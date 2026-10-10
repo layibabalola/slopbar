@@ -66,9 +66,10 @@ function accountRow(p, a) {
       <div class="monitor-state">
         ${a.stale && a.fetched_at ? `<small>${esc(t("lastObserved", { t: duration(Math.max(1, Math.round((Date.now() - new Date(a.fetched_at)) / 60000))) }))}</small>` : ""}
         ${a.error ? `<small>${esc(errorText(p, a.error))}</small>` : ""}
-        ${!a.monitor_connected || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account"].includes(a.error)
+        ${!a.monitor_connected || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account", "monitor_network", "monitor_uncertain"].includes(a.error)
           ? `<button class="btn" data-monitor="${p}" data-id="${esc(a.id)}">${t(a.monitor_connected ? "monitorReconnect" : "monitorConnect")}</button>`
           : `<small>${t("monitorConnected")}</small>`}
+        ${a.monitor_connected ? `<button class="btn" data-disconnect="${p}" data-id="${esc(a.id)}">${t("monitorDisconnect")}</button>` : ""}
       </div>
       ${meter}
       ${a.active
@@ -135,6 +136,17 @@ function renderAccounts() {
 }
 
 $("accounts").addEventListener("click", async (e) => {
+  const disconnect = e.target.closest("[data-disconnect]");
+  if (disconnect) {
+    disconnect.disabled = true;
+    try {
+      const result = await invoke("disconnect_monitoring", { provider: disconnect.dataset.disconnect, id: disconnect.dataset.id });
+      snapshot = result.snapshot; renderAccounts();
+      $("add-hint").textContent = t(result.revoked ? "monitorDisconnected" : "monitorRevokeFailed"); $("add-hint").hidden = false;
+    } catch (err) { alert(errorText("", String(err))); }
+    finally { disconnect.disabled = false; }
+    return;
+  }
   const monitor = e.target.closest("[data-monitor]");
   if (monitor) {
     monitor.disabled = true;

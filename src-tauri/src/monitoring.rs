@@ -20,6 +20,32 @@ pub fn key(slot: &Slot) -> String {
     format!("{}:{}", slot.provider.name(), slot.id)
 }
 
+/// Reserve connect/remove/disconnect for an account through their final disk mutation.
+/// The guard also releases reservations when a task fails or is cancelled.
+#[derive(Default)]
+pub struct Operations(std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>);
+pub struct Operation {
+    key: String,
+    operations: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+impl Operations {
+    pub fn begin(&self, provider: Provider, id: &str) -> Result<Operation, String> {
+        let key = format!("{}:{id}", provider.name());
+        if !self.0.lock().unwrap().insert(key.clone()) {
+            return Err("monitor_busy".into());
+        }
+        Ok(Operation {
+            key,
+            operations: self.0.clone(),
+        })
+    }
+}
+impl Drop for Operation {
+    fn drop(&mut self) {
+        self.operations.lock().unwrap().remove(&self.key);
+    }
+}
+
 // Deliberately no Debug: token values must not enter logs or UI errors.
 #[derive(Clone, Serialize, Deserialize)]
 struct Session {
@@ -30,6 +56,15 @@ struct Session {
     refresh_token: String,
     account_id: Option<String>,
     expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    refresh_expires_at: Option<DateTime<Utc>>,
+    // Persist the replay budget and backoff, so restarting cannot replay indefinitely.
+    #[serde(default)]
+    uncertain_attempts: u8,
+    #[serde(default)]
+    uncertain_retry_at: Option<DateTime<Utc>>,
     #[serde(default)]
     reconnect: bool,
 }
@@ -68,11 +103,33 @@ impl Monitor {
 
     /// A fresh, isolated CLI sign-in is required. Imported/shared CLI sessions are never
     /// promoted to renewable monitoring sessions, even if their access token still works.
-    pub async fn connect(
+    pub async fn connect_replacing(
         &self,
         expected: &Slot,
         login: &Slot,
         cli_slots: &[Slot],
+        client: &reqwest::Client,
+    ) -> Result<(), String> {
+        self.connect_with(expected, login, cli_slots, &Api(client))
+            .await
+    }
+
+    #[cfg(test)]
+    async fn connect(
+        &self,
+        expected: &Slot,
+        login: &Slot,
+        cli_slots: &[Slot],
+    ) -> Result<(), String> {
+        self.connect_with(expected, login, cli_slots, &()).await
+    }
+
+    async fn connect_with(
+        &self,
+        expected: &Slot,
+        login: &Slot,
+        cli_slots: &[Slot],
+        revoke: &impl Revoke,
     ) -> Result<(), String> {
         if expected.provider != login.provider
             || expected.id != login.id
@@ -102,9 +159,31 @@ impl Monitor {
             refresh_token: refresh.to_string(),
             account_id,
             expires_at: expiry(login),
+            scopes: login.data["credentials"]["claudeAiOauth"]["scopes"]
+                .as_array()
+                .map(|v| {
+                    v.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            refresh_expires_at: login.data["credentials"]["claudeAiOauth"]["refreshTokenExpiresAt"]
+                .as_i64()
+                .and_then(DateTime::from_timestamp_millis),
+            uncertain_attempts: 0,
+            uncertain_retry_at: None,
             reconnect: false,
         };
         let mut sessions = self.sessions.lock().await;
+        let previous = sessions
+            .get(&key(expected))
+            .map(|s| s.session.clone())
+            .or_else(|| {
+                private_store::load_secret(&self.path(expected))
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Session>(&b).ok())
+            });
         self.save(expected, &session)?;
         sessions.insert(
             key(expected),
@@ -115,6 +194,16 @@ impl Monitor {
                 error: None,
             },
         );
+        // Replace successfully before revoking the old chain. A failed write must
+        // leave the previously connected login usable.
+        if let Some(previous) = previous.filter(|s| {
+            s.version == 1
+                && s.provider == expected.provider
+                && s.id == expected.id
+                && s.refresh_token != refresh
+        }) {
+            revoke.revoke(&previous).await;
+        }
         Ok(())
     }
 
@@ -123,7 +212,8 @@ impl Monitor {
         private_store::save_secret(&self.path(slot), &bytes).map_err(|_| "monitor_storage".into())
     }
 
-    pub async fn remove(&self, slot: &Slot) -> Result<(), String> {
+    #[cfg(test)]
+    async fn remove(&self, slot: &Slot) -> Result<(), String> {
         let mut sessions = self.sessions.lock().await;
         match std::fs::remove_file(self.path(slot)) {
             Ok(()) => {}
@@ -132,6 +222,36 @@ impl Monitor {
         }
         sessions.remove(&key(slot));
         Ok(())
+    }
+
+    /// Delete locally even if the provider is offline. Never revoke the imported CLI token.
+    pub async fn disconnect(&self, slot: &Slot, client: &reqwest::Client) -> Result<bool, String> {
+        self.disconnect_with(slot, &Api(client)).await
+    }
+
+    async fn disconnect_with(&self, slot: &Slot, transport: &impl Revoke) -> Result<bool, String> {
+        let mut sessions = self.sessions.lock().await;
+        let session = if let Some(state) = sessions.get(&key(slot)) {
+            Some(state.session.clone())
+        } else {
+            match private_store::load_secret(&self.path(slot)) {
+                Ok(bytes) => serde_json::from_slice::<Session>(&bytes).ok(),
+                Err(_) => None,
+            }
+        };
+        match std::fs::remove_file(self.path(slot)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("monitor_storage".into()),
+        }
+        sessions.remove(&key(slot));
+        let Some(session) =
+            session.filter(|s| s.version == 1 && s.provider == slot.provider && s.id == slot.id)
+        else {
+            return Ok(false);
+        };
+        // Hold the same lock through revocation so an in-flight refresh cannot recreate it.
+        Ok(transport.revoke(&session).await)
     }
 
     pub async fn token(
@@ -198,6 +318,19 @@ impl Monitor {
         if state.session.reconnect {
             return Err("monitor_reconnect".into());
         }
+        if state.session.refresh_expires_at.is_some_and(|t| t <= now) {
+            state.session.reconnect = true;
+            state.dirty = true;
+            self.save(slot, &state.session)?;
+            state.dirty = false;
+            return Err("monitor_reconnect".into());
+        }
+        if state.session.uncertain_attempts >= 2 {
+            return Err("monitor_uncertain".into());
+        }
+        if state.session.uncertain_retry_at.is_some_and(|t| t > now) {
+            return Err("monitor_network".into());
+        }
         if state.retry_at.is_some_and(|t| t > now) {
             return Err(state
                 .error
@@ -219,6 +352,15 @@ impl Monitor {
                         state.session.refresh_token = refresh;
                     }
                     state.session.access_token = reply.access_token;
+                    if let Some(scope) = reply.scope {
+                        state.session.scopes =
+                            scope.split_whitespace().map(str::to_owned).collect();
+                    }
+                    if let Some(seconds) = reply.refresh_token_expires_in {
+                        state.session.refresh_expires_at = after_seconds(now, seconds);
+                    }
+                    state.session.uncertain_attempts = 0;
+                    state.session.uncertain_retry_at = None;
                     state.session.expires_at = reply
                         .expires_in
                         .and_then(|n| i64::try_from(n).ok())
@@ -250,14 +392,22 @@ impl Monitor {
                 Err(failure) => {
                     let (code, delay) = match failure {
                         Failure::RateLimited(n) => ("rate_limited", n.clamp(300, 86400)),
-                        // An ambiguous response may have rotated a token. Require reconnect,
-                        // rather than replaying a possibly spent refresh token.
+                        // The monitor owns this chain. Allow one delayed replay after an
+                        // uncertain send; an explicit rejection is terminal. A second
+                        // uncertain result stops automatic replay and offers reconnect.
                         Failure::Ambiguous => {
-                            state.session.reconnect = true;
+                            state.session.uncertain_attempts += 1;
+                            state.session.uncertain_retry_at =
+                                Some(now + chrono::Duration::minutes(5));
                             state.dirty = true;
                             self.save(slot, &state.session)?;
                             state.dirty = false;
-                            return Err("monitor_reconnect".into());
+                            return Err(if state.session.uncertain_attempts >= 2 {
+                                "monitor_uncertain"
+                            } else {
+                                "monitor_network"
+                            }
+                            .into());
                         }
                         _ => ("monitor_network", 300),
                     };
@@ -298,6 +448,13 @@ fn jwt_expiry(token: &str) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(claims["exp"].as_i64()?, 0)
 }
 
+fn after_seconds(now: DateTime<Utc>, seconds: u64) -> Option<DateTime<Utc>> {
+    i64::try_from(seconds)
+        .ok()
+        .and_then(chrono::Duration::try_seconds)
+        .and_then(|d| now.checked_add_signed(d))
+}
+
 #[derive(Deserialize)]
 struct Reply {
     #[serde(default)]
@@ -305,8 +462,11 @@ struct Reply {
     refresh_token: Option<String>,
     expires_in: Option<u64>,
     token_type: Option<String>,
+    scope: Option<String>,
+    refresh_token_expires_in: Option<u64>,
 }
 
+#[derive(Debug, PartialEq)]
 enum Failure {
     Revoked,
     RateLimited(i64),
@@ -317,6 +477,15 @@ enum Failure {
 trait Refresh {
     async fn refresh(&self, session: &Session) -> Result<Reply, Failure>;
 }
+trait Revoke {
+    async fn revoke(&self, session: &Session) -> bool;
+}
+#[cfg(test)]
+impl Revoke for () {
+    async fn revoke(&self, _: &Session) -> bool {
+        false
+    }
+}
 struct Api<'a>(&'a reqwest::Client);
 
 impl Refresh for Api<'_> {
@@ -325,16 +494,32 @@ impl Refresh for Api<'_> {
             Provider::Claude => (CLAUDE_TOKEN_URL, CLAUDE_CLIENT_ID),
             Provider::Codex => (CODEX_TOKEN_URL, CODEX_CLIENT_ID),
         };
-        let request = self.0.post(url).header("Accept", "application/json");
-        let fields = [
-            ("grant_type", "refresh_token"),
-            ("refresh_token", session.refresh_token.as_str()),
-            ("client_id", client_id),
-        ];
-        let request = match session.provider {
-            Provider::Claude => request.json(&json!({ "grant_type": "refresh_token", "refresh_token": session.refresh_token, "client_id": client_id })),
-            Provider::Codex => request.form(&fields),
-        };
+        self.refresh_at(session, url, client_id).await
+    }
+}
+
+impl Api<'_> {
+    async fn refresh_at(
+        &self,
+        session: &Session,
+        url: &str,
+        client_id: &str,
+    ) -> Result<Reply, Failure> {
+        let mut fields = json!({ "grant_type": "refresh_token", "refresh_token": session.refresh_token, "client_id": client_id });
+        if session.provider == Provider::Claude {
+            // Compatibility for monitoring files from the first version of this patch.
+            // These are a subset of the scopes granted by the official CLI login.
+            fields["scope"] = json!(if session.scopes.is_empty() {
+                "user:profile user:inference".into()
+            } else {
+                session.scopes.join(" ")
+            });
+        }
+        let request = self
+            .0
+            .post(url)
+            .header("Accept", "application/json")
+            .json(&fields);
         let response = request.send().await.map_err(|e| {
             if e.is_connect() {
                 Failure::Transient
@@ -358,16 +543,59 @@ impl Refresh for Api<'_> {
         if !response.status().is_success() {
             // Only explicit OAuth rejection is terminal. Do not expose provider response bodies.
             let body: Value = response.json().await.unwrap_or(Value::Null);
-            return Err(
-                if status == 401 || body["error"].as_str() == Some("invalid_grant") {
-                    Failure::Revoked
-                } else {
-                    Failure::Transient
-                },
-            );
+            return Err(if revoked(status, &body) {
+                Failure::Revoked
+            } else {
+                Failure::Transient
+            });
         }
         response.json().await.map_err(|_| Failure::Ambiguous)
     }
+}
+
+impl Revoke for Api<'_> {
+    async fn revoke(&self, session: &Session) -> bool {
+        let (url, client_id) = match session.provider {
+            Provider::Claude => (
+                "https://platform.claude.com/v1/oauth/token/revoke",
+                CLAUDE_CLIENT_ID,
+            ),
+            Provider::Codex => ("https://auth.openai.com/oauth/revoke", CODEX_CLIENT_ID),
+        };
+        self.revoke_at(session, url, client_id).await
+    }
+}
+impl Api<'_> {
+    async fn revoke_at(&self, session: &Session, url: &str, client_id: &str) -> bool {
+        self.0.post(url).timeout(std::time::Duration::from_secs(5))
+            .json(&json!({"token": session.refresh_token, "token_type_hint": "refresh_token", "client_id": client_id}))
+            .send().await.is_ok_and(|r| r.status().is_success())
+    }
+}
+
+fn revoked(status: u16, body: &Value) -> bool {
+    if status == 401 {
+        return true;
+    }
+    // Check all shapes rather than letting a descriptive string hide a nested code.
+    [
+        body["error"].as_str(),
+        body["error"]["type"].as_str(),
+        body["error"]["code"].as_str(),
+        body["code"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|code| {
+        (status == 400 && code.eq_ignore_ascii_case("invalid_grant"))
+            || [
+                "refresh_token_expired",
+                "refresh_token_reused",
+                "refresh_token_invalidated",
+            ]
+            .iter()
+            .any(|known| code.eq_ignore_ascii_case(known))
+    })
 }
 
 #[cfg(test)]

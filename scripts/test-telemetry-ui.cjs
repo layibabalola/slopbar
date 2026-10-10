@@ -35,6 +35,7 @@ async function setup(page, label) {
       core: { invoke: async (command, args) => {
         window.testCalls.push({ command, args });
         if (command === 'get_usage' || command === 'refresh') return data;
+        if (command === 'disconnect_monitoring') return { snapshot: data, revoked: true };
         if (command === 'get_settings') return { providers: { claude: true, codex: true }, language: 'en', aliases: {}, refresh_minutes: 5, launch_at_login: false, auto_update: true,
           notifications: { usage: true, resets: true, switches: true }, balancer: { claude: { auto: false, threshold: 90 }, codex: { auto: false, threshold: 90 } } };
         if (command === 'system_locale') return 'en-US';
@@ -68,6 +69,9 @@ async function setup(page, label) {
     assert.match(await settings.locator('#add-hint').innerText(), /Finish the monitoring sign-in/);
     const called = await settings.evaluate(() => window.testCalls.filter(c => c.command === 'connect_monitoring' || c.command === 'switch_account'));
     assert.deepEqual(called, [{ command: 'connect_monitoring', args: { provider: 'claude', id: 'inactive:org' } }]);
+    await settings.locator('[data-key="claude:connected:org"] [data-disconnect]').click();
+    assert.match(await settings.locator('#add-hint').innerText(), /session revoked/);
+    assert.deepEqual(await settings.evaluate(() => window.testCalls.filter(c => c.command === 'disconnect_monitoring')), [{ command: 'disconnect_monitoring', args: { provider: 'claude', id: 'connected:org' } }]);
     await settings.setViewportSize({ width: 760, height: 800 });
     assert.equal(await settings.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
     if (process.env.UI_SCREENSHOT_DIR) await settings.screenshot({ path: path.join(process.env.UI_SCREENSHOT_DIR, 'slopbar-settings.png'), fullPage: true });
@@ -85,6 +89,17 @@ async function setup(page, label) {
     await panel.evaluate(() => window.testEmit('monitoring-login', { error: 'monitor_wrong_account' }));
     assert.match(await panel.locator('#panel-notice').innerText(), /different account/);
     if (process.env.UI_SCREENSHOT_DIR) await panel.screenshot({ path: path.join(process.env.UI_SCREENSHOT_DIR, 'slopbar-panel.png'), fullPage: true });
+
+    // Every supported language supplies the monitoring controls and error strings.
+    const translations = await panel.evaluate(async () => {
+      const { t, setLanguage, LANGUAGES } = await import('/i18n.js');
+      const keys = ['monitorDisconnect', 'monitorDisconnected', 'monitorRevokeFailed', 'monitor_uncertain', 'monitorConnect', 'monitorReconnect', 'monitorConnected', 'monitorPending', 'monitor_setup', 'monitor_reconnect', 'monitor_storage', 'monitor_network', 'monitor_wrong_account', 'monitor_shared_login', 'monitor_login_failed', 'monitor_busy', 'lastObserved', 'lastReading', 'usageUnknown', 'manualUpdates'];
+      setLanguage('en'); const english = keys.map(k => t(k));
+      return Object.keys(LANGUAGES).filter(l => l !== 'en').map(l => {
+        setLanguage(l); return { l, values: keys.map(k => t(k)), english };
+      });
+    });
+    for (const { l, values, english } of translations) for (let i = 0; i < values.length; i++) assert.notEqual(values[i], english[i], `${l} translation ${i}`);
 
     const dock = await browser.newPage();
     dock.on('pageerror', err => errors.push(String(err)));

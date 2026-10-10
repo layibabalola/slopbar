@@ -391,54 +391,37 @@ pub fn start_login(provider: Provider, sources: &[Source]) -> Result<LoginJob, S
     let source = login_source(provider, sources).ok_or("CLI not found")?.clone();
     static LOGIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = format!(".slopbar-login-{}-{}-{}", std::process::id(), chrono::Utc::now().timestamp_millis(), LOGIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-    let (var, cmd) = match provider {
-        Provider::Claude => ("CLAUDE_CONFIG_DIR", "claude auth login"),
-        Provider::Codex => ("CODEX_HOME", "codex login"),
-    };
+    let cmd = match provider { Provider::Claude => "claude auth login", Provider::Codex => "codex login" };
     let dir = source.home.join(&name);
     // Never reuse a directory (or a symlink) left by an earlier/crashed sign-in.
     std::fs::create_dir(&dir).map_err(|_| "monitor_storage".to_string())?;
     // Keep an isolated Codex login out of the machine's shared credential-store entry.
     // A config file also avoids different cmd.exe / bash quoting rules for TOML strings.
-    if provider == Provider::Codex {
-        if std::fs::write(dir.join("config.toml"), "cli_auth_credentials_store = \"file\"\n").is_err() {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err("monitor_storage".into());
-        }
+    if provider == Provider::Codex
+        && std::fs::write(dir.join("config.toml"), "cli_auth_credentials_store = \"file\"\n").is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err("monitor_storage".into());
     }
 
-    // A new console window runs the sign-in and closes when the CLI exits.
-    let mut term = match &source.distro {
-        Some(distro) => {
-            let native = format!("{}/{name}", source.native_home).replace('\'', "'\\''");
-            // -l loads the login profile, where ~/.local/bin (the CLIs' usual home) joins PATH.
-            let script = format!(
-                "chmod 700 -- '{native}' && env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN -u OPENAI_API_KEY -u CODEX_APP_SERVER_LOGIN_CLIENT_ID {var}='{native}' {cmd}"
-            );
-            let mut c = std::process::Command::new("wsl.exe");
-            c.args(["-d", distro, "--", "bash", "-lic", &script]);
-            c
-        }
-        None => {
-            let mut c = std::process::Command::new("cmd.exe");
-            c.env(var, &dir).args(["/c", cmd]);
-            for name in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "CODEX_APP_SERVER_LOGIN_CLIENT_ID"] { c.env_remove(name); }
-            // The app may have been started from a \\wsl.localhost path, which cmd can't use.
-            if let Some(home) = dirs::home_dir() {
-                c.current_dir(home);
-            }
-            c
-        }
-    };
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-        term.creation_flags(CREATE_NEW_CONSOLE);
+    if crate::login::prepare(&dir, provider, cmd).is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err("monitor_storage".into());
     }
-    let child = match term.spawn() {
+    let native = format!("{}/{name}", source.native_home);
+    let mut term = crate::login::command(provider, &source, &dir, &native, cmd, true);
+    let mut child = match term.spawn() {
         Ok(child) => child,
         Err(_) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err("monitor_login_failed".into());
+        }
+    };
+
+    let tree = match crate::login::ProcessTree::attach(&child) {
+        Ok(tree) => tree,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
             let _ = std::fs::remove_dir_all(&dir);
             return Err("monitor_login_failed".into());
         }
@@ -452,10 +435,12 @@ pub fn start_login(provider: Provider, sources: &[Source]) -> Result<LoginJob, S
         distro: source.distro.clone(),
         native_home: source.native_home.clone(),
     };
-    Ok(LoginJob { provider, source: login, dir, started: Instant::now(), child })
+    Ok(LoginJob { provider, source: login, dir, native, started: Instant::now(), child, tree: Some(tree) })
 }
 
 pub struct LoginJob {
+    tree: Option<crate::login::ProcessTree>,
+    native: String,
     child: std::process::Child,
     provider: Provider,
     source: Source,
@@ -494,10 +479,25 @@ impl LoginJob {
             }
             break Some(slot);
         };
+        // Close the process tree before reading/removing any remaining login state.
+        drop(self.tree.take());
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if result.is_none() {
+            let (provider, source, dir, native) = (self.provider, self.source.clone(), self.dir.clone(), self.native.clone());
+            let _ = tokio::task::spawn_blocking(move || crate::login::logout(provider, &source, &dir, &native)).await;
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
         result
+    }
+}
+
+impl Drop for LoginJob {
+    fn drop(&mut self) {
+        drop(self.tree.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // A cancelled task leaves the marked folder for startup logout/cleanup.
     }
 }
 

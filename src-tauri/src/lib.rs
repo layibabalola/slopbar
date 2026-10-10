@@ -1,5 +1,6 @@
 #![cfg_attr(not(feature = "desktop"), allow(dead_code))]
 mod accounts;
+mod login;
 mod balancer;
 mod model;
 mod settings;

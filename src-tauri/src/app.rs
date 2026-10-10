@@ -18,7 +18,7 @@ const MENU_IDS: [&str; 3] = ["refresh", "settings", "quit"];
 pub struct AppState {
     monitor: monitoring::Monitor,
     refresh_lock: tokio::sync::Mutex<()>,
-    connecting: Mutex<HashSet<String>>,
+    account_operations: monitoring::Operations,
     pub(crate) snapshot: Mutex<Snapshot>,
     pub(crate) settings: Mutex<Settings>,
     /// The widget's right-click menu and its items (relabeled when the language changes).
@@ -120,32 +120,30 @@ async fn add_account(app: AppHandle, provider: Provider) -> Result<(), String> {
 /// A one-time login owns its own refresh-token chain; it never changes the active CLI.
 #[tauri::command]
 async fn connect_monitoring(app: AppHandle, provider: Provider, id: String) -> Result<(), String> {
+    let operation = app.state::<AppState>().account_operations.begin(provider, &id)?;
     let expected = accounts::load_slots().into_iter().find(|s| s.provider == provider && s.id == id)
         .ok_or("monitor_wrong_account")?;
     let key = monitoring::key(&expected);
-    if !app.state::<AppState>().connecting.lock().unwrap().insert(key.clone()) {
-        return Err("monitor_busy".into());
-    }
     let found = app.state::<AppState>().sources.lock().unwrap().clone();
     let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login(provider, &found)).await;
     let job = match job {
         Ok(Ok(job)) => job,
         _ => {
-            app.state::<AppState>().connecting.lock().unwrap().remove(&key);
             return Err("monitor_login_failed".into());
         }
     };
     tauri::async_runtime::spawn(async move {
+        let operation = operation;
         let outcome = match job.wait_isolated(&http_client()).await {
             Some(login) => {
                 let slots = accounts::load_slots();
                 if slots.iter().any(|s| s.provider == provider && s.id == id) {
-                    app.state::<AppState>().monitor.connect(&expected, &login, &slots).await
+                    app.state::<AppState>().monitor.connect_replacing(&expected, &login, &slots, &http_client()).await
                 } else { Err("monitor_wrong_account".into()) }
             }
             None => Err("monitor_login_failed".into()),
         };
-        app.state::<AppState>().connecting.lock().unwrap().remove(&key);
+        drop(operation);
         let _ = app.emit("monitoring-login", serde_json::json!({ "provider": provider, "id": id, "error": outcome.err() }));
         // Preserve last-known data, but allow the new login to bypass an earlier error's backoff.
         {
@@ -160,6 +158,7 @@ async fn connect_monitoring(app: AppHandle, provider: Provider, id: String) -> R
 
 #[tauri::command]
 async fn remove_account(app: AppHandle, provider: Provider, id: String) -> Result<Snapshot, String> {
+    let operation = app.state::<AppState>().account_operations.begin(provider, &id)?;
     let active = {
         let snapshot = app.state::<AppState>().snapshot.lock().unwrap().clone();
         snapshot.accounts.iter().any(|a| a.provider == provider && a.id == id && a.active)
@@ -169,11 +168,30 @@ async fn remove_account(app: AppHandle, provider: Provider, id: String) -> Resul
         return Err("active".into());
     }
     if let Some(slot) = accounts::load_slots().into_iter().find(|s| s.provider == provider && s.id == id) {
-        app.state::<AppState>().monitor.remove(&slot).await?;
+        app.state::<AppState>().monitor.disconnect(&slot, &http_client()).await?;
         app.state::<AppState>().usage_cache.lock().unwrap().remove(&monitoring::key(&slot));
     }
     accounts::remove_slot(provider, &id).map_err(|e| e.to_string())?;
+    drop(operation);
     Ok(do_refresh(&app).await)
+}
+
+#[derive(Serialize)]
+struct Disconnected { snapshot: Snapshot, revoked: bool }
+
+#[tauri::command]
+async fn disconnect_monitoring(app: AppHandle, provider: Provider, id: String) -> Result<Disconnected, String> {
+    let operation = app.state::<AppState>().account_operations.begin(provider, &id)?;
+    let slot = accounts::load_slots().into_iter().find(|s| s.provider == provider && s.id == id)
+        .ok_or("monitor_wrong_account")?;
+    let revoked = app.state::<AppState>().monitor.disconnect(&slot, &http_client()).await?;
+    {
+        let state = app.state::<AppState>();
+        let _refresh = state.refresh_lock.lock().await;
+        providers::retry_now(&mut state.usage_cache.lock().unwrap(), &monitoring::key(&slot));
+    }
+    drop(operation);
+    Ok(Disconnected { snapshot: do_refresh(&app).await, revoked })
 }
 
 #[tauri::command]
@@ -324,6 +342,11 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
         .await
         .unwrap_or_default();
     *state.sources.lock().unwrap() = found.clone();
+    static CLEANUP_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !CLEANUP_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let homes = found.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || crate::login::cleanup(&homes)).await;
+    }
     accounts::resolve_identities(&http_client(), &found).await;
     let scan = found.clone();
     let (active, slots) = tauri::async_runtime::spawn_blocking(move || (accounts::capture(&scan), accounts::load_slots()))
@@ -396,7 +419,7 @@ pub fn run() {
         usage_cache: Mutex::new(providers::load_cache()),
         monitor: monitoring::Monitor::new(settings::app_dir().expect("config directory").join("monitoring")),
         refresh_lock: tokio::sync::Mutex::new(()),
-        connecting: Mutex::default(),
+        account_operations: monitoring::Operations::default(),
         last_switch: Mutex::default(),
         sources: Mutex::default(),
     };
@@ -426,6 +449,7 @@ pub fn run() {
             switch_account,
             add_account,
             connect_monitoring,
+            disconnect_monitoring,
             remove_account,
             set_dock_width,
             dock_clicked,

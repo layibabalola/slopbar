@@ -126,8 +126,9 @@ function renderDetails(snap) {
           </div>
           <div class="acc-meta">${esc(meta)}</div>
           ${a.error ? `<div class="error">${esc(errorText(PROVIDER_NAME[provider], a.error))}</div>` : ""}
-          ${!a.monitor_connected || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account"].includes(a.error)
+          ${!a.monitor_connected || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account", "monitor_network", "monitor_uncertain"].includes(a.error)
             ? `<button class="monitor" data-provider="${provider}" data-id="${esc(a.id)}">${t(a.monitor_connected ? "monitorReconnect" : "monitorConnect")}</button>` : ""}
+          ${a.monitor_connected ? `<button class="monitor" data-disconnect="true" data-provider="${provider}" data-id="${esc(a.id)}">${t("monitorDisconnect")}</button>` : ""}
           ${bars(a)}
           ${resetLines(a)}
           ${a.credits ? `<div class="reset" style="margin-top:6px">${esc(creditsText(a.credits))}</div>` : ""}
@@ -160,7 +161,13 @@ $accounts.addEventListener("click", async (e) => {
   const monitor = e.target.closest("button.monitor");
   if (monitor) {
     monitor.disabled = true;
-    try { await invoke("connect_monitoring", { provider: monitor.dataset.provider, id: monitor.dataset.id }); showToast(t("monitorPending")); }
+    try {
+      const args = { provider: monitor.dataset.provider, id: monitor.dataset.id };
+      if (monitor.dataset.disconnect) {
+        const result = await invoke("disconnect_monitoring", args);
+        render(result.snapshot); showToast(t(result.revoked ? "monitorDisconnected" : "monitorRevokeFailed"));
+      } else { await invoke("connect_monitoring", args); showToast(t("monitorPending")); }
+    }
     catch (err) { showToast(errorText("", String(err))); }
     finally { monitor.disabled = false; }
     return;

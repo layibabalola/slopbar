@@ -37,7 +37,11 @@ Choose **Connect monitoring** next to each account in Settings or the flyout. Co
 
 SlopBar renews this separate session automatically when its access token is about to expire, and polls the provider's usage endpoint. No prompt or model request is sent. Existing accounts need this one-time sign-in because their copied CLI refresh tokens cannot safely be shared with an independent background refresher.
 
+**Disconnect monitoring** works even for the active account. It removes the local monitoring credentials and attempts to revoke that separate session at the provider. If server revocation cannot be confirmed, the UI asks you to revoke it in your provider's account settings. Reconnecting saves the new login before attempting to revoke the previous monitoring session.
+
 Last successful readings survive app restarts. If the provider cannot be reached, the UI shows **Last confirmed … ago** and retains the observed values. A passed reset time does not imply a measured 0%. Automatic switching considers only fresh, successfully measured accounts. A revoked session, an unusable refresh response, or a lost credential file may still require **Reconnect monitoring**; recent account use is never the recovery instruction.
+
+A refresh timeout does not immediately disconnect an account. SlopBar waits five minutes and allows one retry of its own monitoring token. Both the backoff and retry limit survive restarts. An explicit token rejection requires reconnecting; after a second uncertain response, automatic replay stops and the UI offers reconnecting. The providers can reject a retry if the timed-out request already rotated its token.
 
 ### Why the original version lost inactive accounts
 
@@ -59,6 +63,8 @@ The standalone executable is `src-tauri/target/release/slopbar.exe`. Exit any ru
 Local builds disable upstream updates at compile time, including if an existing settings file enables automatic updates. This prevents an unpatched upstream release from replacing this fix. Release maintainers can explicitly enable the `upstream-updates` Cargo feature after merging the fix. The Settings page shows when updates are unavailable.
 
 An optional frontend smoke check is available as `node scripts/test-telemetry-ui.cjs` with Playwright and Chromium installed. It uses synthetic accounts and mocked Tauri commands to check monitoring controls, stale usage, error feedback, and the minimum supported window width. Set `CHROMIUM_PATH` to use an existing Chromium binary. These checks do not authenticate with a provider or exercise a real Windows credential store; the Rust tests run DPAPI checks when executed on Windows.
+
+The Rust suite also runs the real HTTP code against a local server with synthetic tokens: JSON request encoding, saved Claude scopes, nested OAuth errors, rate limits, delayed responses, and revocation. `Telemetry tests` runs core tests on Linux and Windows without release credentials. Fork PR workflows can require maintainer approval before they execute.
 
 Cross-compiled for Windows from WSL/Linux:
 
