@@ -36,9 +36,9 @@ const peak = (a) => a.windows.reduce((m, w) => (w.used_percent > (m?.used_percen
 
 /** The usage ring with the provider's mark inside; the name and the number are in the tooltip. */
 const chip = (a) => {
-  const w = peak(a);
-  const tip = w ? `${PROVIDER_NAME[a.provider]} ${Math.round(w.used_percent)}%` : PROVIDER_NAME[a.provider];
-  return `<span class="chip" title="${tip}"><span class="ring-mark">${ring(w?.used_percent ?? 0)}${MARK[a.provider]}</span></span>`;
+  const w = a.stale || a.error ? null : peak(a);
+  const tip = w ? `${PROVIDER_NAME[a.provider]} ${Math.round(w.used_percent)}%` : `${PROVIDER_NAME[a.provider]} — ${t("usageUnknown")}`;
+  return `<span class="chip" title="${esc(tip)}"><span class="ring-mark">${w ? ring(w.used_percent) : '<span class="unknown-mark">?</span>'}${MARK[a.provider]}</span></span>`;
 };
 
 let toast = null;
@@ -89,12 +89,15 @@ function bars(a) {
     <div class="win">
       <div class="row"><span>${esc(windowLabel(w))}</span><b>${Math.round(w.used_percent)}%</b></div>
       <div class="bar"><div style="width:${Math.min(100, w.used_percent)}%;background:${color(w.used_percent)}"></div></div>
-      ${w.resets_at ? `<div class="reset">${esc(resetsIn(w.resets_at))}</div>` : ""}
+      ${w.resets_at && !a.stale ? `<div class="reset">${esc(resetsIn(w.resets_at))}</div>` : ""}
     </div>`).join("");
 }
 
 /** One section per provider; each account shows its usage, the signed-in one marked "in use". */
 function renderDetails(snap) {
+  const notice = document.getElementById("panel-notice");
+  notice.textContent = toast ?? "";
+  notice.hidden = !toast;
   $updated.textContent = snap.updated_at ? time(snap.updated_at) : "";
   if (!snap.accounts.length) {
     $accounts.innerHTML = `<p class="empty">${snap.updated_at ? t("noCredentials") : t("searching")}</p>`;
@@ -108,7 +111,7 @@ function renderDetails(snap) {
       <div class="acc-head"><span class="name">${PROVIDER_NAME[provider]}</span></div>
       ${list.map((a) => {
         const stale = a.stale && a.fetched_at
-          ? t("staleAgo", { t: duration(Math.max(1, Math.round((Date.now() - new Date(a.fetched_at)) / 60000))) })
+          ? t("lastObserved", { t: duration(Math.max(1, Math.round((Date.now() - new Date(a.fetched_at)) / 60000))) })
           : "";
         // Every row has one detail line, whatever its state, so switching doesn't change heights.
         const meta = [a.active ? a.sources.join(" + ") : a.alias ? a.email : "", a.org, stale].filter(Boolean).join(" · ") || " ";
@@ -123,6 +126,8 @@ function renderDetails(snap) {
           </div>
           <div class="acc-meta">${esc(meta)}</div>
           ${a.error ? `<div class="error">${esc(errorText(PROVIDER_NAME[provider], a.error))}</div>` : ""}
+          ${!a.monitor_connected || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account"].includes(a.error)
+            ? `<button class="monitor" data-provider="${provider}" data-id="${esc(a.id)}">${t(a.monitor_connected ? "monitorReconnect" : "monitorConnect")}</button>` : ""}
           ${bars(a)}
           ${resetLines(a)}
           ${a.credits ? `<div class="reset" style="margin-top:6px">${esc(creditsText(a.credits))}</div>` : ""}
@@ -152,6 +157,14 @@ function patch(container, html) {
 }
 
 $accounts.addEventListener("click", async (e) => {
+  const monitor = e.target.closest("button.monitor");
+  if (monitor) {
+    monitor.disabled = true;
+    try { await invoke("connect_monitoring", { provider: monitor.dataset.provider, id: monitor.dataset.id }); showToast(t("monitorPending")); }
+    catch (err) { showToast(errorText("", String(err))); }
+    finally { monitor.disabled = false; }
+    return;
+  }
   const button = e.target.closest("button.use");
   if (!button) return;
   const { provider, id } = button.dataset;
@@ -223,6 +236,7 @@ $refresh.addEventListener("click", async () => {
   try { render(await invoke("refresh")); } finally { $refresh.classList.remove("spin"); }
 });
 
+listen("monitoring-login", ({ payload }) => showToast(payload.error ? errorText("", payload.error) : t("monitorConnected")));
 listen("usage-updated", (e) => render(e.payload));
 invoke("get_usage").then(render);
 setInterval(() => invoke("get_usage").then(render), 60_000);

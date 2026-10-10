@@ -2,6 +2,19 @@
 // Missing languages and keys fall back to English.
 const MESSAGES = {
   en: {
+    monitorConnect: "Connect monitoring", monitorReconnect: "Reconnect monitoring",
+    monitorConnected: "Independent monitoring connected", monitorPending: "Finish the monitoring sign-in in the opened terminal. Your active account stays the same.",
+    monitor_setup: "Connect monitoring once to keep this account's usage available while idle.",
+    monitor_reconnect: "Monitoring sign-in needs reconnecting. No account use is required.",
+    monitor_storage: "Could not save or read the monitoring login. Check available disk space and file access.",
+    monitor_network: "Monitoring service unavailable — retrying shortly.",
+    monitor_wrong_account: "That sign-in belongs to a different account or organization. Sign in to the account selected here.",
+    monitor_shared_login: "That login is shared with a CLI. Use a fresh monitoring sign-in.",
+    monitor_login_failed: "Monitoring sign-in did not complete. Try connecting again.",
+    monitor_busy: "A monitoring sign-in is already open for this account.",
+    lastObserved: "Last confirmed {t} ago", lastReading: "Last reading", usageUnknown: "Usage unavailable",
+    manualUpdates: "Manual updates only for this build.",
+
     title: "Plan usage", loading: "Loading…", noAccounts: "No accounts",
     noCredentials: "No Claude Code or Codex credentials found on Windows or WSL.",
     searching: "Looking for accounts…", refresh: "Refresh",
@@ -307,6 +320,7 @@ const CLI_NAME = { Claude: "Claude Code", Codex: "Codex" };
 
 export function errorText(provider, code) {
   const vars = { provider: CLI_NAME[provider] ?? provider };
+  if (code.startsWith("monitor_")) return t(code);
   if (code === "token_expired" || code === "token_invalid" || code === "bad_response") return t(code, vars);
   if (code === "idle") return t("idle");
   if (code === "rate_limited") return t("rateLimited");

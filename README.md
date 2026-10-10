@@ -12,7 +12,8 @@ Your Claude Code and Codex plan limits, right in the Windows taskbar, next to th
 
 ## Features
 
-- **No sign-in**: reads the credentials Claude Code and Codex already saved.
+- **Account discovery**: reads the credentials Claude Code and Codex already saved.
+- **Independent monitoring**: connect each account once to keep checking its usage while it is inactive, without opening a conversation or switching the CLI.
 - **Windows + WSL**: finds accounts in your Windows profile and in every WSL distro.
 - **Lives in your taskbar**: a small widget next to the clock shows each provider's usage as a ring around its logo; hover for the exact number.
 - **One click for the details**: click the widget for a flyout with every account, its session and weekly limits, reset times, limit resets and credits. Right-click it to refresh, open Settings or quit.
@@ -30,7 +31,34 @@ Add accounts in **Settings → Accounts**: SlopBar opens the CLI's own sign-in (
 > [!NOTE]
 > A running Codex session keeps its account until you restart it.
 
+### Monitoring accounts you aren't using
+
+Choose **Connect monitoring** next to each account in Settings or the flyout. Complete the official CLI's sign-in for that same account and organization. This creates a separate monitoring session in a temporary configuration folder; it is never imported into the switching vault or written to the active CLI's files. The temporary folder is removed when sign-in completes, fails, or times out.
+
+SlopBar renews this separate session automatically when its access token is about to expire, and polls the provider's usage endpoint. No prompt or model request is sent. Existing accounts need this one-time sign-in because their copied CLI refresh tokens cannot safely be shared with an independent background refresher.
+
+Last successful readings survive app restarts. If the provider cannot be reached, the UI shows **Last confirmed … ago** and retains the observed values. A passed reset time does not imply a measured 0%. Automatic switching considers only fresh, successfully measured accounts. A revoked session, an unusable refresh response, or a lost credential file may still require **Reconnect monitoring**; recent account use is never the recovery instruction.
+
+### Why the original version lost inactive accounts
+
+At upstream commit `60a7c8e0835b4cd320dba3e0b1352d7a8161c9e1`, `providers::fetch_one` stopped before requesting usage when a copied Claude access token had expired. SlopBar deliberately never renewed tokens, and `accounts::capture` only obtained replacements when an official CLI had already refreshed its login. Inactive accounts therefore lost live telemetry. The UI translated an inactive expired token into “Not used recently,” hiding the authentication cause. The last-success cache lived only in memory, and its reset prediction could display 0% without a provider response.
+
+Refreshing those existing copied refresh tokens would race the CLI's token rotation. This branch instead owns a separate refresh-token chain per monitored account, serializes refreshes, saves rotated tokens atomically, backs off after failures, and uses Windows DPAPI for monitoring credentials. The older account-switching vault still uses its original plaintext format; see [SECURITY.md](SECURITY.md).
+
 ## Build
+
+On Windows, with Rust and the usual Tauri prerequisites installed:
+
+```powershell
+cargo test --locked --no-default-features --lib --manifest-path src-tauri/Cargo.toml
+cargo build --locked --release --manifest-path src-tauri/Cargo.toml
+```
+
+The standalone executable is `src-tauri/target/release/slopbar.exe`. Exit any running SlopBar before starting it; the single-instance guard otherwise hands control to the already running version. Existing settings and accounts are read from the same data directory.
+
+Local builds disable upstream updates at compile time, including if an existing settings file enables automatic updates. This prevents an unpatched upstream release from replacing this fix. Release maintainers can explicitly enable the `upstream-updates` Cargo feature after merging the fix. The Settings page shows when updates are unavailable.
+
+An optional frontend smoke check is available as `node scripts/test-telemetry-ui.cjs` with Playwright and Chromium installed. It uses synthetic accounts and mocked Tauri commands to check monitoring controls, stale usage, error feedback, and the minimum supported window width. Set `CHROMIUM_PATH` to use an existing Chromium binary. These checks do not authenticate with a provider or exercise a real Windows credential store; the Rust tests run DPAPI checks when executed on Windows.
 
 Cross-compiled for Windows from WSL/Linux:
 
@@ -45,11 +73,11 @@ pnpm tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --no-bundle
 The app is at `src-tauri/target/x86_64-pc-windows-msvc/release/slopbar.exe`.
 
 > [!NOTE]
-> SlopBar never refreshes tokens, so it can't log you out of your CLI. If a token expires, open `claude` or `codex` once.
+> Monitoring only renews its own separately connected sessions. Imported CLI sessions are never refreshed by SlopBar.
 
 ## Releases
 
-Every push to `main` builds on GitHub Actions and publishes a release (`v0.2.<run>`) with the installer and the standalone `.exe`. Installed apps update themselves silently in the background.
+The upstream release workflow publishes from `main` (`v0.2.<run>`), runs the telemetry tests on Windows, and enables signed upstream updates for those releases. Local builds use manual updates.
 
 ## License
 

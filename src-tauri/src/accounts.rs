@@ -389,21 +389,31 @@ fn login_source(provider: Provider, sources: &[Source]) -> Option<&Source> {
 /// imports the account once the sign-in finishes. The current login is never touched.
 pub fn start_login(provider: Provider, sources: &[Source]) -> Result<LoginJob, String> {
     let source = login_source(provider, sources).ok_or("CLI not found")?.clone();
-    let name = format!(".slopbar-login-{}", chrono::Utc::now().timestamp_millis());
+    static LOGIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = format!(".slopbar-login-{}-{}-{}", std::process::id(), chrono::Utc::now().timestamp_millis(), LOGIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let (var, cmd) = match provider {
         Provider::Claude => ("CLAUDE_CONFIG_DIR", "claude auth login"),
         Provider::Codex => ("CODEX_HOME", "codex login"),
     };
     let dir = source.home.join(&name);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // Never reuse a directory (or a symlink) left by an earlier/crashed sign-in.
+    std::fs::create_dir(&dir).map_err(|_| "monitor_storage".to_string())?;
+    // Keep an isolated Codex login out of the machine's shared credential-store entry.
+    // A config file also avoids different cmd.exe / bash quoting rules for TOML strings.
+    if provider == Provider::Codex {
+        if std::fs::write(dir.join("config.toml"), "cli_auth_credentials_store = \"file\"\n").is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err("monitor_storage".into());
+        }
+    }
 
-    // A new console window runs the sign-in; it closes on success and stays open on failure.
+    // A new console window runs the sign-in and closes when the CLI exits.
     let mut term = match &source.distro {
         Some(distro) => {
-            let native = format!("{}/{name}", source.native_home);
+            let native = format!("{}/{name}", source.native_home).replace('\'', "'\\''");
             // -l loads the login profile, where ~/.local/bin (the CLIs' usual home) joins PATH.
             let script = format!(
-                "{var}='{native}' {cmd} && sleep 1 || {{ echo; read -rp 'Press Enter to close'; }}"
+                "chmod 700 -- '{native}' && env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN -u OPENAI_API_KEY -u CODEX_APP_SERVER_LOGIN_CLIENT_ID {var}='{native}' {cmd}"
             );
             let mut c = std::process::Command::new("wsl.exe");
             c.args(["-d", distro, "--", "bash", "-lic", &script]);
@@ -411,7 +421,8 @@ pub fn start_login(provider: Provider, sources: &[Source]) -> Result<LoginJob, S
         }
         None => {
             let mut c = std::process::Command::new("cmd.exe");
-            c.env(var, &dir).args(["/c", &format!("{cmd} || pause")]);
+            c.env(var, &dir).args(["/c", cmd]);
+            for name in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "CODEX_APP_SERVER_LOGIN_CLIENT_ID"] { c.env_remove(name); }
             // The app may have been started from a \\wsl.localhost path, which cmd can't use.
             if let Some(home) = dirs::home_dir() {
                 c.current_dir(home);
@@ -425,7 +436,13 @@ pub fn start_login(provider: Provider, sources: &[Source]) -> Result<LoginJob, S
         const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
         term.creation_flags(CREATE_NEW_CONSOLE);
     }
-    term.spawn().map_err(|e| e.to_string())?;
+    let child = match term.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err("monitor_login_failed".into());
+        }
+    };
 
     let login = Source {
         label: source.label.clone(),
@@ -435,10 +452,11 @@ pub fn start_login(provider: Provider, sources: &[Source]) -> Result<LoginJob, S
         distro: source.distro.clone(),
         native_home: source.native_home.clone(),
     };
-    Ok(LoginJob { provider, source: login, dir, started: Instant::now() })
+    Ok(LoginJob { provider, source: login, dir, started: Instant::now(), child })
 }
 
 pub struct LoginJob {
+    child: std::process::Child,
     provider: Provider,
     source: Source,
     dir: PathBuf,
@@ -449,22 +467,35 @@ impl LoginJob {
     /// Polls until the sign-in has produced a login, then imports it and cleans up.
     /// Gives up after 15 minutes (the temp dir is removed either way).
     pub async fn wait(self, client: &reqwest::Client) -> Option<Slot> {
+        let slot = self.wait_isolated(client).await?;
+        let _guard = VAULT.lock().unwrap();
+        save_slot(&slot).ok()?;
+        Some(slot)
+    }
+
+    /// Complete a separate login without ever importing it into the switching vault.
+    pub async fn wait_isolated(mut self, client: &reqwest::Client) -> Option<Slot> {
         let result = loop {
             if self.started.elapsed() > Duration::from_secs(15 * 60) {
                 break None;
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
-            let Some(mut slot) = read_login(self.provider, &self.source, &[]) else { continue };
-            // Let the CLI finish writing (Claude adds account details right after the tokens).
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            slot = read_login(self.provider, &self.source, &[]).unwrap_or(slot);
-            if slot.provider == Provider::Claude {
-                slot = with_claude_profile(client, slot).await;
+            // Wait for successful CLI exit, not the first partially written credential file.
+            match self.child.try_wait() {
+                Ok(Some(status)) if status.success() => {},
+                Ok(None) => continue,
+                _ => break None,
             }
-            let _guard = VAULT.lock().unwrap();
-            let _ = save_slot(&slot);
+            let Some(mut slot) = read_login(self.provider, &self.source, &[]) else { break None };
+            if slot.provider == Provider::Claude {
+                // A monitor must be bound to the server-verified account, not a config label.
+                let Some(verified) = with_claude_profile(client, slot).await else { break None };
+                slot = verified;
+            }
             break Some(slot);
         };
+        let _ = self.child.kill();
+        let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
         result
     }
@@ -495,10 +526,8 @@ async fn claude_profile(client: &reqwest::Client, token: &str) -> Option<Value> 
 }
 
 /// Replaces a new Claude login's identity with the profile API's answer.
-async fn with_claude_profile(client: &reqwest::Client, slot: Slot) -> Slot {
-    let Some((token, _)) = slot.access() else { return slot };
-    match claude_profile(client, &token).await {
-        Some(account) => claude_slot(slot.data["credentials"].clone(), Some(account)).unwrap_or(slot),
-        None => slot,
-    }
+async fn with_claude_profile(client: &reqwest::Client, slot: Slot) -> Option<Slot> {
+    let (token, _) = slot.access()?;
+    let account = claude_profile(client, &token).await?;
+    claude_slot(slot.data["credentials"].clone(), Some(account))
 }

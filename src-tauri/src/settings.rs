@@ -99,7 +99,7 @@ impl Default for Settings {
             providers: Providers::default(),
             language: "auto".into(),
             launch_at_login: false,
-            auto_update: true,
+            auto_update: cfg!(feature = "upstream-updates"),
             last_version: None,
             aliases: HashMap::new(),
             balancer: Balancer::default(),

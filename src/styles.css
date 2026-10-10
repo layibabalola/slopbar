@@ -181,3 +181,7 @@ header #updated { margin-left: auto; margin-right: 4px; }
 .reset-grant { display: flex; gap: 6px; align-items: baseline; margin-top: 8px; font-size: 11px; color: var(--text-2); }
 .reset-grant span { color: var(--text); }
 .reset-grant.usable, .reset-grant.usable span { color: var(--ok); }
+
+.monitor { margin: 6px 0; padding: 5px 8px; cursor: pointer; }
+.unknown-mark { position: absolute; right: -4px; top: -5px; font-size: 11px; font-weight: 700; }
+#panel-notice { padding: 10px 14px; font-size: 12px; line-height: 1.4; color: var(--text); }

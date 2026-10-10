@@ -69,7 +69,7 @@ pub async fn fetch(client: &reqwest::Client, token: &str, account_id: Option<&st
         req = req.header("ChatGPT-Account-Id", id);
     }
     let resp = req.send().await.map_err(|e| e.to_string())?;
-    if resp.status() == 401 || resp.status() == 403 {
+    if resp.status() == 401 {
         return Err("token_invalid".into());
     }
     if resp.status() == 429 {

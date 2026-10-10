@@ -2,10 +2,18 @@
 
 ## What SlopBar can access
 
-SlopBar reads the sign-in files that Claude Code and Codex already keep on your PC, in your Windows profile and in each WSL distro, to show your plan usage. It never refreshes these tokens and only sends them, over HTTPS, to the providers' own APIs: `api.anthropic.com` for Claude and `chatgpt.com` for Codex. Accounts you add are kept in SlopBar's data folder in your user profile (`%APPDATA%\dev.thelio.slopbar`).
+SlopBar reads the sign-in files that Claude Code and Codex already keep on your PC, in your Windows profile and in each WSL distro. The existing account-switching vault copies full login data, including refresh tokens, into JSON files under `%APPDATA%\dev.thelio.slopbar\accounts`. **That legacy vault is still plaintext.** This telemetry fix does not encrypt or redesign it.
 
-Updates come from this repository's releases, and the app only installs one whose signature matches the key built into it.
+Independent monitoring requires a separate official CLI sign-in. SlopBar rejects a monitoring login whose refresh token equals a known CLI login and verifies that its account and organization match the selected slot. A successful monitoring login is stored separately under `monitoring`, protected by Windows DPAPI for the current Windows user. It is never used for account switching or exported to a CLI. Temporary CLI sign-in files are removed after completion/failure/timeout; an abrupt app or machine crash can leave a temporary `.slopbar-login-*` folder in the selected profile. WSL login folders are restricted to their owner before authentication runs.
+
+Only those independently owned monitoring sessions are refreshed. Imported CLI refresh tokens are never sent to a token endpoint. Refreshes are serialized; new refresh tokens are saved atomically before normal polling resumes. If a write fails after rotation, the new token is retained in memory and persistence is retried without replaying the old token. Exiting before that write succeeds can require reconnecting. Revocation or an ambiguous refresh response also requires reconnecting. HTTP redirects are disabled for authentication and usage requests; token values and response bodies are not returned to the UI.
+
+Authentication and usage requests go over HTTPS directly to the providers: `api.anthropic.com` and `platform.claude.com` for Claude, `chatgpt.com` and `auth.openai.com` for Codex. Monitoring does not send model prompts. The usage cache contains readings and timestamps, not authentication tokens. The non-Windows headless test build uses owner-only files rather than DPAPI; the desktop app targets Windows.
+
+These OAuth sessions are credentials, not read-only usage API keys. DPAPI protects files at rest, but a compromised SlopBar process or code running as the same user can still misuse them. This change does not eliminate application, dependency, or update supply-chain risk.
+
+Local builds have upstream updates disabled at compile time. Official release builds explicitly enable `upstream-updates`; those updates must match the signing key built into the app. Signatures authenticate a publisher, not the safety of a release.
 
 ## Reporting a vulnerability
 
-Please report security issues privately through [GitHub's private vulnerability reporting](https://github.com/thelioo/slopbar/security/advisories/new) instead of opening a public issue. Fixes ship as regular releases, which installed copies pick up on their own.
+Please report upstream security issues privately through [GitHub's private vulnerability reporting](https://github.com/thelioo/slopbar/security/advisories/new) instead of opening a public issue.
