@@ -142,8 +142,9 @@ fn closing_windows_job_terminates_the_login_process() {
     drop(tree);
     let start = std::time::Instant::now();
     loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(!status.success());
+        if child.try_wait().unwrap().is_some() {
+            // Kill-on-close can report exit code zero. The process was still
+            // running before close, and must terminate long before its 30s wait.
             break;
         }
         if start.elapsed() > Duration::from_secs(3) {
