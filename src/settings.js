@@ -1,8 +1,10 @@
 import { MARK } from "./marks.js";
+import { observeFrontend } from "./diagnostics.js";
 import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetsIn, resetText, errorText, duration } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
+observeFrontend("settings");
 
 const REFRESH_OPTIONS = [1, 5, 15, 30];
 const PROVIDERS = [["claude", "Claude"], ["codex", "Codex"]];
@@ -265,6 +267,15 @@ $("claude").addEventListener("change", (e) => update({ providers: { ...settings.
 $("codex").addEventListener("change", (e) => update({ providers: { ...settings.providers, codex: e.target.checked } }));
 $("startup").addEventListener("change", (e) => update({ launch_at_login: e.target.checked }));
 $("auto-update").addEventListener("change", (e) => update({ auto_update: e.target.checked }));
+$("export-diagnostics").addEventListener("click", async () => {
+  const button = $("export-diagnostics"), status = $("diagnostics-status");
+  button.disabled = true; status.hidden = false; status.textContent = t("diagnosticsExporting");
+  try {
+    const path = await invoke("export_diagnostics");
+    status.textContent = t("diagnosticsSaved", { path });
+  } catch { status.textContent = t("diagnosticsFailed"); }
+  finally { button.disabled = false; }
+});
 for (const kind of ["usage", "resets", "switches"]) {
   $(`notify-${kind}`).addEventListener("change", (e) => update({ notifications: { ...settings.notifications, [kind]: e.target.checked } }));
 }

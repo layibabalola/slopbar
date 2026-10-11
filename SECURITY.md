@@ -31,3 +31,11 @@ Local builds have upstream updates disabled at compile time. Official release bu
 ## Reporting a vulnerability
 
 Please report upstream security issues privately through [GitHub's private vulnerability reporting](https://github.com/thelioo/slopbar/security/advisories/new) instead of opening a public issue.
+
+## Diagnostic reports
+
+Diagnostic collection uses structured allowlisted events rather than free-form logs. Exported reports contain anonymous account numbers, usage percentages/timestamps, operational outcomes, and build metadata. Never attach the account vault, monitoring sessions, or `diagnostics/history.bin` to a support request; use Settings' **Export diagnostics** report.
+
+Tokens, account identities, aliases, paths, distro names, HTTP URLs/headers/bodies, raw errors, and stacks are excluded from export. A local account-ID-to-number mapping enables continuity across restarts. It remains inside the Windows DPAPI-protected journal and is never exported. On Unix headless tests the journal is private but not encrypted. Reports are readable JSON, remain on the machine until explicitly shared, and include usage/timing information. No diagnostic upload endpoint exists.
+
+Events are bounded by 7 days and 10,000 entries; the local mapping is capped at 1,024 accounts. Corrupt/unreadable history and failed persistence are reported without blocking account monitoring. Diagnostic retention does not include old exports; users control those files. Deleting the app's diagnostics folder while SlopBar is stopped clears its history and mapping. Routine observations may be lost on abrupt termination; critical auth transitions are persisted immediately on a best-effort basis.

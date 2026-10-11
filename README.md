@@ -55,6 +55,16 @@ At upstream commit `60a7c8e0835b4cd320dba3e0b1352d7a8161c9e1`, `providers::fetch
 
 Refreshing those existing copied refresh tokens would race the CLI's token rotation. This branch instead owns a separate refresh-token chain per monitored account, serializes refreshes, saves rotated tokens atomically, backs off after failures, and uses Windows DPAPI for monitoring credentials. The older account-switching vault still uses its original plaintext format; see [SECURITY.md](SECURITY.md).
 
+## Diagnostics for real-machine testing
+
+This build records a local rolling diagnostic history automatically. After testing, use **Settings → General → Diagnostics → Export diagnostics**. It creates a `SlopBar-Diagnostics-*.json` report and opens its folder on Windows. Upload that JSON report for analysis; do not upload the account vault, monitoring files, or the encrypted journal.
+
+The report includes anonymous account numbers stable across restarts, usage percentages and last-confirmed times, monitoring/CLI/fallback usage outcomes, refresh HTTP statuses and timeout categories, renewal reasons, backoff/replay decisions, isolated login stages, revocation outcomes, poll durations/gaps, frontend error categories, and the executable's embedded build metadata. It excludes tokens, emails, aliases, account/organization IDs, home paths, distro names, request URLs/headers/bodies, provider response bodies, raw exception messages, and stacks. Collection is local; there is no automatic upload.
+
+The journal retains at most **7 days or 10,000 events**, whichever limit is reached first. Its account-number mapping is retained locally for continuity and never exported. Windows protects the journal/mapping with current-user DPAPI; exports are readable JSON containing usage/timing data. Routine observations are flushed at poll completion; authentication transitions are flushed immediately. Killing the app can lose the final routine observations, but the next startup records the missing clean shutdown. Storage failures are best effort and do not change token handling. A full crash dump and provider-side/CLI internal logs are not collected.
+
+For automated build verification, `slopbar.exe --build-info-to <path>` writes the executable's own commit, tree, dirty-checkout flag, and Tauri/updater configuration without launching the GUI or reading credentials. CI packaging checks this output against the checkout before producing the ZIP.
+
 ## Build
 
 On Windows, with Rust and the usual Tauri prerequisites installed:

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 import zipfile
 
 root = Path(__file__).resolve().parents[1]
@@ -14,6 +15,14 @@ base = "60a7c8e0835b4cd320dba3e0b1352d7a8161c9e1"
 repository = os.environ.get("GITHUB_REPOSITORY", "layibabalola/slopbar")
 run = os.environ.get("GITHUB_RUN_ID")
 ci = f"https://github.com/{repository}/actions/runs/{run}" if run else None
+with tempfile.TemporaryDirectory() as temporary:
+    info_path = Path(temporary) / "build-info.json"
+    subprocess.run([str(exe), "--build-info-to", str(info_path)], check=True, timeout=15)
+    binary_build = json.loads(info_path.read_text())
+if (binary_build["commit"] != head or binary_build["dirty"]
+        or binary_build["tauri_dev"] is not False or binary_build["upstream_updates"]
+        or binary_build["source_tree"] != subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=root, text=True).strip()):
+    raise RuntimeError("Executable provenance or release configuration does not match this checkout")
 manifest = {
     "commit": head,
     "source_tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=root, text=True).strip(),
@@ -22,10 +31,11 @@ manifest = {
     "target": "x86_64-pc-windows-msvc",
     "signed": False,
     "upstream_updates": False,
-    "tauri_custom_protocol": True,
+    "tauri_custom_protocol": not binary_build["tauri_dev"],
     "cargo_features": ["desktop", "tauri/custom-protocol"],
     "ci": ci,
     "pr": "https://github.com/thelioo/slopbar/pull/6",
+    "binary_build": binary_build,
 }
 instructions = f"""SlopBar independent monitoring — unsigned Windows test build
 Source commit: {head}
@@ -36,6 +46,14 @@ Build and checks: {ci or 'see BUILD-MANIFEST.json'}
 3. Open Settings and choose Connect monitoring for each account. Sign in to the
    same account and organization using the official CLI. This creates a separate
    monitoring login. No model prompts are sent.
+4. Test idle renewal. Export a report from Settings > General > Diagnostics >
+   Export diagnostics and upload the generated SlopBar-Diagnostics-*.json for review.
+   The report includes anonymous account numbers, usage percentages/timestamps,
+   refresh/backoff outcomes, login stages, and build metadata. It excludes tokens,
+   emails, aliases, account/organization IDs, paths, URLs, and provider response bodies.
+   Collection is local; nothing is uploaded automatically. The rolling encrypted
+   journal retains at most 7 days / 10,000 events. Keep the exported report private
+   until you choose to share it. Prior independent monitoring logins are reused.
 
 This build uses manual updates. Install a newer reviewed build to get fixes.
 It uses Tauri's release custom-protocol configuration with embedded assets.

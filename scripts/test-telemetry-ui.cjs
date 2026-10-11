@@ -36,6 +36,7 @@ async function setup(page, label) {
         window.testCalls.push({ command, args });
         if (command === 'get_usage' || command === 'refresh') return data;
         if (command === 'disconnect_monitoring') return { snapshot: data, revoked: true };
+        if (command === 'export_diagnostics') { if (window.testExportFail) throw new Error('PRIVATE-export-error'); return 'C:\\test\\SlopBar-Diagnostics.json'; }
         if (command === 'get_settings') return { providers: { claude: true, codex: true }, language: 'en', aliases: {}, refresh_minutes: 5, launch_at_login: false, auto_update: true,
           notifications: { usage: true, resets: true, switches: true }, balancer: { claude: { auto: false, threshold: 90 }, codex: { auto: false, threshold: 90 } } };
         if (command === 'system_locale') return 'en-US';
@@ -75,6 +76,22 @@ async function setup(page, label) {
     await settings.locator('[data-key="claude:connected:org"] [data-disconnect]').click();
     assert.match(await settings.locator('#add-hint').innerText(), /session revoked/);
     assert.deepEqual(await settings.evaluate(() => window.testCalls.filter(c => c.command === 'disconnect_monitoring')), [{ command: 'disconnect_monitoring', args: { provider: 'claude', id: 'connected:org' } }]);
+    await settings.locator('[data-page="general"]').click();
+    await settings.locator('#export-diagnostics').click();
+    assert.match(await settings.locator('#diagnostics-status').innerText(), /Diagnostics saved: C:\\test\\SlopBar-Diagnostics.json/);
+    await settings.evaluate(() => { window.testExportFail = true; });
+    await settings.locator('#export-diagnostics').click();
+    assert.match(await settings.locator('#diagnostics-status').innerText(), /Could not export diagnostics/);
+    assert.doesNotMatch(await settings.locator('#diagnostics-status').innerText(), /PRIVATE/);
+    assert.equal(await settings.locator('#export-diagnostics').isDisabled(), false);
+    await settings.evaluate(() => {
+      for (let i = 0; i < 25; i++) window.dispatchEvent(new ErrorEvent('error', { message: 'PRIVATE-message', filename: 'https://PRIVATE-url/token', error: new TypeError('PRIVATE-secret'), lineno: 42, colno: 3 }));
+    });
+    const frontend = await settings.evaluate(() => window.testCalls.filter(c => c.command === 'record_frontend_error'));
+    assert.equal(frontend.length, 20);
+    assert.deepEqual(frontend[0].args, { surface: 'settings', kind: 'type_error', line: 42, column: 3 });
+    assert.doesNotMatch(JSON.stringify(frontend), /PRIVATE/);
+    await settings.locator('[data-page="accounts"]').click();
     await settings.setViewportSize({ width: 760, height: 800 });
     assert.equal(await settings.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
     if (process.env.UI_SCREENSHOT_DIR) await settings.screenshot({ path: path.join(process.env.UI_SCREENSHOT_DIR, 'slopbar-settings.png'), fullPage: true });

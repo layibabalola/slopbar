@@ -57,6 +57,28 @@ fn login() -> Slot {
 }
 
 #[tokio::test]
+async fn diagnostic_refresh_trace_is_secret_free_and_recording_failure_cannot_break_renewal() {
+    let dir = TempDir::new();
+    let journal = dir.0.join("journal");
+    // A directory at the journal-file path simulates storage failure.
+    std::fs::create_dir(&journal).unwrap();
+    let recorder = std::sync::Arc::new(crate::diagnostics::Recorder::new(journal));
+    recorder.start();
+    let monitor = Monitor::new(dir.0.join("sessions")).with_diagnostics(recorder.clone());
+    let expected = cli();
+    let transport = Scripted::new([Err(Failure::Transient), reply("PRIVATE-new-access", Some("PRIVATE-new-refresh"))]);
+    monitor.connect(&expected, &login(), &[]).await.unwrap();
+    assert_eq!(monitor.token_with(&expected, &transport, None, now()).await.err().as_deref(), Some("monitor_network"));
+    assert_eq!(monitor.token_with(&expected, &transport, None, now() + chrono::Duration::minutes(6)).await.unwrap().0, "PRIVATE-new-access");
+    let report = String::from_utf8(recorder.report(&crate::model::Snapshot::default(), &crate::settings::Settings::default()).unwrap()).unwrap();
+    for private in ["PRIVATE", "monitor-access-1", "monitor-refresh-1", "cli-refresh", "account:org", "test@example.invalid"] { assert!(!report.contains(private)); }
+    let data: serde_json::Value = serde_json::from_str(&report).unwrap();
+    assert!(data["storage_errors"].as_u64().unwrap() > 0);
+    let outcomes: Vec<_> = data["events"].as_array().unwrap().iter().filter_map(|r| r["event"]["outcome"].as_str()).collect();
+    assert_eq!(outcomes, ["started", "transient", "started", "success"]);
+}
+
+#[tokio::test]
 async fn inactive_account_renews_repeatedly_across_restart_without_using_cli_session() {
     let dir = TempDir::new();
     let expected = cli();
@@ -974,12 +996,12 @@ mod http {
     struct Local<'a>(&'a reqwest::Client, &'a str);
     impl Refresh for Local<'_> {
         async fn refresh(&self, session: &Session) -> Result<Reply, Failure> {
-            Api(self.0).refresh_at(session, self.1, "test-client").await
+            Api(self.0, None).refresh_at(session, self.1, "test-client").await
         }
     }
     impl Revoke for Local<'_> {
         async fn revoke(&self, session: &Session) -> bool {
-            Api(self.0).revoke_at(session, self.1, "test-client").await
+            Api(self.0, None).revoke_at(session, self.1, "test-client").await
         }
     }
     fn client(timeout_ms: u64) -> reqwest::Client {
@@ -1006,6 +1028,25 @@ mod http {
             reconnect: false,
             access_rejected: false,
         }
+    }
+    #[tokio::test]
+    async fn http_diagnostics_keep_status_and_timeout_but_never_requests_or_bodies() {
+        let dir = TempDir::new();
+        let recorder = crate::diagnostics::Recorder::new(dir.0.join("journal")); recorder.start();
+        let mut slow = response(200, "PRIVATE-provider-body"); slow.delay = Duration::from_millis(60);
+        let server = Server::new(vec![response(503, "PRIVATE-provider-body"), response(200, "PRIVATE-revoke-body"), slow]);
+        let http = client(20);
+        let api = Api(&http, Some(&recorder));
+        let mut s = session(Provider::Claude); s.id = "PRIVATE-account-id".into(); s.refresh_token = "PRIVATE-refresh-token".into();
+        assert!(matches!(api.refresh_at(&s, &server.url, "PRIVATE-client-id").await, Err(Failure::Transient)));
+        assert!(api.revoke_at(&s, &server.url, "PRIVATE-client-id").await);
+        assert!(matches!(api.refresh_at(&s, &server.url, "PRIVATE-client-id").await, Err(Failure::Ambiguous)));
+        let report = String::from_utf8(recorder.report(&crate::model::Snapshot::default(), &crate::settings::Settings::default()).unwrap()).unwrap();
+        assert!(!report.contains("PRIVATE")); assert!(!report.contains(&server.url));
+        let data: Value = serde_json::from_str(&report).unwrap();
+        let events: Vec<_> = data["events"].as_array().unwrap().iter().filter(|r| r["event"]["type"] == "http").collect();
+        assert_eq!(events.len(), 3); assert_eq!(events[0]["event"]["status"], 503);
+        assert_eq!(events[1]["event"]["status"], 200); assert_eq!(events[2]["event"]["network"], "timeout");
     }
     #[tokio::test]
     async fn real_hint_failures_allow_usage_without_repeating_refresh_during_backoff() {

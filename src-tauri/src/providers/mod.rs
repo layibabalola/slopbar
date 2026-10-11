@@ -10,6 +10,7 @@ use crate::monitoring::{self, Monitor};
 use crate::accounts::{Active, Provider, Slot};
 use crate::model::{AccountUsage, ResetGrant, UsageWindow};
 use crate::settings::Settings;
+use crate::diagnostics::{self, Code, Event, Origin};
 
 /// Last successful numbers per account, used when its saved token can't be used or the usage
 /// API asks us to slow down.
@@ -175,7 +176,7 @@ async fn fetch_one_with(client: &reqwest::Client, slot: &Slot, monitor: &Monitor
     match result {
         Err(error) if active && monitor.connected(slot) && !slot.expired() && !error.starts_with("rate_limited") => {
             if let Some((token, account)) = slot.access() {
-                match usage.fetch(slot.provider, &token, account.as_deref()).await {
+                match observed_usage(usage, monitor, slot, &token, account.as_deref(), Origin::ActiveCliFallback).await {
                     Ok(mut live) => {
                     // Fresh telemetry stays eligible for balancing. Keep the monitor's
                     // separate error visible so its Reconnect control is still honest.
@@ -200,11 +201,12 @@ async fn fetch_session(client: &reqwest::Client, slot: &Slot, monitor: &Monitor,
         if slot.expired() { return Err("monitor_setup".into()); }
         slot.access().ok_or("monitor_setup")?
     };
-    match usage.fetch(slot.provider, &token, account.as_deref()).await {
+    let origin = if owned { Origin::Monitoring } else { Origin::Cli };
+    match observed_usage(usage, monitor, slot, &token, account.as_deref(), origin).await {
         Err(e) if e == "token_invalid" && owned => {
             let (renewed, account) = monitor.token(slot, client, Some(&token)).await?;
             // Exactly one renewal and one usage retry for the independent session.
-            match usage.fetch(slot.provider, &renewed, account.as_deref()).await {
+            match observed_usage(usage, monitor, slot, &renewed, account.as_deref(), Origin::Monitoring).await {
                 Err(e) if e == "token_invalid" => {
                     monitor.reject(slot, &renewed).await?;
                     Err("monitor_reconnect".into())
@@ -215,6 +217,13 @@ async fn fetch_session(client: &reqwest::Client, slot: &Slot, monitor: &Monitor,
         Err(e) if e == "token_invalid" => Err("monitor_setup".into()),
         result => result,
     }
+}
+
+async fn observed_usage(usage: &impl Usage, monitor: &Monitor, slot: &Slot, token: &str, account: Option<&str>, origin: Origin) -> Result<Fetched, String> {
+    let started = std::time::Instant::now();
+    let result = usage.fetch(slot.provider, token, account).await;
+    monitor.record(slot, Event::Usage { origin, code: Code::from_error(result.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) });
+    result
 }
 
 async fn fetch_token(client: &reqwest::Client, provider: Provider, token: &str, account: Option<&str>) -> Result<Fetched, String> {
@@ -242,7 +251,9 @@ mod tests {
         }
         for active in [false, true] {
             let dir = TempDir::new();
-            let monitor = Monitor::new(dir.0.clone());
+            let recorder = std::sync::Arc::new(crate::diagnostics::Recorder::new(dir.0.join("journal")));
+            recorder.start();
+            let monitor = Monitor::new(dir.0.join("monitoring")).with_diagnostics(recorder.clone());
             let account = slot("active:org", "live-cli-access", "cli-owned-refresh", i64::MAX);
             let login = slot("active:org", "monitor-access", "monitor-refresh", i64::MAX);
             monitor.connect(&account, &login, &[]).await.unwrap();
@@ -263,6 +274,9 @@ mod tests {
                 assert!(usage.0.lock().unwrap().is_empty());
             }
             assert_eq!(serde_json::to_vec(&account).unwrap(), original);
+            let report = String::from_utf8(recorder.report(&crate::model::Snapshot::default(), &Settings::default()).unwrap()).unwrap();
+            for private in ["live-cli-access", "cli-owned-refresh", "monitor-access", "monitor-refresh", "active:org"] { assert!(!report.contains(private)); }
+            assert_eq!(report.contains("active_cli_fallback"), active);
         }
     }
 

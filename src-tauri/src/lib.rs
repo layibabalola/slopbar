@@ -8,6 +8,8 @@ mod sources;
 mod providers;
 mod monitoring;
 mod private_store;
+mod diagnostics;
+pub use diagnostics::write_build_info;
 #[cfg(feature = "desktop")]
 mod dock;
 #[cfg(feature = "desktop")]

@@ -388,22 +388,34 @@ fn login_source(provider: Provider, sources: &[Source]) -> Option<&Source> {
 /// Opens a terminal that runs the CLI's own sign-in in an isolated temporary config dir, then
 /// imports the account once the sign-in finishes. The current login is never touched.
 pub fn start_login(provider: Provider, sources: &[Source]) -> Result<LoginJob, String> {
-    let source = login_source(provider, sources).ok_or("CLI not found")?.clone();
+    start_login_observed(provider, sources, None)
+}
+
+pub fn start_login_observed(provider: Provider, sources: &[Source], diagnostics: Option<crate::diagnostics::Context>) -> Result<LoginJob, String> {
+    use crate::diagnostics::LoginStage;
+    let source = login_source(provider, sources);
+    if let Some(d) = &diagnostics { d.login(LoginStage::CliDiscovery, source.is_some(), source.is_some_and(|s| s.distro.is_some()), None, 0); }
+    let source = source.ok_or("CLI not found")?.clone();
     static LOGIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = format!(".slopbar-login-{}-{}-{}", std::process::id(), chrono::Utc::now().timestamp_millis(), LOGIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let cmd = crate::login::action(provider, false);
     let dir = source.home.join(&name);
     // Never reuse a directory (or a symlink) left by an earlier/crashed sign-in.
-    std::fs::create_dir(&dir).map_err(|_| "monitor_storage".to_string())?;
+    let made = std::fs::create_dir(&dir);
+    if let Some(d) = &diagnostics { d.login(LoginStage::Directory, made.is_ok(), source.distro.is_some(), None, 0); }
+    made.map_err(|_| "monitor_storage".to_string())?;
     // Keep an isolated Codex login out of the machine's shared credential-store entry.
     // A config file also avoids different cmd.exe / bash quoting rules for TOML strings.
     if provider == Provider::Codex
         && std::fs::write(dir.join("config.toml"), "cli_auth_credentials_store = \"file\"\n").is_err() {
+        if let Some(d) = &diagnostics { d.login(LoginStage::Prepare, false, source.distro.is_some(), None, 0); }
         let _ = std::fs::remove_dir_all(&dir);
         return Err("monitor_storage".into());
     }
 
-    if crate::login::prepare(&dir, provider, cmd).is_err() {
+    let prepared = crate::login::prepare(&dir, provider, cmd);
+    if let Some(d) = &diagnostics { d.login(LoginStage::Prepare, prepared.is_ok(), source.distro.is_some(), None, 0); }
+    if prepared.is_err() {
         let _ = std::fs::remove_dir_all(&dir);
         return Err("monitor_storage".into());
     }
@@ -412,10 +424,12 @@ pub fn start_login(provider: Provider, sources: &[Source]) -> Result<LoginJob, S
     let (child, tree) = match crate::login::ProcessTree::spawn(&mut term, true) {
         Ok(process) => process,
         Err(_) => {
+            if let Some(d) = &diagnostics { d.login(LoginStage::ProcessStart, false, source.distro.is_some(), None, 0); }
             let _ = std::fs::remove_dir_all(&dir);
             return Err("monitor_login_failed".into());
         }
     };
+    if let Some(d) = &diagnostics { d.login(LoginStage::ProcessStart, true, source.distro.is_some(), None, 0); }
 
     let login = Source {
         label: source.label.clone(),
@@ -425,10 +439,12 @@ pub fn start_login(provider: Provider, sources: &[Source]) -> Result<LoginJob, S
         distro: source.distro.clone(),
         native_home: source.native_home.clone(),
     };
-    Ok(LoginJob { provider, source: login, dir, native, started: Instant::now(), child, tree: Some(tree) })
+    Ok(LoginJob { provider, source: login, dir, native, started: Instant::now(), child, tree: Some(tree), diagnostics, finished: false })
 }
 
 pub struct LoginJob {
+    diagnostics: Option<crate::diagnostics::Context>,
+    finished: bool,
     tree: Option<crate::login::ProcessTree>,
     native: String,
     child: std::process::Child,
@@ -450,21 +466,27 @@ impl LoginJob {
 
     /// Complete a separate login without ever importing it into the switching vault.
     pub async fn wait_isolated(mut self, client: &reqwest::Client) -> Option<Slot> {
+        use crate::diagnostics::LoginStage;
         let result = loop {
             if self.started.elapsed() > Duration::from_secs(15 * 60) {
+                self.record_login(LoginStage::Timeout, false, None);
                 break None;
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
             // Wait for successful CLI exit, not the first partially written credential file.
             match self.child.try_wait() {
-                Ok(Some(status)) if status.success() => {},
+                Ok(Some(status)) => { self.record_login(LoginStage::ProcessExit, status.success(), status.code()); if !status.success() { break None; } },
                 Ok(None) => continue,
-                _ => break None,
+                _ => { self.record_login(LoginStage::ProcessExit, false, None); break None; },
             }
-            let Some(mut slot) = read_login(self.provider, &self.source, &[]) else { break None };
+            let slot = read_login(self.provider, &self.source, &[]);
+            self.record_login(LoginStage::Credentials, slot.is_some(), None);
+            let Some(mut slot) = slot else { break None };
             if slot.provider == Provider::Claude {
                 // A monitor must be bound to the server-verified account, not a config label.
-                let Some(verified) = with_claude_profile(client, slot).await else { break None };
+                let verified = with_claude_profile(client, slot).await;
+                self.record_login(LoginStage::Profile, verified.is_some(), None);
+                let Some(verified) = verified else { break None };
                 slot = verified;
             }
             break Some(slot);
@@ -475,18 +497,28 @@ impl LoginJob {
         let _ = self.child.wait();
         // Credentials may reach the vault, main CLI, or monitor only after a
         // durable handoff marker prevents later cleanup from logging them out.
-        let result = result.filter(|_| crate::login::handoff(&self.dir, self.provider).is_ok());
+        let result = result.filter(|_| {
+            let ok = crate::login::handoff(&self.dir, self.provider).is_ok();
+            self.record_login(LoginStage::Handoff, ok, None); ok
+        });
         if result.is_none() {
             let (provider, source, dir, native) = (self.provider, self.source.clone(), self.dir.clone(), self.native.clone());
             let _ = tokio::task::spawn_blocking(move || crate::login::logout(provider, &source, &dir, &native)).await;
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let removed = std::fs::remove_dir_all(&self.dir);
+        self.record_login(LoginStage::FolderCleanup, removed.is_ok(), None);
+        self.finished = true;
         result
+    }
+
+    fn record_login(&self, stage: crate::diagnostics::LoginStage, ok: bool, exit_code: Option<i32>) {
+        if let Some(d) = &self.diagnostics { d.login(stage, ok, self.source.distro.is_some(), exit_code, crate::diagnostics::millis(self.started)); }
     }
 }
 
 impl Drop for LoginJob {
     fn drop(&mut self) {
+        if !self.finished { self.record_login(crate::diagnostics::LoginStage::Cancelled, false, None); }
         drop(self.tree.take());
         let _ = self.child.kill();
         let _ = self.child.wait();

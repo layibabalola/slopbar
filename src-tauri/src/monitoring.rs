@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::accounts::{Provider, Slot};
 use crate::private_store;
+use crate::diagnostics::{self, Decision, Event, RefreshOutcome, RefreshReason, RevokeOutcome, RevokeReason};
 
 const CLAUDE_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -85,6 +86,7 @@ pub struct Monitor {
     dir: PathBuf,
     // Serializes refresh, reconnect and removal. The desktop is a single-instance app.
     sessions: Mutex<HashMap<String, State>>,
+    diagnostics: Option<std::sync::Arc<diagnostics::Recorder>>,
 }
 
 impl Monitor {
@@ -92,7 +94,23 @@ impl Monitor {
         Self {
             dir,
             sessions: Mutex::new(HashMap::new()),
+            diagnostics: None,
         }
+    }
+
+    pub fn with_diagnostics(mut self, recorder: std::sync::Arc<diagnostics::Recorder>) -> Self {
+        self.diagnostics = Some(recorder);
+        self
+    }
+
+    pub(crate) fn record(&self, slot: &Slot, event: Event) {
+        if let Some(r) = &self.diagnostics { r.record(Some(slot.provider), Some(&slot.id), event); }
+    }
+
+    fn decision(&self, slot: &Slot, state: &State, decision: Decision, usable: bool) {
+        self.record(slot, Event::Token { decision, access_expires_at: state.session.expires_at,
+            retry_at: state.session.uncertain_retry_at.or(state.retry_at),
+            uncertain_attempts: state.session.uncertain_attempts, access_rejected: state.session.access_rejected, usable });
     }
 
     fn path(&self, slot: &Slot) -> PathBuf {
@@ -150,7 +168,7 @@ impl Monitor {
         cli_slots: &[Slot],
         client: &reqwest::Client,
     ) -> Result<(), String> {
-        self.connect_or_discard_with(expected, login, cli_slots, &Api(client))
+        self.connect_or_discard_with(expected, login, cli_slots, &Api(client, self.diagnostics.as_deref()))
             .await
     }
 
@@ -185,7 +203,7 @@ impl Monitor {
         cli_slots: &[Slot],
         client: &reqwest::Client,
     ) -> bool {
-        self.discard_unstored_login_with(login, cli_slots, &Api(client))
+        self.discard_unstored_login_with(login, cli_slots, &Api(client, self.diagnostics.as_deref()))
             .await
     }
 
@@ -196,18 +214,22 @@ impl Monitor {
         revoke: &impl Revoke,
     ) -> bool {
         let Some(refresh) = refresh_token(login).filter(|t| !t.is_empty()) else {
+            self.record(login, Event::Revoke { reason: RevokeReason::UninstalledLogin, outcome: RevokeOutcome::NoToken, elapsed_ms: 0 });
             return false;
         };
         // Hold the same lock through the ownership check and revocation. Another
         // connect cannot adopt this token between the check and the network call.
         let sessions = self.sessions.lock().await;
         let Some(protected) = self.protected_tokens_locked(cli_slots, &sessions) else {
+            self.record(login, Event::Revoke { reason: RevokeReason::UninstalledLogin, outcome: RevokeOutcome::UnknownOwnership, elapsed_ms: 0 });
             return false;
         };
         if protected.contains(&(login.provider, refresh.to_owned())) {
+            self.record(login, Event::Revoke { reason: RevokeReason::UninstalledLogin, outcome: RevokeOutcome::Protected, elapsed_ms: 0 });
             return false;
         }
-        revoke
+        let started = std::time::Instant::now();
+        let revoked = revoke
             .revoke(&Session {
                 version: 1,
                 provider: login.provider,
@@ -223,7 +245,10 @@ impl Monitor {
                 reconnect: false,
                 access_rejected: false,
             })
-            .await
+            .await;
+        self.record(login, Event::Revoke { reason: RevokeReason::UninstalledLogin,
+            outcome: if revoked { RevokeOutcome::Confirmed } else { RevokeOutcome::Unconfirmed }, elapsed_ms: diagnostics::millis(started) });
+        revoked
     }
 
     #[cfg(test)]
@@ -315,14 +340,19 @@ impl Monitor {
                 && s.id == expected.id
                 && s.refresh_token != refresh
         }) {
-            revoke.revoke(&previous).await;
+            let started = std::time::Instant::now();
+            let revoked = revoke.revoke(&previous).await;
+            self.record(expected, Event::Revoke { reason: RevokeReason::Replacement,
+                outcome: if revoked { RevokeOutcome::Confirmed } else { RevokeOutcome::Unconfirmed }, elapsed_ms: diagnostics::millis(started) });
         }
         Ok(())
     }
 
     fn save(&self, slot: &Slot, session: &Session) -> Result<(), String> {
         let bytes = serde_json::to_vec(session).map_err(|_| "monitor_storage")?;
-        private_store::save_secret(&self.path(slot), &bytes).map_err(|_| "monitor_storage".into())
+        let result = private_store::save_secret(&self.path(slot), &bytes).map_err(|_| "monitor_storage".into());
+        if result.is_err() { self.record(slot, Event::Action { action: diagnostics::Action::MonitorSave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
+        result
     }
 
     #[cfg(test)]
@@ -339,7 +369,7 @@ impl Monitor {
 
     /// Delete locally even if the provider is offline. Never revoke the imported CLI token.
     pub async fn disconnect(&self, slot: &Slot, client: &reqwest::Client) -> Result<bool, String> {
-        self.disconnect_with(slot, &Api(client)).await
+        self.disconnect_with(slot, &Api(client, self.diagnostics.as_deref())).await
     }
 
     async fn disconnect_with(&self, slot: &Slot, transport: &impl Revoke) -> Result<bool, String> {
@@ -361,10 +391,15 @@ impl Monitor {
         let Some(session) =
             session.filter(|s| s.version == 1 && s.provider == slot.provider && s.id == slot.id)
         else {
+            self.record(slot, Event::Revoke { reason: RevokeReason::Disconnect, outcome: RevokeOutcome::NoToken, elapsed_ms: 0 });
             return Ok(false);
         };
         // Hold the same lock through revocation so an in-flight refresh cannot recreate it.
-        Ok(transport.revoke(&session).await)
+        let started = std::time::Instant::now();
+        let revoked = transport.revoke(&session).await;
+        self.record(slot, Event::Revoke { reason: RevokeReason::Disconnect,
+            outcome: if revoked { RevokeOutcome::Confirmed } else { RevokeOutcome::Unconfirmed }, elapsed_ms: diagnostics::millis(started) });
+        Ok(revoked)
     }
 
     pub async fn token(
@@ -373,8 +408,11 @@ impl Monitor {
         client: &reqwest::Client,
         rejected: Option<&str>,
     ) -> Result<(String, Option<String>), String> {
-        self.token_with(slot, &Api(client), rejected, Utc::now())
-            .await
+        let started = std::time::Instant::now();
+        let result = self.token_with(slot, &Api(client, self.diagnostics.as_deref()), rejected, Utc::now()).await;
+        if result.is_err() { self.record(slot, Event::Action { action: diagnostics::Action::TokenRead,
+            code: diagnostics::Code::from_error(result.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) }); }
+        result
     }
 
     /// A freshly renewed token was also rejected. Persist this terminal state so every
@@ -429,6 +467,7 @@ impl Monitor {
             state.dirty = false;
         }
         if state.session.reconnect {
+            self.decision(slot, state, Decision::Reconnect, false);
             return Err("monitor_reconnect".into());
         }
         let expired = state
@@ -442,7 +481,9 @@ impl Monitor {
             state.dirty = true;
             self.save(slot, &state.session)?;
             state.dirty = false;
+            self.decision(slot, state, Decision::UsageRejected, false);
         }
+        if rejected.is_some() && !rejected_current { self.decision(slot, state, Decision::LateRejectionIgnored, !expired && !state.session.access_rejected); }
         // A renewal hint must not suppress still-usable access credentials during
         // token-endpoint backoff. Never reuse an expired or usage-rejected token.
         let usable_access =
@@ -454,12 +495,15 @@ impl Monitor {
                     )
                 });
         if state.session.uncertain_attempts >= 2 {
+            self.decision(slot, state, Decision::RetryExhausted, usable_access.is_some());
             return usable_access.ok_or_else(|| "monitor_uncertain".into());
         }
         if state.session.uncertain_retry_at.is_some_and(|t| t > now) {
+            self.decision(slot, state, Decision::Backoff, usable_access.is_some());
             return usable_access.ok_or_else(|| "monitor_network".into());
         }
         if state.retry_at.is_some_and(|t| t > now) {
+            self.decision(slot, state, Decision::Backoff, usable_access.is_some());
             return usable_access.ok_or_else(|| {
                 state
                     .error
@@ -471,7 +515,16 @@ impl Monitor {
         // as a renewal hint and let the provider decide whether the token is valid.
         let refresh_due = state.session.refresh_expires_at.is_some_and(|t| t <= now);
         if expired || state.session.access_rejected || refresh_due {
-            match transport.refresh(&state.session).await {
+            let reason = if state.session.access_rejected { RefreshReason::UsageRejection }
+                else if expired { RefreshReason::AccessExpiry } else { RefreshReason::ExpiryHint };
+            self.record(slot, Event::Refresh { outcome: RefreshOutcome::Started, reason, elapsed_ms: 0 });
+            let started = std::time::Instant::now();
+            let result = transport.refresh(&state.session).await;
+            let outcome = match &result { Ok(_) => RefreshOutcome::Success, Err(Failure::Revoked) => RefreshOutcome::Revoked,
+                Err(Failure::RotatedUnreadable) => RefreshOutcome::RotatedUnreadable, Err(Failure::Transient) => RefreshOutcome::Transient,
+                Err(Failure::RateLimited(_)) => RefreshOutcome::RateLimited, Err(Failure::Ambiguous) => RefreshOutcome::Ambiguous };
+            self.record(slot, Event::Refresh { outcome, reason, elapsed_ms: diagnostics::millis(started) });
+            match result {
                 Ok(reply) => {
                     // Once the server may have rotated, preserve the returned refresh token
                     // even when the rest of the response is invalid. Never retry the old one.
@@ -530,6 +583,7 @@ impl Monitor {
                             state.dirty = true;
                             self.save(slot, &state.session)?;
                             state.dirty = false;
+                            self.decision(slot, state, Decision::Grace, usable_access.is_some());
                             return usable_access.ok_or_else(|| {
                                 if state.session.uncertain_attempts >= 2 {
                                     "monitor_uncertain"
@@ -543,10 +597,12 @@ impl Monitor {
                     };
                     state.retry_at = Some(now + chrono::Duration::seconds(delay));
                     state.error = Some(code.into());
+                    self.decision(slot, state, Decision::Grace, usable_access.is_some());
                     return usable_access.ok_or_else(|| code.into());
                 }
             }
         }
+        self.decision(slot, state, Decision::Reuse, true);
         Ok((
             state.session.access_token.clone(),
             state.session.account_id.clone(),
@@ -617,7 +673,7 @@ impl Revoke for () {
         false
     }
 }
-struct Api<'a>(&'a reqwest::Client);
+struct Api<'a>(&'a reqwest::Client, Option<&'a diagnostics::Recorder>);
 
 impl Refresh for Api<'_> {
     async fn refresh(&self, session: &Session) -> Result<Reply, Failure> {
@@ -630,6 +686,9 @@ impl Refresh for Api<'_> {
 }
 
 impl Api<'_> {
+    fn http_event(&self, session: &Session, endpoint: diagnostics::Endpoint, status: Option<u16>, network: Option<diagnostics::Network>, started: std::time::Instant) {
+        if let Some(r) = self.1 { r.record(Some(session.provider), Some(&session.id), Event::Http { endpoint, status, network, elapsed_ms: diagnostics::millis(started) }); }
+    }
     async fn refresh_at(
         &self,
         session: &Session,
@@ -651,7 +710,9 @@ impl Api<'_> {
             .post(url)
             .header("Accept", "application/json")
             .json(&fields);
+        let started = std::time::Instant::now();
         let response = request.send().await.map_err(|e| {
+            self.http_event(session, diagnostics::Endpoint::Token, None, Some(network_kind(&e)), started);
             if e.is_connect() {
                 Failure::Transient
             } else {
@@ -659,6 +720,7 @@ impl Api<'_> {
             }
         })?;
         let status = response.status().as_u16();
+        self.http_event(session, diagnostics::Endpoint::Token, Some(status), None, started);
         if status == 429 {
             let seconds = response
                 .headers()
@@ -703,10 +765,19 @@ impl Revoke for Api<'_> {
 }
 impl Api<'_> {
     async fn revoke_at(&self, session: &Session, url: &str, client_id: &str) -> bool {
-        self.0.post(url).timeout(std::time::Duration::from_secs(5))
+        let started = std::time::Instant::now();
+        let result = self.0.post(url).timeout(std::time::Duration::from_secs(5))
             .json(&json!({"token": session.refresh_token, "token_type_hint": "refresh_token", "client_id": client_id}))
-            .send().await.is_ok_and(|r| r.status().is_success())
+            .send().await;
+        match result {
+            Ok(r) => { self.http_event(session, diagnostics::Endpoint::Revoke, Some(r.status().as_u16()), None, started); r.status().is_success() },
+            Err(e) => { self.http_event(session, diagnostics::Endpoint::Revoke, None, Some(network_kind(&e)), started); false },
+        }
     }
+}
+
+fn network_kind(error: &reqwest::Error) -> diagnostics::Network {
+    if error.is_timeout() { diagnostics::Network::Timeout } else if error.is_connect() { diagnostics::Network::Connect } else { diagnostics::Network::Transport }
 }
 
 fn revoked(status: u16, body: &Value) -> bool {

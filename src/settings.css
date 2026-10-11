@@ -265,6 +265,7 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
 .monitor-state small { display: block; white-space: normal; }
 .monitor-state .btn { align-self: flex-start; }
 .meter.stale { opacity: .65; }
+#diagnostics-status { overflow-wrap: anywhere; }
 @media (max-width: 900px) {
   .account { grid-template-columns: 32px minmax(0, 1fr) 90px auto 20px; gap: 8px; }
   .account .meter { width: 90px; }

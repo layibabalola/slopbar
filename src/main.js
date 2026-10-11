@@ -1,5 +1,6 @@
 import { t, resetsIn, windowLabel, errorText, creditsText, time, translateDom, setLanguage, setSystemLocale, duration, resetText, groupResets } from "./i18n.js";
 import { MARK } from "./marks.js";
+import { observeFrontend } from "./diagnostics.js";
 import { checkUsage, checkSwitch } from "./alerts.js";
 
 const { invoke } = window.__TAURI__.core;
@@ -14,6 +15,7 @@ const $refresh = document.getElementById("refresh");
 
 // The same page renders the taskbar widget ("dock") and the flyout above it ("panel").
 const IS_DOCK = window.__TAURI__.window.getCurrentWindow().label === "dock";
+observeFrontend(IS_DOCK ? "dock" : "panel");
 document.body.classList.add(IS_DOCK ? "dock" : "panel");
 
 let lastSnap = { accounts: [], updated_at: null };

@@ -1,4 +1,4 @@
-use crate::{accounts, balancer, dock, migrate, model, monitoring, notify, panel, providers, settings, sources, updates};
+use crate::{accounts, balancer, diagnostics, dock, migrate, model, monitoring, notify, panel, providers, settings, sources, updates};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -17,6 +17,7 @@ const MENU_IDS: [&str; 3] = ["refresh", "settings", "quit"];
 
 pub struct AppState {
     monitor: monitoring::Monitor,
+    diagnostics: std::sync::Arc<diagnostics::Recorder>,
     refresh_lock: tokio::sync::Mutex<()>,
     account_operations: monitoring::Operations,
     pub(crate) snapshot: Mutex<Snapshot>,
@@ -41,6 +42,28 @@ pub struct AppState {
 #[tauri::command]
 fn get_usage(state: tauri::State<AppState>) -> Snapshot {
     state.snapshot.lock().unwrap().clone()
+}
+
+#[tauri::command]
+async fn export_diagnostics(app: AppHandle) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let recorder = state.diagnostics.clone();
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    let settings = state.settings.lock().unwrap().clone();
+    let path = tauri::async_runtime::spawn_blocking(move || recorder.export(&snapshot, &settings))
+        .await.map_err(|_| "diagnostic_storage")?.map_err(String::from)?;
+    #[cfg(windows)]
+    if let Some(parent) = path.parent() {
+        let folder = parent.to_owned();
+        // No shell or user-supplied command. Open the dedicated export folder.
+        let _ = tauri::async_runtime::spawn_blocking(move || std::process::Command::new("explorer.exe").arg(folder).spawn()).await;
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn record_frontend_error(state: tauri::State<AppState>, surface: diagnostics::Surface, kind: diagnostics::FrontendKind, line: Option<u32>, column: Option<u32>) {
+    state.diagnostics.record(None, None, diagnostics::Event::Frontend { surface, kind, line, column });
 }
 
 #[tauri::command]
@@ -73,9 +96,14 @@ async fn switch_to(app: &AppHandle, provider: Provider, id: String, auto: bool) 
         snapshot.accounts.iter().find(|a| a.provider == provider && a.active).map(|a| a.id.clone())
     };
     let target = id.clone();
-    tauri::async_runtime::spawn_blocking(move || accounts::switch(&found, provider, &target))
+    let started = Instant::now();
+    let result = tauri::async_runtime::spawn_blocking(move || accounts::switch(&found, provider, &target))
         .await
-        .map_err(|e| e.to_string())??;
+        .map_err(|e| e.to_string()).and_then(|r| r);
+    app.state::<AppState>().diagnostics.record(Some(provider), Some(&id), diagnostics::Event::Action {
+        action: if auto { diagnostics::Action::SwitchAuto } else { diagnostics::Action::SwitchManual },
+        code: diagnostics::Code::from_error(result.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) });
+    result?;
     let event = Switched {
         provider,
         from: from.and_then(|f| account_label(app, provider, &f)),
@@ -124,11 +152,15 @@ async fn connect_monitoring(app: AppHandle, provider: Provider, id: String) -> R
     let expected = accounts::load_slots().into_iter().find(|s| s.provider == provider && s.id == id)
         .ok_or("monitor_wrong_account")?;
     let key = monitoring::key(&expected);
+    let started = Instant::now();
+    app.state::<AppState>().diagnostics.record(Some(provider), Some(&id), diagnostics::Event::Action { action: diagnostics::Action::ConnectStarted, code: diagnostics::Code::Ok, elapsed_ms: 0 });
     let found = app.state::<AppState>().sources.lock().unwrap().clone();
-    let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login(provider, &found)).await;
+    let context = diagnostics::Context { recorder: app.state::<AppState>().diagnostics.clone(), provider, id: id.clone() };
+    let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, Some(context))).await;
     let job = match job {
         Ok(Ok(job)) => job,
         _ => {
+            app.state::<AppState>().diagnostics.record(Some(provider), Some(&id), diagnostics::Event::Action { action: diagnostics::Action::ConnectFinished, code: diagnostics::Code::LoginFailed, elapsed_ms: diagnostics::millis(started) });
             return Err("monitor_login_failed".into());
         }
     };
@@ -149,6 +181,8 @@ async fn connect_monitoring(app: AppHandle, provider: Provider, id: String) -> R
             None => Err("monitor_login_failed".into()),
         };
         drop(operation);
+        app.state::<AppState>().diagnostics.record(Some(provider), Some(&id), diagnostics::Event::Action { action: diagnostics::Action::ConnectFinished,
+            code: diagnostics::Code::from_error(outcome.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) });
         let _ = app.emit("monitoring-login", serde_json::json!({ "provider": provider, "id": id, "error": outcome.err() }));
         // Preserve last-known data, but allow the new login to bypass an earlier error's backoff.
         {
@@ -189,7 +223,11 @@ async fn disconnect_monitoring(app: AppHandle, provider: Provider, id: String) -
     let operation = app.state::<AppState>().account_operations.begin(provider, &id)?;
     let slot = accounts::load_slots().into_iter().find(|s| s.provider == provider && s.id == id)
         .ok_or("monitor_wrong_account")?;
-    let revoked = app.state::<AppState>().monitor.disconnect(&slot, &http_client()).await?;
+    let started = Instant::now();
+    let result = app.state::<AppState>().monitor.disconnect(&slot, &http_client()).await;
+    app.state::<AppState>().diagnostics.record(Some(provider), Some(&id), diagnostics::Event::Action { action: diagnostics::Action::Disconnect,
+        code: diagnostics::Code::from_error(result.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) });
+    let revoked = result?;
     {
         let state = app.state::<AppState>();
         let _refresh = state.refresh_lock.lock().await;
@@ -342,6 +380,8 @@ fn http_client() -> reqwest::Client {
 async fn do_refresh(app: &AppHandle) -> Snapshot {
     let state = app.state::<AppState>();
     let _refresh = state.refresh_lock.lock().await;
+    let started = Instant::now();
+    state.diagnostics.poll_started();
     let settings = state.settings.lock().unwrap().clone();
     let found = tauri::async_runtime::spawn_blocking(sources::discover)
         .await
@@ -356,14 +396,18 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     if !CLEANUP_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         let homes = found.clone();
         let protected = state.monitor.protected_tokens(&slots).await;
-        let _ = tauri::async_runtime::spawn_blocking(move || crate::login::cleanup(&homes, protected.as_ref())).await;
+        let started = Instant::now();
+        let result = tauri::async_runtime::spawn_blocking(move || crate::login::cleanup(&homes, protected.as_ref())).await;
+        state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::Cleanup,
+            code: if result.is_ok() { diagnostics::Code::Ok } else { diagnostics::Code::Other }, elapsed_ms: diagnostics::millis(started) });
     }
 
     let mut cache = state.usage_cache.lock().unwrap().clone();
     let mut list = providers::fetch_all(&http_client(), &slots, &active, &mut cache, &settings, &state.monitor).await;
     let valid: HashSet<_> = slots.iter().map(monitoring::key).collect();
     cache.retain(|key, _| valid.contains(key));
-    let _ = providers::save_cache(&cache);
+    let saved = providers::save_cache(&cache);
+    if saved.is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::CacheSave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
     *state.usage_cache.lock().unwrap() = cache;
 
     let decisions = {
@@ -390,6 +434,9 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     }
 
     let snapshot = Snapshot { accounts: list, updated_at: Some(chrono::Utc::now()) };
+    state.diagnostics.samples(&snapshot);
+    state.diagnostics.record(None, None, diagnostics::Event::PollFinished { elapsed_ms: diagnostics::millis(started), accounts: snapshot.accounts.len(),
+        native_sources: found.iter().filter(|s| s.distro.is_none()).count(), wsl_sources: found.iter().filter(|s| s.distro.is_some()).count() });
     *state.snapshot.lock().unwrap() = snapshot.clone();
     let _ = app.emit("usage-updated", &snapshot);
     snapshot
@@ -412,6 +459,7 @@ async fn refresh_loop(app: AppHandle) {
 
 pub fn run() {
     migrate::run();
+    let diagnostics = std::sync::Arc::new(diagnostics::Recorder::new(settings::app_dir().expect("config directory").join("diagnostics/history.bin")));
     // Managed before the builder runs: config windows load (and call commands) before `setup`.
     let state = AppState {
         snapshot: Mutex::default(),
@@ -423,7 +471,8 @@ pub fn run() {
         panel_hidden_at: Mutex::default(),
         dock_width: Mutex::new(160.0),
         usage_cache: Mutex::new(providers::load_cache()),
-        monitor: monitoring::Monitor::new(settings::app_dir().expect("config directory").join("monitoring")),
+        monitor: monitoring::Monitor::new(settings::app_dir().expect("config directory").join("monitoring")).with_diagnostics(diagnostics.clone()),
+        diagnostics: diagnostics.clone(),
         refresh_lock: tokio::sync::Mutex::new(()),
         account_operations: monitoring::Operations::default(),
         last_switch: Mutex::default(),
@@ -441,6 +490,8 @@ pub fn run() {
         ))
         .invoke_handler(tauri::generate_handler![
             get_usage,
+            export_diagnostics,
+            record_frontend_error,
             refresh,
             get_settings,
             system_locale,
@@ -466,6 +517,7 @@ pub fn run() {
             taskbar_theme
         ])
         .setup(|app| {
+            app.state::<AppState>().diagnostics.start();
             let handle = app.handle();
             #[cfg(windows)]
             notify::register_app_id(&app.config().identifier);
@@ -548,6 +600,12 @@ pub fn run() {
             tauri::async_runtime::spawn(updates::run_loop(handle.clone()));
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running slopbar");
+        .build(tauri::generate_context!())
+        .expect("error while building slopbar")
+        .run(|app, event| {
+            // App::run exits the process directly: code after it cannot flush a journal.
+            if matches!(event, tauri::RunEvent::Exit) {
+                app.state::<AppState>().diagnostics.record(None, None, diagnostics::Event::Shutdown);
+            }
+        });
 }
