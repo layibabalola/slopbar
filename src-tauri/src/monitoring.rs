@@ -101,6 +101,35 @@ impl Monitor {
         self.path(slot).is_file()
     }
 
+    /// Cleanup must not revoke any login we own. An unreadable store disables
+    /// cleanup revocation instead of assuming its tokens are unprotected.
+    pub async fn protected_tokens(&self, slots: &[Slot]) -> Option<crate::login::ProtectedTokens> {
+        let sessions = self.sessions.lock().await;
+        let mut tokens: crate::login::ProtectedTokens = slots
+            .iter()
+            .filter_map(|s| refresh_token(s).map(|t| (s.provider, t.to_owned())))
+            .collect();
+        tokens.extend(
+            sessions
+                .values()
+                .map(|s| (s.session.provider, s.session.refresh_token.clone())),
+        );
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(tokens),
+            Err(_) => return None,
+        };
+        for entry in entries {
+            let path = entry.ok()?.path();
+            if path.extension().is_some_and(|ext| ext == "session") {
+                let session: Session =
+                    serde_json::from_slice(&private_store::load_secret(&path).ok()?).ok()?;
+                tokens.insert((session.provider, session.refresh_token));
+            }
+        }
+        Some(tokens)
+    }
+
     /// A fresh, isolated CLI sign-in is required. Imported/shared CLI sessions are never
     /// promoted to renewable monitoring sessions, even if their access token still works.
     pub async fn connect_replacing(
@@ -115,7 +144,7 @@ impl Monitor {
     }
 
     #[cfg(test)]
-    async fn connect(
+    pub(crate) async fn connect(
         &self,
         expected: &Slot,
         login: &Slot,
@@ -318,13 +347,6 @@ impl Monitor {
         if state.session.reconnect {
             return Err("monitor_reconnect".into());
         }
-        if state.session.refresh_expires_at.is_some_and(|t| t <= now) {
-            state.session.reconnect = true;
-            state.dirty = true;
-            self.save(slot, &state.session)?;
-            state.dirty = false;
-            return Err("monitor_reconnect".into());
-        }
         if state.session.uncertain_attempts >= 2 {
             return Err("monitor_uncertain".into());
         }
@@ -343,7 +365,10 @@ impl Monitor {
             .is_some_and(|t| t <= now + chrono::Duration::seconds(60));
         // If another poll already renewed this token, use that result instead of rotating twice.
         let rejected_current = rejected.is_some_and(|t| t == state.session.access_token);
-        if expired || rejected_current {
+        // A CLI can synthesize a refresh-token lifetime. Treat the saved deadline
+        // as a renewal hint and let the provider decide whether the token is valid.
+        let refresh_due = state.session.refresh_expires_at.is_some_and(|t| t <= now);
+        if expired || rejected_current || refresh_due {
             match transport.refresh(&state.session).await {
                 Ok(reply) => {
                     // Once the server may have rotated, preserve the returned refresh token
@@ -356,9 +381,9 @@ impl Monitor {
                         state.session.scopes =
                             scope.split_whitespace().map(str::to_owned).collect();
                     }
-                    if let Some(seconds) = reply.refresh_token_expires_in {
-                        state.session.refresh_expires_at = after_seconds(now, seconds);
-                    }
+                    state.session.refresh_expires_at = reply
+                        .refresh_token_expires_in
+                        .and_then(|seconds| after_seconds(now, seconds));
                     state.session.uncertain_attempts = 0;
                     state.session.uncertain_retry_at = None;
                     state.session.expires_at = reply
@@ -382,7 +407,7 @@ impl Monitor {
                         return Err("monitor_reconnect".into());
                     }
                 }
-                Err(Failure::Revoked) => {
+                Err(Failure::Revoked | Failure::RotatedUnreadable) => {
                     state.session.reconnect = true;
                     state.dirty = true;
                     self.save(slot, &state.session)?;
@@ -472,6 +497,7 @@ enum Failure {
     RateLimited(i64),
     Transient,
     Ambiguous,
+    RotatedUnreadable,
 }
 
 trait Refresh {
@@ -549,7 +575,12 @@ impl Api<'_> {
                 Failure::Transient
             });
         }
-        response.json().await.map_err(|_| Failure::Ambiguous)
+        // Success headers confirm that the refresh was accepted. If the body is
+        // truncated, times out, or is invalid JSON, never replay the spent token.
+        response
+            .json()
+            .await
+            .map_err(|_| Failure::RotatedUnreadable)
     }
 }
 

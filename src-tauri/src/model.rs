@@ -33,6 +33,9 @@ pub struct AccountUsage {
     /// An error code ("token_expired", "token_invalid", "bad_response", "http_<status>")
     /// or a raw network error message.
     pub error: Option<String>,
+    /// Independent monitoring can need recovery while live CLI usage is fresh.
+    #[serde(default)]
+    pub monitor_error: Option<String>,
     /// Last observed numbers; never predict a reset without a successful provider response.
     pub stale: bool,
     pub fetched_at: Option<DateTime<Utc>>,

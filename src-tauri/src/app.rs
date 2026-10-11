@@ -343,15 +343,16 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
         .unwrap_or_default();
     *state.sources.lock().unwrap() = found.clone();
     static CLEANUP_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !CLEANUP_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        let homes = found.clone();
-        let _ = tauri::async_runtime::spawn_blocking(move || crate::login::cleanup(&homes)).await;
-    }
     accounts::resolve_identities(&http_client(), &found).await;
     let scan = found.clone();
     let (active, slots) = tauri::async_runtime::spawn_blocking(move || (accounts::capture(&scan), accounts::load_slots()))
         .await
         .unwrap_or_default();
+    if !CLEANUP_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let homes = found.clone();
+        let protected = state.monitor.protected_tokens(&slots).await;
+        let _ = tauri::async_runtime::spawn_blocking(move || crate::login::cleanup(&homes, protected.as_ref())).await;
+    }
 
     let mut cache = state.usage_cache.lock().unwrap().clone();
     let mut list = providers::fetch_all(&http_client(), &slots, &active, &mut cache, &settings, &state.monitor).await;

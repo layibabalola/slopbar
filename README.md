@@ -41,7 +41,9 @@ SlopBar renews this separate session automatically when its access token is abou
 
 Last successful readings survive app restarts. If the provider cannot be reached, the UI shows **Last confirmed … ago** and retains the observed values. A passed reset time does not imply a measured 0%. Automatic switching considers only fresh, successfully measured accounts. A revoked session, an unusable refresh response, or a lost credential file may still require **Reconnect monitoring**; recent account use is never the recovery instruction.
 
-A refresh timeout does not immediately disconnect an account. SlopBar waits five minutes and allows one retry of its own monitoring token. Both the backoff and retry limit survive restarts. An explicit token rejection requires reconnecting; after a second uncertain response, automatic replay stops and the UI offers reconnecting. The providers can reject a retry if the timed-out request already rotated its token.
+A refresh timeout before success headers does not immediately disconnect an account. SlopBar waits five minutes and allows one retry of its own monitoring token. Both the backoff and retry limit survive restarts. An explicit token rejection requires reconnecting; after a second uncertain response, automatic replay stops and the UI offers reconnecting. A successful HTTP response with an unreadable body requires reconnecting immediately, because replay could reuse an already consumed token. The providers can reject a retry if the timed-out request already rotated its token.
+
+If the active account's monitor fails, SlopBar can still read fresh usage with the CLI's current access token. It never refreshes that CLI token, and keeps the monitoring error and Reconnect control visible alongside the fresh reading. This fallback is restricted to active accounts and respects usage rate limits. A saved refresh-token expiry is a renewal hint: the server decides whether the session is still valid, so a CLI-synthesized 30-day deadline does not itself disconnect monitoring.
 
 ### Why the original version lost inactive accounts
 
@@ -64,7 +66,7 @@ Local builds disable upstream updates at compile time, including if an existing 
 
 An optional frontend smoke check is available as `node scripts/test-telemetry-ui.cjs` with Playwright and Chromium installed. It uses synthetic accounts and mocked Tauri commands to check monitoring controls, stale usage, error feedback, and the minimum supported window width. Set `CHROMIUM_PATH` to use an existing Chromium binary. These checks do not authenticate with a provider or exercise a real Windows credential store; the Rust tests run DPAPI checks when executed on Windows.
 
-The Rust suite also runs the real HTTP code against a local server with synthetic tokens: JSON request encoding, saved Claude scopes, nested OAuth errors, rate limits, delayed responses, and revocation. `Telemetry tests` runs core tests on Linux and Windows without release credentials. Fork PR workflows can require maintainer approval before they execute.
+The Rust suite also runs the real HTTP code against a local server with synthetic tokens: JSON request encoding, saved Claude scopes, nested OAuth errors, rate limits, delayed responses, and revocation. It covers failed credential-file deletion after handoff, non-revocation of imported sessions, and successful-response bodies that must never be replayed. Windows tests check suspended process startup and descendant termination. `Telemetry tests` runs core tests on Linux and Windows, then checks the official updater feature and builds an unsigned native Windows desktop executable. Its test-build artifact includes the exact source and SHA256 manifest; it does not publish a release or use signing secrets. Fork PR workflows can require maintainer approval before they execute.
 
 Cross-compiled for Windows from WSL/Linux:
 

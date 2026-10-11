@@ -391,7 +391,7 @@ pub fn start_login(provider: Provider, sources: &[Source]) -> Result<LoginJob, S
     let source = login_source(provider, sources).ok_or("CLI not found")?.clone();
     static LOGIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = format!(".slopbar-login-{}-{}-{}", std::process::id(), chrono::Utc::now().timestamp_millis(), LOGIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-    let cmd = match provider { Provider::Claude => "claude auth login", Provider::Codex => "codex login" };
+    let cmd = crate::login::action(provider, false);
     let dir = source.home.join(&name);
     // Never reuse a directory (or a symlink) left by an earlier/crashed sign-in.
     std::fs::create_dir(&dir).map_err(|_| "monitor_storage".to_string())?;
@@ -409,19 +409,9 @@ pub fn start_login(provider: Provider, sources: &[Source]) -> Result<LoginJob, S
     }
     let native = format!("{}/{name}", source.native_home);
     let mut term = crate::login::command(provider, &source, &dir, &native, cmd, true);
-    let mut child = match term.spawn() {
-        Ok(child) => child,
+    let (child, tree) = match crate::login::ProcessTree::spawn(&mut term, true) {
+        Ok(process) => process,
         Err(_) => {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err("monitor_login_failed".into());
-        }
-    };
-
-    let tree = match crate::login::ProcessTree::attach(&child) {
-        Ok(tree) => tree,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
             let _ = std::fs::remove_dir_all(&dir);
             return Err("monitor_login_failed".into());
         }
@@ -483,6 +473,9 @@ impl LoginJob {
         drop(self.tree.take());
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Credentials may reach the vault, main CLI, or monitor only after a
+        // durable handoff marker prevents later cleanup from logging them out.
+        let result = result.filter(|_| crate::login::handoff(&self.dir, self.provider).is_ok());
         if result.is_none() {
             let (provider, source, dir, native) = (self.provider, self.source.clone(), self.dir.clone(), self.native.clone());
             let _ = tokio::task::spawn_blocking(move || crate::login::logout(provider, &source, &dir, &native)).await;

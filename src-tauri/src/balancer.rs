@@ -57,7 +57,7 @@ mod tests {
             id: id.into(), provider: Provider::Claude, email: None, alias: None, plan: None, org: None,
             active, sources: vec![], windows: percent.map(|used_percent| UsageWindow {
                 kind: "session".into(), window_seconds: None, used_percent, resets_at: None,
-            }).into_iter().collect(), credits: None, resets: vec![], error: None, stale: false,
+            }).into_iter().collect(), credits: None, resets: vec![], error: None, monitor_error: None, stale: false,
             fetched_at: Some(chrono::Utc::now()), monitor_connected: true,
         }
     }
@@ -75,6 +75,8 @@ mod tests {
         assert!(decide(&[current.clone(), target.clone()], &settings, &HashMap::new()).is_empty());
         assert!(decide(&[current.clone(), account("unknown", false, None)], &settings, &HashMap::new()).is_empty());
         target.error = None;
+        // A monitor error must not invalidate a successful live CLI measurement.
+        target.monitor_error = Some("monitor_reconnect".into());
         assert_eq!(decide(&[current.clone(), target.clone()], &settings, &HashMap::new()), [(Provider::Claude, "inactive".into())]);
         let mut stale_current = current;
         stale_current.stale = true;

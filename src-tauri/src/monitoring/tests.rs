@@ -493,17 +493,63 @@ async fn scopes_and_refresh_lifetime_are_persisted_without_inventing_a_lifetime(
         Monitor::new(dir.0.clone())
             .token_with(
                 &cli(),
-                &Scripted::new([]),
+                &Scripted::new([reply("access-3", Some("refresh-3"))]),
                 None,
                 now() + chrono::Duration::hours(2)
             )
             .await,
-        Err("monitor_reconnect".into())
+        Ok(("access-3".into(), None))
     );
+    let restarted = Monitor::new(dir.0.clone());
+    let saved: Session =
+        serde_json::from_slice(&private_store::load_secret(&restarted.path(&cli())).unwrap())
+            .unwrap();
+    assert_eq!(saved.refresh_expires_at, None);
 }
 
 // These tests exercise the production reqwest encoder, response parser and state
 // machine over a real socket. Only synthetic tokens are sent, to localhost.
+#[tokio::test]
+async fn imported_cli_expiry_hint_requests_one_refresh_instead_of_forcing_reconnect() {
+    let dir = TempDir::new();
+    let monitor = Monitor::new(dir.0.clone());
+    let mut fresh = login();
+    fresh.data["credentials"]["claudeAiOauth"]["expiresAt"] =
+        json!((now() + chrono::Duration::days(40)).timestamp_millis());
+    fresh.data["credentials"]["claudeAiOauth"]["refreshTokenExpiresAt"] =
+        json!((now() + chrono::Duration::days(30)).timestamp_millis());
+    monitor.connect(&cli(), &fresh, &[]).await.unwrap();
+    let transport = Scripted::new([reply("access-after-deadline", Some("new-chain"))]);
+    assert_eq!(
+        monitor
+            .token_with(&cli(), &transport, None, now() + chrono::Duration::days(31))
+            .await
+            .unwrap()
+            .0,
+        "access-after-deadline"
+    );
+    assert_eq!(transport.calls(), ["monitor-refresh-1"]);
+    let saved: Session =
+        serde_json::from_slice(&private_store::load_secret(&monitor.path(&cli())).unwrap())
+            .unwrap();
+    assert!(!saved.reconnect);
+    assert_eq!(saved.refresh_expires_at, None);
+}
+
+#[tokio::test]
+async fn cleanup_protects_vault_and_persisted_monitor_tokens_and_fails_closed_on_corruption() {
+    let dir = TempDir::new();
+    let monitor = Monitor::new(dir.0.clone());
+    monitor.connect(&cli(), &login(), &[]).await.unwrap();
+    drop(monitor);
+    let monitor = Monitor::new(dir.0.clone());
+    let protected = monitor.protected_tokens(&[cli()]).await.unwrap();
+    assert!(protected.contains(&(Provider::Claude, "cli-refresh".into())));
+    assert!(protected.contains(&(Provider::Claude, "monitor-refresh-1".into())));
+    private_store::save_secret(&monitor.path(&cli()), b"corrupt-session").unwrap();
+    assert!(monitor.protected_tokens(&[cli()]).await.is_none());
+}
+
 mod http {
     use super::*;
     use std::io::{Read, Write};
@@ -514,6 +560,7 @@ mod http {
         status: u16,
         body: &'static str,
         delay: Duration,
+        body_delay: Duration,
         header: &'static str,
     }
     fn response(status: u16, body: &'static str) -> Response {
@@ -521,6 +568,7 @@ mod http {
             status,
             body,
             delay: Duration::ZERO,
+            body_delay: Duration::ZERO,
             header: "",
         }
     }
@@ -580,8 +628,10 @@ mod http {
                     }
                     let _ = send.send(String::from_utf8(request).unwrap());
                     std::thread::sleep(reply.delay);
-                    let data = format!("HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}", reply.status, reply.body.len(), reply.header, reply.body);
+                    let data = format!("HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n", reply.status, reply.body.len(), reply.header);
                     let _ = stream.write_all(data.as_bytes());
+                    std::thread::sleep(reply.body_delay);
+                    let _ = stream.write_all(reply.body.as_bytes());
                 }
             });
             Self {
@@ -688,7 +738,7 @@ mod http {
             (400, r#"{"error":"invalid_client"}"#, Failure::Transient),
             (400, "not-json", Failure::Transient),
             (503, r#"{"error":"unavailable"}"#, Failure::Transient),
-            (200, "not-json", Failure::Ambiguous),
+            (200, "not-json", Failure::RotatedUnreadable),
         ] {
             let server = Server::new(vec![response(status, body)]);
             assert_eq!(
@@ -710,6 +760,42 @@ mod http {
                 .err(),
             Some(Failure::RateLimited(900))
         );
+    }
+    #[tokio::test]
+    async fn accepted_but_unreadable_refresh_never_replays_even_after_restart() {
+        for (body, delay) in [
+            ("not-json", 0),
+            (r#"{"refresh_token":"new","expires_in":"invalid-type"}"#, 0),
+            (r#"{"refresh_token":"lost"}"#, 150),
+        ] {
+            let mut accepted = response(200, body);
+            accepted.body_delay = Duration::from_millis(delay);
+            let server = Server::new(vec![accepted]);
+            let dir = TempDir::new();
+            let monitor = Monitor::new(dir.0.clone());
+            monitor.connect(&cli(), &login(), &[]).await.unwrap();
+            assert_eq!(
+                monitor
+                    .token_with(
+                        &cli(),
+                        &Local(&client(if delay == 0 { 1000 } else { 40 }), &server.url),
+                        None,
+                        now()
+                    )
+                    .await,
+                Err("monitor_reconnect".into())
+            );
+            assert!(server.request().contains("monitor-refresh-1"));
+            drop(monitor);
+            let replay = Scripted::new([]);
+            assert_eq!(
+                Monitor::new(dir.0.clone())
+                    .token_with(&cli(), &replay, None, now() + chrono::Duration::days(1))
+                    .await,
+                Err("monitor_reconnect".into())
+            );
+            assert!(replay.calls().is_empty());
+        }
     }
     #[tokio::test]
     async fn real_timeout_recovers_once_without_marking_account_revoked() {

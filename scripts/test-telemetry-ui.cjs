@@ -18,7 +18,7 @@ const data = {
   updated_at: new Date().toISOString(),
   accounts: [
     { id: 'inactive:org', provider: 'claude', email: 'inactive@example.invalid', plan: 'max', active: false, monitor_connected: false, stale: true, error: 'monitor_setup', percent: 87 },
-    { id: 'connected:org', provider: 'claude', email: 'connected@example.invalid', plan: 'max', active: true, monitor_connected: true, stale: false, error: null, percent: 24 },
+    { id: 'connected:org', provider: 'claude', email: 'connected@example.invalid', plan: 'max', active: true, monitor_connected: true, stale: false, error: null, monitor_error: 'monitor_reconnect', percent: 24 },
     { id: 'reconnect:org', provider: 'codex', email: 'reconnect@example.invalid', plan: 'plus', active: true, monitor_connected: true, stale: true, error: 'monitor_reconnect', percent: 52 },
   ].map(a => ({ ...a, alias: null, org: null, credits: null, resets: [], sources: a.active ? ['Windows'] : [],
     fetched_at: new Date(Date.now() - (a.stale ? 7200000 : 1000)).toISOString(),
@@ -60,12 +60,15 @@ async function setup(page, label) {
     settings.on('pageerror', err => errors.push(String(err)));
     await setup(settings, 'settings');
     await settings.goto(base + '/settings.html');
-    await settings.locator('[data-monitor="claude"]').waitFor();
+    await settings.locator('[data-key="claude:inactive:org"] [data-monitor]').waitFor();
     assert.match(await settings.locator('#accounts').innerText(), /Last confirmed 2h ago/);
     assert.match(await settings.locator('[data-key="claude:inactive:org"]').innerText(), /87%/);
     assert.equal(await settings.locator('#auto-update').isDisabled(), true);
     assert.equal(await settings.locator('#auto-update').isChecked(), false);
-    await settings.locator('[data-monitor="claude"]').click();
+    assert.match(await settings.locator('[data-key="claude:connected:org"]').innerText(), /Reconnect monitoring/);
+    assert.match(await settings.locator('[data-key="claude:connected:org"] .meter').innerText(), /24%/);
+    assert.equal(await settings.locator('[data-key="claude:connected:org"] .meter.stale').count(), 0);
+    await settings.locator('[data-key="claude:inactive:org"] [data-monitor]').click();
     assert.match(await settings.locator('#add-hint').innerText(), /Finish the monitoring sign-in/);
     const called = await settings.evaluate(() => window.testCalls.filter(c => c.command === 'connect_monitoring' || c.command === 'switch_account'));
     assert.deepEqual(called, [{ command: 'connect_monitoring', args: { provider: 'claude', id: 'inactive:org' } }]);
