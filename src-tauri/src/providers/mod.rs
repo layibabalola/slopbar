@@ -241,6 +241,46 @@ mod tests {
     use crate::test_support::{slot, TempDir};
 
     #[tokio::test]
+    async fn repeated_monitor_usage_failure_and_cli_fallback_have_independent_diagnostics() {
+        struct Observed(std::sync::Mutex<Vec<String>>);
+        impl Usage for Observed {
+            async fn fetch(&self, _: Provider, token: &str, _: Option<&str>) -> Result<Fetched, String> {
+                self.0.lock().unwrap().push(token.to_owned());
+                if token == "monitor-access" { return Err("bad_response".into()); }
+                Ok(Fetched { windows: observed(24.0).windows, credits: None, resets: vec![], monitor_error: None })
+            }
+        }
+        let dir = TempDir::new();
+        let recorder = std::sync::Arc::new(crate::diagnostics::Recorder::new(dir.0.join("journal")));
+        recorder.start();
+        let monitor = Monitor::new(dir.0.join("monitoring")).with_diagnostics(recorder.clone());
+        let account = slot("active:org", "live-cli-access", "cli-owned-refresh", i64::MAX);
+        let login = slot("active:org", "monitor-access", "monitor-refresh", i64::MAX);
+        monitor.connect(&account, &login, &[]).await.unwrap();
+        let usage = Observed(std::sync::Mutex::new(vec![]));
+        let client = reqwest::Client::new();
+        let original = serde_json::to_vec(&account).unwrap();
+        for _ in 0..60 {
+            let result = fetch_one_with(&client, &account, &monitor, true, &usage).await.unwrap();
+            assert_eq!(result.windows[0].used_percent, 24.0);
+            assert_eq!(result.monitor_error.as_deref(), Some("bad_response"));
+        }
+        let calls = usage.0.lock().unwrap();
+        assert_eq!(calls.len(), 120);
+        for pair in calls.chunks_exact(2) { assert_eq!(pair, ["monitor-access", "live-cli-access"]); }
+        assert_eq!(serde_json::to_vec(&account).unwrap(), original);
+        let report: serde_json::Value = serde_json::from_slice(&recorder.report(&crate::model::Snapshot::default(), &Settings::default()).unwrap()).unwrap();
+        let events = report["events"].as_array().unwrap();
+        let readings: Vec<_> = events.iter().filter(|r| r["event"]["type"] == "usage").collect();
+        assert_eq!(readings.len(), 2);
+        assert_eq!(readings[0]["event"]["origin"], "monitoring");
+        assert_eq!(readings[0]["event"]["code"], "bad_response");
+        assert_eq!(readings[1]["event"]["origin"], "active_cli_fallback");
+        assert_eq!(readings[1]["event"]["code"], "ok");
+        assert!(!events.iter().any(|r| r["event"]["type"] == "refresh"));
+    }
+
+    #[tokio::test]
     async fn only_active_cli_access_tokens_can_supply_fresh_usage_after_monitor_failure() {
         struct Observed(std::sync::Mutex<Vec<String>>);
         impl Usage for Observed {

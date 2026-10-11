@@ -340,7 +340,7 @@ struct State {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Family {
     Token,
-    Usage,
+    Usage(Origin),
     Sample,
     PollStarted,
     PollFinished,
@@ -352,9 +352,13 @@ fn observation(event: &Event) -> Option<(Family, Event)> {
     let mut signature = event.clone();
     let family = match &mut signature {
         Event::Token { .. } => Family::Token,
-        Event::Usage { elapsed_ms, .. } => {
+        Event::Usage {
+            origin, elapsed_ms, ..
+        } => {
             *elapsed_ms = 0;
-            Family::Usage
+            // A failed monitor and a successful CLI fallback are simultaneous
+            // streams, not alternating changes in one observation.
+            Family::Usage(*origin)
         }
         Event::Sample {
             stale,
@@ -986,6 +990,113 @@ mod tests {
                     >= 7
             );
             assert!(s.history.suppressed > 10_000);
+        }
+    }
+    #[test]
+    fn eleven_accounts_retain_a_week_with_repeated_active_cli_fallback() {
+        for interval in [1, 5, 15] {
+            let mut s = State::default();
+            let begin = Utc::now();
+            for minute in (0..=7 * 24 * 60).step_by(interval) {
+                let now = begin + chrono::Duration::minutes(minute as i64);
+                // Ten independent monitors remain healthy; the active account's
+                // monitor usage fails while its captured CLI access token works.
+                Recorder::push_at(
+                    &mut s,
+                    None,
+                    None,
+                    Event::PollStarted { gap_seconds: None },
+                    now,
+                );
+                for account in 0..11 {
+                    let id = format!("synthetic-{account}");
+                    let active = account == 0;
+                    Recorder::push_at(
+                        &mut s,
+                        Some(Provider::Claude),
+                        Some(&id),
+                        Event::Token {
+                            decision: Decision::Reuse,
+                            access_expires_at: None,
+                            retry_at: None,
+                            uncertain_attempts: 0,
+                            access_rejected: false,
+                            usable: true,
+                        },
+                        now,
+                    );
+                    Recorder::push_at(
+                        &mut s,
+                        Some(Provider::Claude),
+                        Some(&id),
+                        Event::Usage {
+                            origin: Origin::Monitoring,
+                            code: if active { Code::BadResponse } else { Code::Ok },
+                            elapsed_ms: minute as u64,
+                        },
+                        now,
+                    );
+                    if active {
+                        Recorder::push_at(
+                            &mut s,
+                            Some(Provider::Claude),
+                            Some(&id),
+                            Event::Usage {
+                                origin: Origin::ActiveCliFallback,
+                                code: Code::Ok,
+                                elapsed_ms: minute as u64 + 1,
+                            },
+                            now,
+                        );
+                    }
+                    let mut reading = stable_sample(now);
+                    if let Event::Sample {
+                        active: is_active,
+                        monitor_code,
+                        ..
+                    } = &mut reading
+                    {
+                        *is_active = active;
+                        *monitor_code = if active { Code::BadResponse } else { Code::Ok };
+                    }
+                    Recorder::push_at(&mut s, Some(Provider::Claude), Some(&id), reading, now);
+                }
+                Recorder::push_at(
+                    &mut s,
+                    None,
+                    None,
+                    Event::PollFinished {
+                        elapsed_ms: (minute % 1000) as u64,
+                        accounts: 11,
+                        native_sources: 1,
+                        wsl_sources: 0,
+                    },
+                    now,
+                );
+            }
+            assert!(
+                s.history.events.len() < 6_500,
+                "interval {interval}: {} events",
+                s.history.events.len()
+            );
+            assert_eq!(s.history.dropped, 0, "interval {interval}");
+            assert_eq!(
+                (s.history.events.back().unwrap().at - s.history.events.front().unwrap().at)
+                    .num_days(),
+                7
+            );
+            for origin in [Origin::Monitoring, Origin::ActiveCliFallback] {
+                let usage = s
+                    .history
+                    .events
+                    .iter()
+                    .filter(|r| {
+                        r.account == Some(1)
+                            && matches!(r.event, Event::Usage { origin: o, .. } if o == origin)
+                    })
+                    .count();
+                assert_eq!(usage, 169, "each stream keeps its own hourly heartbeat");
+            }
         }
     }
     fn idle_poll(s: &mut State, now: DateTime<Utc>, minute: usize) {
