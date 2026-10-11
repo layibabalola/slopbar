@@ -381,8 +381,8 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     let state = app.state::<AppState>();
     let _refresh = state.refresh_lock.lock().await;
     let started = Instant::now();
-    state.diagnostics.poll_started();
     let settings = state.settings.lock().unwrap().clone();
+    state.diagnostics.poll_started(settings.refresh_minutes);
     let found = tauri::async_runtime::spawn_blocking(sources::discover)
         .await
         .unwrap_or_default();

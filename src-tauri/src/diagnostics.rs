@@ -5,12 +5,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 const MAX_EVENTS: usize = 10_000;
 const MAX_ACCOUNTS: usize = 1_024;
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
 const DAYS: i64 = 7;
+const HEARTBEAT_SECONDS: i64 = 3_600;
+const FLUSH_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -64,7 +67,7 @@ impl Code {
         }
     }
 }
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
     ConnectStarted,
@@ -80,14 +83,14 @@ pub enum Action {
     Revoke,
     Export,
 }
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Surface {
     Settings,
     Panel,
     Dock,
 }
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum FrontendKind {
     Error,
@@ -98,14 +101,14 @@ pub enum FrontendKind {
     Rejection,
     Other,
 }
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Origin {
     Monitoring,
     Cli,
     ActiveCliFallback,
 }
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
     Reuse,
@@ -117,14 +120,14 @@ pub enum Decision {
     UsageRejected,
     LateRejectionIgnored,
 }
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum RefreshReason {
     AccessExpiry,
     UsageRejection,
     ExpiryHint,
 }
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum RefreshOutcome {
     Started,
@@ -135,7 +138,7 @@ pub enum RefreshOutcome {
     RateLimited,
     Ambiguous,
 }
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum LoginStage {
     CliDiscovery,
@@ -150,14 +153,14 @@ pub enum LoginStage {
     FolderCleanup,
     Cancelled,
 }
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum RevokeReason {
     Disconnect,
     Replacement,
     UninstalledLogin,
 }
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum RevokeOutcome {
     Confirmed,
@@ -166,7 +169,7 @@ pub enum RevokeOutcome {
     UnknownOwnership,
     NoToken,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     Http {
@@ -240,26 +243,26 @@ pub enum Event {
         windows: Vec<Window>,
     },
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Window {
     kind: WindowKind,
     used_percent: f64,
     resets_at: Option<DateTime<Utc>>,
 }
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Endpoint {
     Token,
     Revoke,
 }
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Network {
     Connect,
     Timeout,
     Transport,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum WindowKind {
     Session,
@@ -297,7 +300,7 @@ fn sample(a: &crate::model::AccountUsage) -> Event {
             .collect(),
     }
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 struct Record {
     at: DateTime<Utc>,
     run: u64,
@@ -305,7 +308,7 @@ struct Record {
     account: Option<u32>,
     event: Event,
 }
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct History {
     version: u8,
     run: u64,
@@ -314,8 +317,12 @@ struct History {
     accounts: HashMap<String, u32>,
     events: VecDeque<Record>,
     dropped: u64,
+    #[serde(default)]
+    suppressed: u64,
     clean_shutdown: bool,
 }
+type ObservationKey = (Option<Provider>, Option<u32>, Family);
+type ObservationValue = (Event, DateTime<Utc>);
 #[derive(Default)]
 struct State {
     history: History,
@@ -323,10 +330,70 @@ struct State {
     history_unreadable: bool,
     storage_errors: u64,
     last_poll: Option<DateTime<Utc>>,
+    observations: HashMap<ObservationKey, ObservationValue>,
+    generation: u64,
+    urgent_through: u64,
+    completed: u64,
+    write_attempts: u64,
+    stop: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Family {
+    Token,
+    Usage,
+    Sample,
+    PollStarted,
+    PollFinished,
+    Action(Action),
+}
+// Ignore measurement timestamps/timing jitter when deciding whether state changed.
+// The actual record keeps those values; a fresh heartbeat is kept every hour.
+fn observation(event: &Event) -> Option<(Family, Event)> {
+    let mut signature = event.clone();
+    let family = match &mut signature {
+        Event::Token { .. } => Family::Token,
+        Event::Usage { elapsed_ms, .. } => {
+            *elapsed_ms = 0;
+            Family::Usage
+        }
+        Event::Sample {
+            stale,
+            last_confirmed_at,
+            ..
+        } => {
+            if !*stale {
+                *last_confirmed_at = None;
+            }
+            Family::Sample
+        }
+        Event::PollStarted { .. } => Family::PollStarted,
+        Event::PollFinished { elapsed_ms, .. } => {
+            *elapsed_ms = if *elapsed_ms >= 60_000 { 60_000 } else { 0 };
+            Family::PollFinished
+        }
+        Event::Action {
+            action, elapsed_ms, ..
+        } if matches!(
+            action,
+            Action::TokenRead | Action::CacheSave | Action::MonitorSave
+        ) =>
+        {
+            *elapsed_ms = 0;
+            Family::Action(*action)
+        }
+        _ => return None,
+    };
+    Some((family, signature))
+}
+#[derive(Default)]
+struct Shared {
+    state: Mutex<State>,
+    wake: Condvar,
 }
 pub struct Recorder {
     path: PathBuf,
-    state: Mutex<State>,
+    shared: Arc<Shared>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 pub struct Context {
     pub recorder: std::sync::Arc<Recorder>,
@@ -357,15 +424,34 @@ impl Context {
 }
 impl Recorder {
     pub fn new(path: PathBuf) -> Self {
+        Self::with_writer(path, |path, bytes| {
+            private_store::save_secret(path, bytes).is_ok()
+        })
+    }
+    fn with_writer(
+        path: PathBuf,
+        save: impl Fn(&std::path::Path, &[u8]) -> bool + Send + 'static,
+    ) -> Self {
+        let shared = Arc::new(Shared::default());
+        let writer = shared.clone();
+        let writer_path = path.clone();
+        let worker = std::thread::Builder::new()
+            .name("diagnostic-writer".into())
+            .spawn(move || Self::write_loop(writer_path, writer, save))
+            .ok();
+        if worker.is_none() {
+            shared.state.lock().unwrap().storage_errors = 1;
+        }
         Self {
             path,
-            state: Mutex::default(),
+            shared,
+            worker,
         }
     }
     // Start only in Tauri setup, AFTER single-instance handling. A second launch
     // must not load/save a competing journal or falsely mark the app as stopped.
     pub fn start(&self) {
-        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if s.started {
             return;
         }
@@ -401,7 +487,8 @@ impl Recorder {
                 history_unreadable: unreadable,
             },
         );
-        self.persist(&mut s);
+        s.urgent_through = s.generation;
+        self.shared.wake.notify_all();
     }
     fn account(s: &mut State, provider: Option<Provider>, id: Option<&str>) -> Option<u32> {
         let (provider, id) = (provider?, id?);
@@ -421,8 +508,29 @@ impl Recorder {
         Some(n)
     }
     fn push(s: &mut State, provider: Option<Provider>, id: Option<&str>, event: Event) {
-        let now = Utc::now();
+        Self::push_at(s, provider, id, event, Utc::now());
+    }
+    fn push_at(
+        s: &mut State,
+        provider: Option<Provider>,
+        id: Option<&str>,
+        event: Event,
+        now: DateTime<Utc>,
+    ) {
         let account = Self::account(s, provider, id);
+        if let Some((family, signature)) = observation(&event) {
+            let key = (provider, account, family);
+            if s.observations.get(&key).is_some_and(|(previous, at)| {
+                *previous == signature
+                    && now >= *at
+                    && (now - *at).num_seconds() < HEARTBEAT_SECONDS
+            }) {
+                s.history.suppressed = s.history.suppressed.saturating_add(1);
+                return;
+            }
+            s.observations.insert(key, (signature, now));
+        }
+        s.generation = s.generation.saturating_add(1);
         s.history.events.push_back(Record {
             at: now,
             run: s.history.run,
@@ -440,51 +548,130 @@ impl Recorder {
             s.history.dropped = s.history.dropped.saturating_add(1);
         }
     }
-    fn persist(&self, s: &mut State) {
-        let ok = serde_json::to_vec(&s.history)
-            .ok()
-            .filter(|b| b.len() as u64 <= MAX_BYTES)
-            .is_some_and(|b| private_store::save_secret(&self.path, &b).is_ok());
-        if !ok {
-            s.storage_errors = s.storage_errors.saturating_add(1);
+    fn write_loop(
+        path: PathBuf,
+        shared: Arc<Shared>,
+        save: impl Fn(&std::path::Path, &[u8]) -> bool,
+    ) {
+        let mut next_flush = Instant::now() + FLUSH_INTERVAL;
+        loop {
+            let (history, generation, stopping) = {
+                let mut s = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if s.stop && (!s.started || s.generation == s.completed) {
+                        return;
+                    }
+                    let dirty = s.started && s.generation > s.completed;
+                    if dirty
+                        && (s.stop
+                            || s.urgent_through > s.completed
+                            || Instant::now() >= next_flush)
+                    {
+                        break;
+                    }
+                    let wait = if dirty {
+                        next_flush.saturating_duration_since(Instant::now())
+                    } else {
+                        FLUSH_INTERVAL
+                    };
+                    s = shared
+                        .wake
+                        .wait_timeout(s, wait)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                }
+                (s.history.clone(), s.generation, s.stop)
+            };
+            // Serialization, DPAPI and disk I/O never hold the recorder or monitor lock.
+            let ok = serde_json::to_vec(&history)
+                .ok()
+                .filter(|b| b.len() as u64 <= MAX_BYTES)
+                .is_some_and(|b| save(&path, &b));
+            let mut s = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.write_attempts = s.write_attempts.saturating_add(1);
+            if !ok {
+                s.storage_errors = s.storage_errors.saturating_add(1);
+            }
+            // Complete barriers even on disk failure. Diagnostics cannot gate authentication.
+            s.completed = generation;
+            next_flush = Instant::now() + FLUSH_INTERVAL;
+            shared.wake.notify_all();
+            if stopping && s.generation == s.completed {
+                return;
+            }
+        }
+    }
+    // Only export/shutdown wait for the background writer. Auth callers merely notify it.
+    fn flush(&self) {
+        if self.worker.is_none() {
+            return;
+        }
+        let mut s = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let target = s.generation;
+        s.urgent_through = target;
+        self.shared.wake.notify_all();
+        while s.started && s.completed < target {
+            s = self.shared.wake.wait(s).unwrap_or_else(|e| e.into_inner());
         }
     }
     pub fn record(&self, provider: Option<Provider>, id: Option<&str>, event: Event) {
-        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let shutdown = matches!(event, Event::Shutdown);
+        self.record_at(provider, id, event, Utc::now());
+        if shutdown {
+            self.flush();
+        }
+    }
+    fn record_at(
+        &self,
+        provider: Option<Provider>,
+        id: Option<&str>,
+        event: Event,
+        now: DateTime<Utc>,
+    ) {
+        let mut s = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if !s.started {
             return;
         }
         if matches!(event, Event::Shutdown) {
             s.history.clean_shutdown = true;
         }
-        // Batch routine observations into the poll's durable completion. Preserve
-        // lifecycle/auth transitions immediately, including BEFORE sending a refresh.
-        let flush = !matches!(
-            event,
-            Event::Token { .. } | Event::Usage { .. } | Event::Frontend { .. } | Event::Http { .. }
-        );
-        Self::push(&mut s, provider, id, event);
-        // Best effort only: diagnostic disk failure NEVER changes authentication.
-        if flush {
-            self.persist(&mut s);
-        }
-    }
-    pub fn poll_started(&self) {
-        let gap = {
-            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            s.last_poll
-                .replace(Utc::now())
-                .map(|t| (Utc::now() - t).num_seconds())
+        let urgent = match &event {
+            Event::Token { decision, .. } => !matches!(decision, Decision::Reuse),
+            Event::PollStarted { gap_seconds } => gap_seconds.is_some(),
+            Event::Usage { .. }
+            | Event::Sample { .. }
+            | Event::Frontend { .. }
+            | Event::Http { .. }
+            | Event::PollFinished { .. } => false,
+            _ => true,
         };
-        self.record(None, None, Event::PollStarted { gap_seconds: gap });
+        let previous = s.generation;
+        Self::push_at(&mut s, provider, id, event, now);
+        if s.generation > previous && urgent {
+            s.urgent_through = s.generation;
+        }
+        self.shared.wake.notify_all();
+    }
+    pub fn poll_started(&self, refresh_minutes: u32) {
+        let now = Utc::now();
+        let gap = {
+            let mut s = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.last_poll.replace(now).map(|t| (now - t).num_seconds())
+        };
+        // Ordinary interval jitter is not a transition. Record unusual gaps exactly;
+        // their cause (sleep, hang, slow requests) remains an inference.
+        let abnormal = gap.filter(|g| *g < 0 || *g > i64::from(refresh_minutes) * 120 + 60);
+        self.record(
+            None,
+            None,
+            Event::PollStarted {
+                gap_seconds: abnormal,
+            },
+        );
     }
     pub fn samples(&self, snapshot: &Snapshot) {
-        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !s.started {
-            return;
-        }
         for a in &snapshot.accounts {
-            Self::push(&mut s, Some(a.provider), Some(&a.id), sample(a));
+            self.record(Some(a.provider), Some(&a.id), sample(a));
         }
     }
     pub fn report(
@@ -492,7 +679,7 @@ impl Recorder {
         snapshot: &Snapshot,
         settings: &Settings,
     ) -> Result<Vec<u8>, &'static str> {
-        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if !s.started {
             return Err("diagnostic_storage");
         }
@@ -508,20 +695,25 @@ impl Recorder {
             })
             .collect();
         #[derive(Serialize)]
-        struct Report<'a> {
+        struct Report {
             schema_version: u8,
             exported_at: DateTime<Utc>,
             build: Build,
             retention_days: i64,
             event_limit: usize,
             dropped_events: u64,
+            suppressed_observations: u64,
+            heartbeat_seconds: i64,
+            routine_flush_seconds: u64,
+            journal_write_attempts: u64,
+            history_from: Option<DateTime<Utc>>,
             history_unreadable: bool,
             storage_errors: u64,
             refresh_minutes: u32,
             claude_enabled: bool,
             codex_enabled: bool,
             current: Vec<Record>,
-            events: &'a VecDeque<Record>,
+            events: VecDeque<Record>,
         }
         let report = Report {
             schema_version: 1,
@@ -530,14 +722,20 @@ impl Recorder {
             retention_days: DAYS,
             event_limit: MAX_EVENTS,
             dropped_events: s.history.dropped,
+            suppressed_observations: s.history.suppressed,
+            heartbeat_seconds: HEARTBEAT_SECONDS,
+            routine_flush_seconds: FLUSH_INTERVAL.as_secs(),
+            journal_write_attempts: s.write_attempts,
+            history_from: s.history.events.front().map(|r| r.at),
             history_unreadable: s.history_unreadable,
             storage_errors: s.storage_errors,
             refresh_minutes: settings.refresh_minutes,
             claude_enabled: settings.providers.claude,
             codex_enabled: settings.providers.codex,
             current,
-            events: &s.history.events,
+            events: s.history.events.clone(),
         };
+        drop(s);
         serde_json::to_vec_pretty(&report).map_err(|_| "diagnostic_storage")
     }
     pub fn export(
@@ -554,6 +752,7 @@ impl Recorder {
                 elapsed_ms: 0,
             },
         );
+        self.flush();
         let bytes = self.report(snapshot, settings)?;
         let dir = self
             .path
@@ -566,6 +765,18 @@ impl Recorder {
         ));
         private_store::write(&path, &bytes).map_err(|_| "diagnostic_storage")?;
         Ok(path)
+    }
+}
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        {
+            let mut s = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.stop = true;
+            self.shared.wake.notify_all();
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 #[derive(Serialize)]
@@ -641,6 +852,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.aliases.insert(canary.into(), canary.into());
         r.samples(&snapshot);
+        r.flush();
         #[cfg(windows)]
         assert!(!std::fs::read(dir.0.join("history"))
             .unwrap()
@@ -706,7 +918,7 @@ mod tests {
         let r = Recorder::new(path.clone());
         r.start();
         {
-            let mut s = r.state.lock().unwrap();
+            let mut s = r.shared.state.lock().unwrap();
             let old = Record {
                 at: Utc::now() - chrono::Duration::days(8),
                 run: 1,
@@ -717,7 +929,7 @@ mod tests {
             s.history.events = VecDeque::from(vec![old; MAX_EVENTS + 1]);
         }
         r.record(None, None, Event::Shutdown);
-        assert_eq!(r.state.lock().unwrap().history.events.len(), 1);
+        assert_eq!(r.shared.state.lock().unwrap().history.events.len(), 1);
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         r.record(
@@ -727,6 +939,7 @@ mod tests {
                 gap_seconds: Some(900),
             },
         );
+        r.flush();
         let report: serde_json::Value = serde_json::from_slice(
             &r.report(&Snapshot::default(), &Settings::default())
                 .unwrap(),
@@ -735,6 +948,224 @@ mod tests {
         assert_eq!(report["history_unreadable"], true);
         assert!(report["storage_errors"].as_u64().unwrap() > 0);
         assert!(report["dropped_events"].as_u64().unwrap() > MAX_EVENTS as u64);
+    }
+    fn stable_sample(at: DateTime<Utc>) -> Event {
+        Event::Sample {
+            active: false,
+            monitoring: true,
+            stale: false,
+            last_confirmed_at: Some(at),
+            code: Code::Ok,
+            monitor_code: Code::Ok,
+            windows: vec![Window {
+                kind: WindowKind::Session,
+                used_percent: 24.0,
+                resets_at: None,
+            }],
+        }
+    }
+    #[test]
+    fn eleven_idle_accounts_retain_a_week_even_with_one_minute_polls() {
+        for interval in [1, 5, 15] {
+            let mut s = State::default();
+            s.history.run = 1;
+            let begin = Utc::now();
+            for minute in (0..=7 * 24 * 60).step_by(interval) {
+                let now = begin + chrono::Duration::minutes(minute as i64);
+                idle_poll(&mut s, now, minute);
+            }
+            assert!(
+                s.history.events.len() < 6_000,
+                "interval {interval}: {}",
+                s.history.events.len()
+            );
+            assert_eq!(s.history.dropped, 0);
+            assert!(
+                (s.history.events.back().unwrap().at - s.history.events.front().unwrap().at)
+                    .num_days()
+                    >= 7
+            );
+            assert!(s.history.suppressed > 10_000);
+        }
+    }
+    fn idle_poll(s: &mut State, now: DateTime<Utc>, minute: usize) {
+        Recorder::push_at(s, None, None, Event::PollStarted { gap_seconds: None }, now);
+        for account in 0..11 {
+            let id = format!("synthetic-{account}");
+            for event in [
+                Event::Token {
+                    decision: Decision::Reuse,
+                    access_expires_at: None,
+                    retry_at: None,
+                    uncertain_attempts: 0,
+                    access_rejected: false,
+                    usable: true,
+                },
+                Event::Usage {
+                    origin: Origin::Monitoring,
+                    code: Code::Ok,
+                    elapsed_ms: minute as u64,
+                },
+                stable_sample(now),
+            ] {
+                Recorder::push_at(s, Some(Provider::Claude), Some(&id), event, now);
+            }
+        }
+        Recorder::push_at(
+            s,
+            None,
+            None,
+            Event::PollFinished {
+                elapsed_ms: (minute % 1000) as u64,
+                accounts: 11,
+                native_sources: 1,
+                wsl_sources: 0,
+            },
+            now,
+        );
+    }
+    #[test]
+    fn transitions_and_hourly_heartbeat_keep_real_readings() {
+        let mut s = State::default();
+        let now = Utc::now();
+        Recorder::push_at(
+            &mut s,
+            Some(Provider::Claude),
+            Some("account"),
+            stable_sample(now),
+            now,
+        );
+        let later = now + chrono::Duration::minutes(5);
+        Recorder::push_at(
+            &mut s,
+            Some(Provider::Claude),
+            Some("account"),
+            stable_sample(later),
+            later,
+        );
+        assert_eq!(s.history.events.len(), 1);
+        let mut failed = stable_sample(later);
+        if let Event::Sample { stale, code, .. } = &mut failed {
+            *stale = true;
+            *code = Code::Network;
+        }
+        Recorder::push_at(
+            &mut s,
+            Some(Provider::Claude),
+            Some("account"),
+            failed,
+            later,
+        );
+        let recovered = later + chrono::Duration::minutes(5);
+        Recorder::push_at(
+            &mut s,
+            Some(Provider::Claude),
+            Some("account"),
+            stable_sample(recovered),
+            recovered,
+        );
+        let heartbeat = recovered + chrono::Duration::hours(1);
+        Recorder::push_at(
+            &mut s,
+            Some(Provider::Claude),
+            Some("account"),
+            stable_sample(heartbeat),
+            heartbeat,
+        );
+        assert_eq!(s.history.events.len(), 4);
+        assert!(matches!(s.history.events.back().unwrap().event,
+            Event::Sample { last_confirmed_at: Some(at), .. } if at == heartbeat));
+    }
+    #[test]
+    fn ordinary_polls_do_not_rewrite_the_journal_and_export_drains_the_writer() {
+        let dir = TempDir::new();
+        let path = dir.0.join("history");
+        let r = Recorder::new(path.clone());
+        r.start();
+        r.flush();
+        let writes = r.shared.state.lock().unwrap().write_attempts;
+        let on_disk = std::fs::read(&path).unwrap();
+        for _ in 0..100 {
+            r.poll_started(5);
+            r.record(
+                Some(Provider::Claude),
+                Some("account"),
+                stable_sample(Utc::now()),
+            );
+            r.record(
+                None,
+                None,
+                Event::PollFinished {
+                    elapsed_ms: 2,
+                    accounts: 1,
+                    native_sources: 1,
+                    wsl_sources: 0,
+                },
+            );
+        }
+        assert_eq!(r.shared.state.lock().unwrap().write_attempts, writes);
+        assert_eq!(std::fs::read(&path).unwrap(), on_disk);
+        let export = r
+            .export(&Snapshot::default(), &Settings::default())
+            .unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(export).unwrap()).unwrap();
+        assert_eq!(report["journal_write_attempts"], writes + 1);
+        assert!(report["suppressed_observations"].as_u64().unwrap() > 200);
+        let history: History =
+            serde_json::from_slice(&private_store::load_secret(&path).unwrap()).unwrap();
+        assert!(history
+            .events
+            .iter()
+            .any(|r| matches!(r.event, Event::Sample { .. })));
+    }
+    #[test]
+    fn auth_records_return_while_the_background_disk_writer_is_stalled() {
+        let dir = TempDir::new();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first = std::cell::Cell::new(true);
+        let r = Arc::new(Recorder::with_writer(
+            dir.0.join("history"),
+            move |path, bytes| {
+                if first.replace(false) {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }
+                private_store::save_secret(path, bytes).is_ok()
+            },
+        ));
+        r.start();
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let observer = r.clone();
+        let auth = std::thread::spawn(move || {
+            observer.record(
+                Some(Provider::Claude),
+                Some("account"),
+                Event::Refresh {
+                    outcome: RefreshOutcome::Started,
+                    reason: RefreshReason::AccessExpiry,
+                    elapsed_ms: 0,
+                },
+            );
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(3));
+        release_tx.send(()).unwrap();
+        auth.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "authentication waited for diagnostic disk I/O"
+        );
+        r.flush();
+        let s = r.shared.state.lock().unwrap();
+        assert_eq!(s.completed, s.generation);
+        assert!(s
+            .history
+            .events
+            .iter()
+            .any(|r| matches!(r.event, Event::Refresh { .. })));
     }
     #[test]
     fn error_codes_never_passthrough_messages() {

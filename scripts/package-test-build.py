@@ -9,6 +9,13 @@ import tempfile
 import zipfile
 
 root = Path(__file__).resolve().parents[1]
+def require_clean_checkout():
+    status = subprocess.check_output(
+        ["git", "--no-optional-locks", "status", "--porcelain", "--untracked-files=normal"], cwd=root)
+    if status:
+        raise RuntimeError("Refusing to package a dirty checkout")
+
+require_clean_checkout()
 exe = root / "src-tauri/target/release/slopbar.exe"
 head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
 base = "60a7c8e0835b4cd320dba3e0b1352d7a8161c9e1"
@@ -52,7 +59,8 @@ Build and checks: {ci or 'see BUILD-MANIFEST.json'}
    refresh/backoff outcomes, login stages, and build metadata. It excludes tokens,
    emails, aliases, account/organization IDs, paths, URLs, and provider response bodies.
    Collection is local; nothing is uploaded automatically. The rolling encrypted
-   journal retains at most 7 days / 10,000 events. Keep the exported report private
+   journal keeps changes plus hourly heartbeats, at most 7 days / 10,000 events.
+   Reports show the actual retained period. Keep the exported report private
    until you choose to share it. Prior independent monitoring logins are reused.
 
 This build uses manual updates. Install a newer reviewed build to get fixes.
@@ -68,6 +76,7 @@ Read source/SECURITY.md for the remaining limits. This is not an official releas
 """
 source = subprocess.check_output(["git", "archive", "--format=zip", "--prefix=source/", head], cwd=root)
 patch = subprocess.check_output(["git", "diff", "--binary", base, head], cwd=root)
+require_clean_checkout()
 output = root / "SlopBar-Independent-Monitoring.zip"
 with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as bundle:
     bundle.write(exe, "slopbar.exe")
