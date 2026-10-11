@@ -67,6 +67,9 @@ struct Session {
     uncertain_retry_at: Option<DateTime<Utc>>,
     #[serde(default)]
     reconnect: bool,
+    // A usage 401 must remain a rejection during backoff and across restart.
+    #[serde(default)]
+    access_rejected: bool,
 }
 
 struct State {
@@ -105,6 +108,14 @@ impl Monitor {
     /// cleanup revocation instead of assuming its tokens are unprotected.
     pub async fn protected_tokens(&self, slots: &[Slot]) -> Option<crate::login::ProtectedTokens> {
         let sessions = self.sessions.lock().await;
+        self.protected_tokens_locked(slots, &sessions)
+    }
+
+    fn protected_tokens_locked(
+        &self,
+        slots: &[Slot],
+        sessions: &HashMap<String, State>,
+    ) -> Option<crate::login::ProtectedTokens> {
         let mut tokens: crate::login::ProtectedTokens = slots
             .iter()
             .filter_map(|s| refresh_token(s).map(|t| (s.provider, t.to_owned())))
@@ -139,7 +150,79 @@ impl Monitor {
         cli_slots: &[Slot],
         client: &reqwest::Client,
     ) -> Result<(), String> {
-        self.connect_with(expected, login, cli_slots, &Api(client))
+        self.connect_or_discard_with(expected, login, cli_slots, &Api(client))
+            .await
+    }
+
+    async fn connect_or_discard_with(
+        &self,
+        expected: &Slot,
+        login: &Slot,
+        cli_slots: &[Slot],
+        revoke: &impl Revoke,
+    ) -> Result<(), String> {
+        let result = self.connect_with(expected, login, cli_slots, revoke).await;
+        if matches!(
+            result.as_ref().err().map(String::as_str),
+            Some("monitor_wrong_account" | "monitor_storage")
+        ) {
+            let known: Vec<Slot> = cli_slots
+                .iter()
+                .cloned()
+                .chain(std::iter::once(expected.clone()))
+                .collect();
+            self.discard_unstored_login_with(login, &known, revoke)
+                .await;
+        }
+        result
+    }
+
+    /// A handed-off login that was never installed must not become an orphaned
+    /// provider session. Never revoke a token used by any CLI or stored monitor.
+    pub async fn discard_unstored_login(
+        &self,
+        login: &Slot,
+        cli_slots: &[Slot],
+        client: &reqwest::Client,
+    ) -> bool {
+        self.discard_unstored_login_with(login, cli_slots, &Api(client))
+            .await
+    }
+
+    async fn discard_unstored_login_with(
+        &self,
+        login: &Slot,
+        cli_slots: &[Slot],
+        revoke: &impl Revoke,
+    ) -> bool {
+        let Some(refresh) = refresh_token(login).filter(|t| !t.is_empty()) else {
+            return false;
+        };
+        // Hold the same lock through the ownership check and revocation. Another
+        // connect cannot adopt this token between the check and the network call.
+        let sessions = self.sessions.lock().await;
+        let Some(protected) = self.protected_tokens_locked(cli_slots, &sessions) else {
+            return false;
+        };
+        if protected.contains(&(login.provider, refresh.to_owned())) {
+            return false;
+        }
+        revoke
+            .revoke(&Session {
+                version: 1,
+                provider: login.provider,
+                id: login.id.clone(),
+                access_token: String::new(),
+                refresh_token: refresh.to_owned(),
+                account_id: None,
+                expires_at: None,
+                scopes: vec![],
+                refresh_expires_at: None,
+                uncertain_attempts: 0,
+                uncertain_retry_at: None,
+                reconnect: false,
+                access_rejected: false,
+            })
             .await
     }
 
@@ -203,6 +286,7 @@ impl Monitor {
             uncertain_attempts: 0,
             uncertain_retry_at: None,
             reconnect: false,
+            access_rejected: false,
         };
         let mut sessions = self.sessions.lock().await;
         let previous = sessions
@@ -347,28 +431,46 @@ impl Monitor {
         if state.session.reconnect {
             return Err("monitor_reconnect".into());
         }
-        if state.session.uncertain_attempts >= 2 {
-            return Err("monitor_uncertain".into());
-        }
-        if state.session.uncertain_retry_at.is_some_and(|t| t > now) {
-            return Err("monitor_network".into());
-        }
-        if state.retry_at.is_some_and(|t| t > now) {
-            return Err(state
-                .error
-                .clone()
-                .unwrap_or_else(|| "monitor_network".into()));
-        }
         let expired = state
             .session
             .expires_at
             .is_some_and(|t| t <= now + chrono::Duration::seconds(60));
-        // If another poll already renewed this token, use that result instead of rotating twice.
+        // A late rejection of an old token cannot invalidate a newer rotation.
         let rejected_current = rejected.is_some_and(|t| t == state.session.access_token);
+        if rejected_current && !state.session.access_rejected {
+            state.session.access_rejected = true;
+            state.dirty = true;
+            self.save(slot, &state.session)?;
+            state.dirty = false;
+        }
+        // A renewal hint must not suppress still-usable access credentials during
+        // token-endpoint backoff. Never reuse an expired or usage-rejected token.
+        let usable_access =
+            (!expired && !state.session.access_rejected && !state.session.access_token.is_empty())
+                .then(|| {
+                    (
+                        state.session.access_token.clone(),
+                        state.session.account_id.clone(),
+                    )
+                });
+        if state.session.uncertain_attempts >= 2 {
+            return usable_access.ok_or_else(|| "monitor_uncertain".into());
+        }
+        if state.session.uncertain_retry_at.is_some_and(|t| t > now) {
+            return usable_access.ok_or_else(|| "monitor_network".into());
+        }
+        if state.retry_at.is_some_and(|t| t > now) {
+            return usable_access.ok_or_else(|| {
+                state
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "monitor_network".into())
+            });
+        }
         // A CLI can synthesize a refresh-token lifetime. Treat the saved deadline
         // as a renewal hint and let the provider decide whether the token is valid.
         let refresh_due = state.session.refresh_expires_at.is_some_and(|t| t <= now);
-        if expired || rejected_current || refresh_due {
+        if expired || state.session.access_rejected || refresh_due {
             match transport.refresh(&state.session).await {
                 Ok(reply) => {
                     // Once the server may have rotated, preserve the returned refresh token
@@ -377,6 +479,7 @@ impl Monitor {
                         state.session.refresh_token = refresh;
                     }
                     state.session.access_token = reply.access_token;
+                    state.session.access_rejected = false;
                     if let Some(scope) = reply.scope {
                         state.session.scopes =
                             scope.split_whitespace().map(str::to_owned).collect();
@@ -427,18 +530,20 @@ impl Monitor {
                             state.dirty = true;
                             self.save(slot, &state.session)?;
                             state.dirty = false;
-                            return Err(if state.session.uncertain_attempts >= 2 {
-                                "monitor_uncertain"
-                            } else {
-                                "monitor_network"
-                            }
-                            .into());
+                            return usable_access.ok_or_else(|| {
+                                if state.session.uncertain_attempts >= 2 {
+                                    "monitor_uncertain"
+                                } else {
+                                    "monitor_network"
+                                }
+                                .into()
+                            });
                         }
                         _ => ("monitor_network", 300),
                     };
                     state.retry_at = Some(now + chrono::Duration::seconds(delay));
                     state.error = Some(code.into());
-                    return Err(code.into());
+                    return usable_access.ok_or_else(|| code.into());
                 }
             }
         }

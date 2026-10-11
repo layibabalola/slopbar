@@ -16,7 +16,11 @@ Only independently owned monitoring sessions are refreshed. Imported CLI refresh
 
 When an active account's monitor is unavailable, usage can fall back to the CLI access token captured from its current login. This is a read-only usage request and does not refresh/revoke the CLI session or bypass a usage rate limit. The monitoring failure remains separately visible while successful usage is fresh and eligible for balancing. Inactive accounts continue to require their independent session.
 
+A refresh-expiry hint can trigger renewal while the monitoring access token is still usable. Temporary errors, token-endpoint rate limits, and uncertain sends retain that access token for usage requests during backoff, without increasing the persisted replay budget. Expired or usage-rejected access tokens are withheld. Explicit refresh rejection and an unreadable successful response still stop access immediately.
+
 Disconnect removes local monitoring credentials even when the provider is unavailable, then attempts revocation of that monitoring token. Replacing a monitoring login saves the new login first and attempts revocation of the old chain. Server revocation is best effort; a failed disconnect revocation is reported in the UI. Account removal also attempts revocation. Imported CLI sessions are never revoked by these actions.
+
+Wrong-account or storage failures after login handoff attempt revocation of the uninstalled login. The ownership check and revocation share the monitoring lock, and tokens matching known CLI or in-memory/persisted monitoring sessions are protected. Shared-login rejection never invokes this cleanup. Unreadable ownership storage suppresses revocation; an offline provider or ambiguous ownership can leave a session to revoke manually in provider account settings. WSL write-through marker replacement still needs a real WSL integration check and fails closed if unsupported.
 
 Authentication and usage requests go over HTTPS directly to the providers: `api.anthropic.com` and `platform.claude.com` for Claude, `chatgpt.com` and `auth.openai.com` for Codex. Monitoring does not send model prompts. The usage cache contains readings and timestamps, not authentication tokens. The non-Windows headless test build uses owner-only files rather than DPAPI; the desktop app targets Windows.
 

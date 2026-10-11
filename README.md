@@ -39,11 +39,15 @@ SlopBar renews this separate session automatically when its access token is abou
 
 **Disconnect monitoring** works even for the active account. It removes the local monitoring credentials and attempts to revoke that separate session at the provider. If server revocation cannot be confirmed, the UI asks you to revoke it in your provider's account settings. Reconnecting saves the new login before attempting to revoke the previous monitoring session.
 
+If a completed monitoring login is rejected for the wrong account or cannot be saved, SlopBar attempts to revoke that uninstalled login. It first protects every known CLI/monitor token; shared tokens or unreadable ownership stores disable this cleanup. Failed cleanup can leave a provider session to revoke manually in account settings.
+
 Last successful readings survive app restarts. If the provider cannot be reached, the UI shows **Last confirmed … ago** and retains the observed values. A passed reset time does not imply a measured 0%. Automatic switching considers only fresh, successfully measured accounts. A revoked session, an unusable refresh response, or a lost credential file may still require **Reconnect monitoring**; recent account use is never the recovery instruction.
 
 A refresh timeout before success headers does not immediately disconnect an account. SlopBar waits five minutes and allows one retry of its own monitoring token. Both the backoff and retry limit survive restarts. An explicit token rejection requires reconnecting; after a second uncertain response, automatic replay stops and the UI offers reconnecting. A successful HTTP response with an unreadable body requires reconnecting immediately, because replay could reuse an already consumed token. The providers can reject a retry if the timed-out request already rotated its token.
 
 If the active account's monitor fails, SlopBar can still read fresh usage with the CLI's current access token. It never refreshes that CLI token, and keeps the monitoring error and Reconnect control visible alongside the fresh reading. This fallback is restricted to active accounts and respects usage rate limits. A saved refresh-token expiry is a renewal hint: the server decides whether the session is still valid, so a CLI-synthesized 30-day deadline does not itself disconnect monitoring.
+
+When only that hint triggers renewal, a temporary failure, rate limit, or uncertain send does not suppress a still-valid monitoring access token. Usage polling continues with that token while refresh backoff and the replay budget remain enforced. Expired or usage-rejected access tokens are never returned this way; explicit refresh rejection and unreadable successful rotations still require reconnecting.
 
 ### Why the original version lost inactive accounts
 
@@ -57,10 +61,12 @@ On Windows, with Rust and the usual Tauri prerequisites installed:
 
 ```powershell
 cargo test --locked --no-default-features --lib --manifest-path src-tauri/Cargo.toml
-cargo build --locked --release --manifest-path src-tauri/Cargo.toml
+cargo build --locked --release --features tauri/custom-protocol --manifest-path src-tauri/Cargo.toml
 ```
 
 The standalone executable is `src-tauri/target/release/slopbar.exe`. Exit any running SlopBar before starting it; the single-instance guard otherwise hands control to the already running version. Existing settings and accounts are read from the same data directory.
+
+The `tauri/custom-protocol` feature selects Tauri's release configuration with embedded assets. CI checks and test builds use this feature too; a plain Cargo release build without it uses Tauri's development configuration.
 
 Local builds disable upstream updates at compile time, including if an existing settings file enables automatic updates. This prevents an unpatched upstream release from replacing this fix. Release maintainers can explicitly enable the `upstream-updates` Cargo feature after merging the fix. The Settings page shows when updates are unavailable.
 

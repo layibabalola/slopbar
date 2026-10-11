@@ -536,6 +536,326 @@ async fn imported_cli_expiry_hint_requests_one_refresh_instead_of_forcing_reconn
     assert_eq!(saved.refresh_expires_at, None);
 }
 
+fn hinted_login() -> Slot {
+    let mut fresh = login();
+    fresh.data["credentials"]["claudeAiOauth"]["expiresAt"] =
+        json!((now() + chrono::Duration::days(9)).timestamp_millis());
+    fresh.data["credentials"]["claudeAiOauth"]["refreshTokenExpiresAt"] =
+        json!((now() - chrono::Duration::days(1)).timestamp_millis());
+    fresh
+}
+
+#[tokio::test]
+async fn hint_failures_keep_valid_access_and_backoff_but_never_return_rejected_or_expired_access() {
+    for (failure, delay, code) in [
+        (Failure::Transient, 300, "monitor_network"),
+        (Failure::RateLimited(900), 900, "rate_limited"),
+        (Failure::Ambiguous, 300, "monitor_network"),
+    ] {
+        let dir = TempDir::new();
+        let monitor = Monitor::new(dir.0.clone());
+        monitor.connect(&cli(), &hinted_login(), &[]).await.unwrap();
+        let transport = Scripted::new([Err(failure), reply("renewed", Some("rotated"))]);
+        assert_eq!(
+            monitor
+                .token_with(&cli(), &transport, None, now())
+                .await
+                .unwrap()
+                .0,
+            "monitor-access-1"
+        );
+        let backoff = now() + chrono::Duration::seconds(delay - 1);
+        assert_eq!(
+            monitor
+                .token_with(&cli(), &transport, None, backoff)
+                .await
+                .unwrap()
+                .0,
+            "monitor-access-1"
+        );
+        assert_eq!(
+            monitor
+                .token_with(&cli(), &transport, Some("monitor-access-1"), backoff)
+                .await,
+            Err(code.into())
+        );
+        assert_eq!(
+            monitor.token_with(&cli(), &transport, None, backoff).await,
+            Err(code.into())
+        );
+        // The access-token grace does not disable renewal backoff or rate limits.
+        assert_eq!(transport.calls().len(), 1);
+        assert_eq!(
+            monitor
+                .token_with(
+                    &cli(),
+                    &transport,
+                    None,
+                    now() + chrono::Duration::seconds(delay)
+                )
+                .await
+                .unwrap()
+                .0,
+            "renewed"
+        );
+        assert_eq!(transport.calls().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn usage_rejection_survives_restart_during_hint_backoff_and_clears_after_rotation() {
+    let dir = TempDir::new();
+    let monitor = Monitor::new(dir.0.clone());
+    monitor.connect(&cli(), &hinted_login(), &[]).await.unwrap();
+    let transport = Scripted::new([Err(Failure::Ambiguous), reply("renewed", Some("rotated"))]);
+    assert!(monitor
+        .token_with(&cli(), &transport, None, now())
+        .await
+        .is_ok());
+    assert_eq!(
+        monitor
+            .token_with(&cli(), &transport, Some("monitor-access-1"), now())
+            .await,
+        Err("monitor_network".into())
+    );
+    drop(monitor);
+    let restarted = Monitor::new(dir.0.clone());
+    assert_eq!(
+        restarted
+            .token_with(
+                &cli(),
+                &transport,
+                None,
+                now() + chrono::Duration::seconds(299)
+            )
+            .await,
+        Err("monitor_network".into())
+    );
+    assert_eq!(transport.calls().len(), 1);
+    assert_eq!(
+        restarted
+            .token_with(
+                &cli(),
+                &transport,
+                None,
+                now() + chrono::Duration::minutes(5)
+            )
+            .await
+            .unwrap()
+            .0,
+        "renewed"
+    );
+    assert_eq!(
+        restarted
+            .token_with(
+                &cli(),
+                &transport,
+                None,
+                now() + chrono::Duration::minutes(6)
+            )
+            .await
+            .unwrap()
+            .0,
+        "renewed"
+    );
+    assert_eq!(transport.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn hint_ambiguity_keeps_access_across_restart_without_expanding_replay_budget() {
+    let dir = TempDir::new();
+    let monitor = Monitor::new(dir.0.clone());
+    monitor.connect(&cli(), &hinted_login(), &[]).await.unwrap();
+    let transport = Scripted::new([Err(Failure::Ambiguous), Err(Failure::Ambiguous)]);
+    assert_eq!(
+        monitor
+            .token_with(&cli(), &transport, None, now())
+            .await
+            .unwrap()
+            .0,
+        "monitor-access-1"
+    );
+    drop(monitor);
+    let monitor = Monitor::new(dir.0.clone());
+    assert_eq!(
+        monitor
+            .token_with(
+                &cli(),
+                &transport,
+                None,
+                now() + chrono::Duration::seconds(299)
+            )
+            .await
+            .unwrap()
+            .0,
+        "monitor-access-1"
+    );
+    assert_eq!(transport.calls().len(), 1);
+    assert_eq!(
+        monitor
+            .token_with(
+                &cli(),
+                &transport,
+                None,
+                now() + chrono::Duration::minutes(5)
+            )
+            .await
+            .unwrap()
+            .0,
+        "monitor-access-1"
+    );
+    drop(monitor);
+    let monitor = Monitor::new(dir.0.clone());
+    assert_eq!(
+        monitor
+            .token_with(&cli(), &transport, None, now() + chrono::Duration::days(1))
+            .await
+            .unwrap()
+            .0,
+        "monitor-access-1"
+    );
+    assert_eq!(
+        monitor
+            .token_with(
+                &cli(),
+                &transport,
+                Some("monitor-access-1"),
+                now() + chrono::Duration::days(1)
+            )
+            .await,
+        Err("monitor_uncertain".into())
+    );
+    assert_eq!(
+        monitor
+            .token_with(&cli(), &transport, None, now() + chrono::Duration::days(9))
+            .await,
+        Err("monitor_uncertain".into())
+    );
+    assert_eq!(transport.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn hint_never_grants_access_after_rejection_or_an_accepted_unreadable_rotation() {
+    for failure in [Failure::Revoked, Failure::RotatedUnreadable] {
+        let dir = TempDir::new();
+        let monitor = Monitor::new(dir.0.clone());
+        monitor.connect(&cli(), &hinted_login(), &[]).await.unwrap();
+        let transport = Scripted::new([Err(failure)]);
+        assert_eq!(
+            monitor.token_with(&cli(), &transport, None, now()).await,
+            Err("monitor_reconnect".into())
+        );
+        assert_eq!(
+            Monitor::new(dir.0.clone())
+                .token_with(&cli(), &transport, None, now() + chrono::Duration::days(1))
+                .await,
+            Err("monitor_reconnect".into())
+        );
+        assert_eq!(transport.calls().len(), 1);
+    }
+}
+
+#[derive(Default)]
+struct RecordedRevocations(SyncMutex<Vec<String>>);
+impl Revoke for RecordedRevocations {
+    async fn revoke(&self, session: &Session) -> bool {
+        self.0.lock().unwrap().push(session.refresh_token.clone());
+        true
+    }
+}
+
+#[tokio::test]
+async fn rejected_handoff_is_revoked_only_when_no_cli_or_monitor_owns_its_token() {
+    for mode in 0..6 {
+        let dir = TempDir::new();
+        let monitor = Monitor::new(dir.0.clone());
+        let mut wrong = login();
+        wrong.id = "different:org".into();
+        let mut known = vec![];
+        if mode == 1 {
+            known.push(wrong.clone());
+        }
+        if mode == 2 {
+            wrong.data = cli().data;
+        }
+        if mode == 3 {
+            monitor.connect(&cli(), &login(), &[]).await.unwrap();
+            // Force the ownership check to load the stored monitor from disk.
+            monitor.sessions.lock().await.clear();
+        }
+        if mode == 4 {
+            monitor.connect(&cli(), &login(), &[]).await.unwrap();
+            private_store::save_secret(&monitor.path(&cli()), b"corrupt").unwrap();
+        }
+        if mode == 5 {
+            wrong.id = cli().id;
+            wrong.data = cli().data;
+        }
+        let revoked = RecordedRevocations::default();
+        let result = monitor
+            .connect_or_discard_with(&cli(), &wrong, &known, &revoked)
+            .await;
+        assert_eq!(
+            result,
+            Err(if mode == 5 {
+                "monitor_shared_login"
+            } else {
+                "monitor_wrong_account"
+            }
+            .into())
+        );
+        let calls = revoked.0.lock().unwrap();
+        if mode == 0 {
+            assert_eq!(*calls, ["monitor-refresh-1"]);
+        } else {
+            assert!(calls.is_empty(), "mode {mode}");
+        }
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn failed_replacement_revokes_only_new_handoff_and_preserves_old_monitor() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = TempDir::new();
+    let monitor = Monitor::new(dir.0.clone());
+    monitor.connect(&cli(), &login(), &[]).await.unwrap();
+    let path = monitor.path(&cli());
+    // Permit reading the protected old session but deny replacement/deletion.
+    let locked = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&path)
+        .unwrap();
+    let fresh = slot("account:org", "new-access", "new-refresh", 0);
+    let revoked = RecordedRevocations::default();
+    assert_eq!(
+        monitor
+            .connect_or_discard_with(&cli(), &fresh, &[], &revoked)
+            .await,
+        Err("monitor_storage".into())
+    );
+    assert_eq!(*revoked.0.lock().unwrap(), ["new-refresh"]);
+    let saved: Session =
+        serde_json::from_slice(&private_store::load_secret(&path).unwrap()).unwrap();
+    assert_eq!(saved.refresh_token, "monitor-refresh-1");
+    assert_eq!(
+        monitor.sessions.lock().await[&key(&cli())]
+            .session
+            .refresh_token,
+        "monitor-refresh-1"
+    );
+    drop(locked);
+    monitor
+        .connect_or_discard_with(&cli(), &fresh, &[], &revoked)
+        .await
+        .unwrap();
+    assert_eq!(
+        *revoked.0.lock().unwrap(),
+        ["new-refresh", "monitor-refresh-1"]
+    );
+}
+
 #[tokio::test]
 async fn cleanup_protects_vault_and_persisted_monitor_tokens_and_fails_closed_on_corruption() {
     let dir = TempDir::new();
@@ -684,6 +1004,59 @@ mod http {
             uncertain_attempts: 0,
             uncertain_retry_at: None,
             reconnect: false,
+            access_rejected: false,
+        }
+    }
+    #[tokio::test]
+    async fn real_hint_failures_allow_usage_without_repeating_refresh_during_backoff() {
+        for (status, delay, retry_after) in [
+            (503, 0, ""),
+            (429, 0, "Retry-After: 900\r\n"),
+            (200, 150, ""),
+        ] {
+            let mut failed = response(status, "{}");
+            failed.delay = Duration::from_millis(delay);
+            failed.header = retry_after;
+            let server = Server::new(vec![failed]);
+            let dir = TempDir::new();
+            let monitor = Monitor::new(dir.0.clone());
+            monitor.connect(&cli(), &hinted_login(), &[]).await.unwrap();
+            let client = client(if delay == 0 { 1000 } else { 40 });
+            let local = Local(&client, &server.url);
+            assert_eq!(
+                monitor
+                    .token_with(&cli(), &local, None, now())
+                    .await
+                    .unwrap()
+                    .0,
+                "monitor-access-1"
+            );
+            assert_eq!(
+                monitor
+                    .token_with(&cli(), &local, None, now() + chrono::Duration::seconds(299))
+                    .await
+                    .unwrap()
+                    .0,
+                "monitor-access-1"
+            );
+            assert!(server.request().contains("monitor-refresh-1"));
+            assert!(server.requests.try_recv().is_err());
+            let code = if status == 429 {
+                "rate_limited"
+            } else {
+                "monitor_network"
+            };
+            assert_eq!(
+                monitor
+                    .token_with(
+                        &cli(),
+                        &local,
+                        Some("monitor-access-1"),
+                        now() + chrono::Duration::seconds(299)
+                    )
+                    .await,
+                Err(code.into())
+            );
         }
     }
     #[tokio::test]

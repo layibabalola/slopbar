@@ -22,6 +22,8 @@ manifest = {
     "target": "x86_64-pc-windows-msvc",
     "signed": False,
     "upstream_updates": False,
+    "tauri_custom_protocol": True,
+    "cargo_features": ["desktop", "tauri/custom-protocol"],
     "ci": ci,
     "pr": "https://github.com/thelioo/slopbar/pull/6",
 }
@@ -36,6 +38,7 @@ Build and checks: {ci or 'see BUILD-MANIFEST.json'}
    monitoring login. No model prompts are sent.
 
 This build uses manual updates. Install a newer reviewed build to get fixes.
+It uses Tauri's release custom-protocol configuration with embedded assets.
 It reads your existing settings/accounts from the usual SlopBar data folder.
 Monitoring credentials use current-user Windows DPAPI. The older account-switching
 vault is still plaintext. These are full OAuth credentials, not usage-only keys.

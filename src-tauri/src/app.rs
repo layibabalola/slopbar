@@ -139,7 +139,12 @@ async fn connect_monitoring(app: AppHandle, provider: Provider, id: String) -> R
                 let slots = accounts::load_slots();
                 if slots.iter().any(|s| s.provider == provider && s.id == id) {
                     app.state::<AppState>().monitor.connect_replacing(&expected, &login, &slots, &http_client()).await
-                } else { Err("monitor_wrong_account".into()) }
+                } else {
+                    let mut known = slots;
+                    known.push(expected.clone());
+                    app.state::<AppState>().monitor.discard_unstored_login(&login, &known, &http_client()).await;
+                    Err("monitor_wrong_account".into())
+                }
             }
             None => Err("monitor_login_failed".into()),
         };

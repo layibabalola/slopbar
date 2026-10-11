@@ -30,9 +30,9 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - name: Check official updater feature
-        run: cargo check --locked --features upstream-updates --manifest-path src-tauri/Cargo.toml
+        run: cargo check --locked --features upstream-updates,tauri/custom-protocol --manifest-path src-tauri/Cargo.toml
       - name: Build unsigned Windows desktop test executable (manual updates)
-        run: cargo build --locked --release --manifest-path src-tauri/Cargo.toml
+        run: cargo build --locked --release --features tauri/custom-protocol --manifest-path src-tauri/Cargo.toml
       - name: Package executable and exact source
         run: python scripts/package-test-build.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
