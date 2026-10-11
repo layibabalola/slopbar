@@ -110,7 +110,10 @@ pub fn command(
             // /d disables cmd AutoRun, which can restore authentication overrides.
             c.arg("/d").arg("/c");
             if visible {
-                c.arg(dir.join("login.cmd"));
+                // The cwd is set by CreateProcess, not parsed by cmd. Keeping the
+                // script argument constant also protects profile paths containing
+                // cmd metacharacters or paired %environment-variable% text.
+                c.arg("login.cmd");
             } else {
                 c.arg(action);
             }

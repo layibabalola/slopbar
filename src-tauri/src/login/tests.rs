@@ -312,6 +312,46 @@ fn job_fixture_process() {
 
 #[cfg(windows)]
 #[test]
+fn native_login_script_handles_profile_path_shell_metacharacters() {
+    let home = TempDir::new();
+    let dir = home.0.join("profile & ^ %SLOPBAR_PATH_TEST%");
+    std::fs::create_dir(&dir).unwrap();
+    prepare(&dir, Provider::Codex, "echo login-ok>result.txt").unwrap();
+    let mut cmd = command(
+        Provider::Codex,
+        &source(&home.0),
+        &dir,
+        dir.to_str().unwrap(),
+        "unused",
+        true,
+    );
+    cmd.env("SLOPBAR_PATH_TEST", "wrong-path")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let (mut child, _tree) = ProcessTree::spawn(&mut cmd, false).unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "login script did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("result.txt"))
+            .unwrap()
+            .trim(),
+        "login-ok"
+    );
+}
+
+#[cfg(windows)]
+#[test]
 fn suspended_login_is_assigned_before_running_and_job_close_kills_descendants() {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
