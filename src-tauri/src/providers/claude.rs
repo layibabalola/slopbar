@@ -27,7 +27,7 @@ pub struct ClaudeUsage {
 }
 
 /// Fetches the usage windows, or an error code (see `model::AccountUsage::error`).
-pub async fn fetch(client: &reqwest::Client, token: &str) -> Result<ClaudeUsage, String> {
+pub async fn fetch(client: &reqwest::Client, token: &str, observe: &super::evidence::Observer<'_>) -> Result<ClaudeUsage, String> {
     let resp = client
         .get("https://api.anthropic.com/api/oauth/usage")
         .bearer_auth(token)
@@ -44,7 +44,12 @@ pub async fn fetch(client: &reqwest::Client, token: &str) -> Result<ClaudeUsage,
     if !resp.status().is_success() {
         return Err(format!("http_{}", resp.status().as_u16()));
     }
-    let raw: Value = resp.json().await.map_err(|_| "bad_response".to_string())?;
+    let status = resp.status().as_u16();
+    let raw: Value = match resp.json().await {
+        Ok(raw) => raw,
+        Err(_) => { observe(super::evidence::Evidence::outcome(super::evidence::Endpoint::ClaudeUsage, Some(status))); return Err("bad_response".into()); }
+    };
+    observe(super::evidence::capture(super::evidence::Endpoint::ClaudeUsage, status, &raw));
     let resets = resets(&raw);
     let u: Usage = serde_json::from_value(raw).map_err(|_| "bad_response".to_string())?;
     let windows = [

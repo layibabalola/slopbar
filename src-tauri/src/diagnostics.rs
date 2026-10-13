@@ -172,6 +172,10 @@ pub enum RevokeOutcome {
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    ProviderEvidence {
+        origin: Origin,
+        evidence: crate::providers::evidence::Evidence,
+    },
     Http {
         endpoint: Endpoint,
         status: Option<u16>,
@@ -339,6 +343,7 @@ struct State {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Family {
+    ProviderEvidence(Origin, crate::providers::evidence::Endpoint),
     Token,
     Usage(Origin),
     Sample,
@@ -351,6 +356,7 @@ enum Family {
 fn observation(event: &Event) -> Option<(Family, Event)> {
     let mut signature = event.clone();
     let family = match &mut signature {
+        Event::ProviderEvidence { origin, evidence } => Family::ProviderEvidence(*origin, evidence.endpoint),
         Event::Token { .. } => Family::Token,
         Event::Usage {
             origin, elapsed_ms, ..
@@ -856,6 +862,12 @@ mod tests {
         let mut settings = Settings::default();
         settings.aliases.insert(canary.into(), canary.into());
         r.samples(&snapshot);
+        let raw = serde_json::json!({"identity":canary,"authorization":canary,
+            "credits":[{"title":canary,"reset_type":canary,"status":"available","expires_at":canary}]});
+        r.record(Some(Provider::Claude), Some(canary), Event::ProviderEvidence {
+            origin: Origin::Monitoring,
+            evidence: crate::providers::evidence::capture(crate::providers::evidence::Endpoint::CodexResetDetails, 200, &raw),
+        });
         r.flush();
         #[cfg(windows)]
         assert!(!std::fs::read(dir.0.join("history"))
@@ -871,6 +883,23 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&report).unwrap();
         assert_eq!(json["current"][0]["event"]["code"], "other");
         assert_eq!(json["current"][0]["event"]["windows"][0]["kind"], "other");
+        assert!(json["events"].as_array().unwrap().iter().any(|r| r["event"]["type"] == "provider_evidence"));
+    }
+    #[test]
+    fn provider_evidence_deduplicates_each_endpoint_and_origin_separately() {
+        use crate::providers::evidence::{capture, Endpoint};
+        let mut s = State::default();
+        let now = Utc::now();
+        for _ in 0..100 {
+            for origin in [Origin::Monitoring, Origin::ActiveCliFallback] {
+                for endpoint in [Endpoint::CodexUsage, Endpoint::CodexResetDetails] {
+                    Recorder::push_at(&mut s, Some(Provider::Codex), Some("synthetic"), Event::ProviderEvidence {
+                        origin, evidence: capture(endpoint, 200, &serde_json::json!({})),
+                    }, now);
+                }
+            }
+        }
+        assert_eq!(s.history.events.len(), 4);
     }
     #[test]
     fn pseudonyms_history_and_unclean_exit_survive_restart() {

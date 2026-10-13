@@ -60,7 +60,7 @@ struct Credit {
 }
 
 /// Fetches the usage windows, or an error code (see `model::AccountUsage::error`).
-pub async fn fetch(client: &reqwest::Client, token: &str, account_id: Option<&str>) -> Result<CodexUsage, String> {
+pub async fn fetch(client: &reqwest::Client, token: &str, account_id: Option<&str>, observe: &super::evidence::Observer<'_>) -> Result<CodexUsage, String> {
     let mut req = client
         .get("https://chatgpt.com/backend-api/wham/usage")
         .bearer_auth(token)
@@ -78,7 +78,13 @@ pub async fn fetch(client: &reqwest::Client, token: &str, account_id: Option<&st
     if !resp.status().is_success() {
         return Err(format!("http_{}", resp.status().as_u16()));
     }
-    let usage: Usage = resp.json().await.map_err(|_| "bad_response".to_string())?;
+    let status = resp.status().as_u16();
+    let raw: serde_json::Value = match resp.json().await {
+        Ok(raw) => raw,
+        Err(_) => { observe(super::evidence::Evidence::outcome(super::evidence::Endpoint::CodexUsage, Some(status))); return Err("bad_response".into()); }
+    };
+    observe(super::evidence::capture(super::evidence::Endpoint::CodexUsage, status, &raw));
+    let usage: Usage = serde_json::from_value(raw).map_err(|_| "bad_response".to_string())?;
     let windows = usage
         .rate_limit
         .map(|rl| {
@@ -108,7 +114,7 @@ pub async fn fetch(client: &reqwest::Client, token: &str, account_id: Option<&st
     let available = counts.as_ref().and_then(|r| r.available_count).unwrap_or(0);
     let usable_now = counts.as_ref().and_then(|r| r.applicable_available_count).unwrap_or(0) > 0;
     let resets = if available > 0 {
-        list_resets(client, token, account_id, usable_now).await.unwrap_or_else(|| {
+        list_resets(client, token, account_id, usable_now, observe).await.unwrap_or_else(|| {
             vec![ResetGrant {
                 kind: "full".into(),
                 title: None,
@@ -130,6 +136,7 @@ async fn list_resets(
     token: &str,
     account_id: Option<&str>,
     usable: bool,
+    observe: &super::evidence::Observer<'_>,
 ) -> Option<Vec<ResetGrant>> {
     let mut req = client
         .get("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")
@@ -138,7 +145,21 @@ async fn list_resets(
     if let Some(id) = account_id {
         req = req.header("ChatGPT-Account-Id", id);
     }
-    let list: CreditList = req.send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
+    let resp = match req.send().await {
+        Ok(resp) => resp,
+        Err(_) => { observe(super::evidence::Evidence::outcome(super::evidence::Endpoint::CodexResetDetails, None)); return None; }
+    };
+    let status = resp.status().as_u16();
+    if !resp.status().is_success() {
+        observe(super::evidence::Evidence::outcome(super::evidence::Endpoint::CodexResetDetails, Some(status)));
+        return None;
+    }
+    let raw: serde_json::Value = match resp.json().await {
+        Ok(raw) => raw,
+        Err(_) => { observe(super::evidence::Evidence::outcome(super::evidence::Endpoint::CodexResetDetails, Some(status))); return None; }
+    };
+    observe(super::evidence::capture(super::evidence::Endpoint::CodexResetDetails, status, &raw));
+    let list: CreditList = serde_json::from_value(raw).ok()?;
     Some(
         list.credits
             .into_iter()

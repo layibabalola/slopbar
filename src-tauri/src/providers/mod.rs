@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod codex;
+pub mod evidence;
 
 use std::collections::HashMap;
 
@@ -156,12 +157,12 @@ struct Fetched {
 }
 
 trait Usage {
-    async fn fetch(&self, provider: Provider, token: &str, account: Option<&str>) -> Result<Fetched, String>;
+    async fn fetch(&self, provider: Provider, token: &str, account: Option<&str>, observe: &evidence::Observer<'_>) -> Result<Fetched, String>;
 }
 struct Api<'a>(&'a reqwest::Client);
 impl Usage for Api<'_> {
-    async fn fetch(&self, provider: Provider, token: &str, account: Option<&str>) -> Result<Fetched, String> {
-        fetch_token(self.0, provider, token, account).await
+    async fn fetch(&self, provider: Provider, token: &str, account: Option<&str>, observe: &evidence::Observer<'_>) -> Result<Fetched, String> {
+        fetch_token(self.0, provider, token, account, observe).await
     }
 }
 
@@ -221,16 +222,17 @@ async fn fetch_session(client: &reqwest::Client, slot: &Slot, monitor: &Monitor,
 
 async fn observed_usage(usage: &impl Usage, monitor: &Monitor, slot: &Slot, token: &str, account: Option<&str>, origin: Origin) -> Result<Fetched, String> {
     let started = std::time::Instant::now();
-    let result = usage.fetch(slot.provider, token, account).await;
+    let observe = |evidence| monitor.record(slot, Event::ProviderEvidence { origin, evidence });
+    let result = usage.fetch(slot.provider, token, account, &observe).await;
     monitor.record(slot, Event::Usage { origin, code: Code::from_error(result.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) });
     result
 }
 
-async fn fetch_token(client: &reqwest::Client, provider: Provider, token: &str, account: Option<&str>) -> Result<Fetched, String> {
+async fn fetch_token(client: &reqwest::Client, provider: Provider, token: &str, account: Option<&str>, observe: &evidence::Observer<'_>) -> Result<Fetched, String> {
     match provider {
-        Provider::Claude => claude::fetch(client, token)
+        Provider::Claude => claude::fetch(client, token, observe)
             .await.map(|u| Fetched { windows: u.windows, credits: None, resets: u.resets, monitor_error: None }),
-        Provider::Codex => codex::fetch(client, token, account)
+        Provider::Codex => codex::fetch(client, token, account, observe)
             .await.map(|u| Fetched { windows: u.windows, credits: u.credits, resets: u.resets, monitor_error: None }),
     }
 }
@@ -244,7 +246,7 @@ mod tests {
     async fn repeated_monitor_usage_failure_and_cli_fallback_have_independent_diagnostics() {
         struct Observed(std::sync::Mutex<Vec<String>>);
         impl Usage for Observed {
-            async fn fetch(&self, _: Provider, token: &str, _: Option<&str>) -> Result<Fetched, String> {
+            async fn fetch(&self, _: Provider, token: &str, _: Option<&str>, _: &evidence::Observer<'_>) -> Result<Fetched, String> {
                 self.0.lock().unwrap().push(token.to_owned());
                 if token == "monitor-access" { return Err("bad_response".into()); }
                 Ok(Fetched { windows: observed(24.0).windows, credits: None, resets: vec![], monitor_error: None })
@@ -284,7 +286,7 @@ mod tests {
     async fn only_active_cli_access_tokens_can_supply_fresh_usage_after_monitor_failure() {
         struct Observed(std::sync::Mutex<Vec<String>>);
         impl Usage for Observed {
-            async fn fetch(&self, _: Provider, token: &str, _: Option<&str>) -> Result<Fetched, String> {
+            async fn fetch(&self, _: Provider, token: &str, _: Option<&str>, _: &evidence::Observer<'_>) -> Result<Fetched, String> {
                 self.0.lock().unwrap().push(token.to_owned());
                 Ok(Fetched { windows: observed(24.0).windows, credits: None, resets: vec![], monitor_error: None })
             }
