@@ -7,6 +7,7 @@ use serde_json::Value;
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Endpoint {
+    ClaudeProfile,
     ClaudeUsage,
     CodexUsage,
     CodexResetDetails,
@@ -14,6 +15,9 @@ pub enum Endpoint {
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Field {
+    AccountMatches,
+    OrganizationMatches,
+    EmailMatches,
     FiveHour,
     SevenDay,
     SevenDayOpus,
@@ -226,7 +230,7 @@ pub fn capture(endpoint: Endpoint, status: u16, raw: &Value) -> Evidence {
         .into_iter()
         .map(|(f, key)| (f, key, raw.get("rate_limit").and_then(|v| v.get(key))))
         .collect(),
-        Endpoint::CodexResetDetails => vec![],
+        Endpoint::CodexResetDetails | Endpoint::ClaudeProfile => vec![],
     };
     for (f, _, w) in &windows {
         e.probe(*f, None, None, *w, Parse::Object);
@@ -265,7 +269,8 @@ pub fn capture(endpoint: Endpoint, status: u16, raw: &Value) -> Evidence {
             .map(|o| {
                 o.iter()
                     .filter(|(k, v)| {
-                        !windows.iter().any(|(_, key, _)| key == k)
+                        k.as_str() != "extra_usage"
+                            && !windows.iter().any(|(_, key, _)| key == k)
                             && v.is_object()
                             && v.get("utilization").is_some()
                     })
@@ -368,9 +373,49 @@ pub fn capture(endpoint: Endpoint, status: u16, raw: &Value) -> Evidence {
     e
 }
 
+/// Compare identities only in memory; the diagnostic schema can hold booleans,
+/// never an email, organization name, UUID, profile body or token.
+pub fn profile(status: u16, raw: &Value, slot: &crate::accounts::Slot) -> Evidence {
+    let mut e = Evidence::outcome(Endpoint::ClaudeProfile, Some(status));
+    e.parsed_json = true;
+    let expected = &slot.data["oauth_account"];
+    for (field, actual, expected) in [
+        (Field::AccountMatches, raw["account"]["uuid"].as_str(), expected["accountUuid"].as_str()),
+        (Field::OrganizationMatches, raw["organization"]["uuid"].as_str(), expected["organizationUuid"].as_str()),
+        (Field::EmailMatches, raw["account"]["email"].as_str(), slot.email.as_deref()),
+    ] {
+        let comparison = actual.zip(expected).filter(|(a, b)| !a.is_empty() && !b.is_empty())
+            .map(|(a, b)| Value::Bool(a == b));
+        e.probe(field, None, None, comparison.as_ref(), Parse::Bool);
+    }
+    e
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn extra_usage_is_credit_utilization_not_an_unrecognized_included_window() {
+        let fixture: Value = serde_json::from_str(include_str!("fixtures/usage-divergence.json")).unwrap();
+        let e = capture(Endpoint::ClaudeUsage, 200, &fixture["claude_usage"]);
+        assert_eq!(e.unrecognized_window_count, 0);
+        assert!(e.fields.iter().any(|p| p.field == Field::SevenDayFable && p.state == State::Missing));
+        assert!(e.fields.iter().any(|p| p.field == Field::Utilization && p.parent == Some(Field::ExtraUsage) && p.number == Some(18.3675)));
+    }
+
+    #[test]
+    fn profile_reports_matching_unknown_and_mismatched_identity_without_values() {
+        let mut slot = crate::test_support::slot("PRIVATE-ID", "SECRET-access", "SECRET-refresh", 0);
+        slot.email = Some("PRIVATE-email".into());
+        slot.data["oauth_account"] = serde_json::json!({"accountUuid":"PRIVATE-account","organizationUuid":"PRIVATE-org"});
+        let raw = serde_json::json!({"account":{"uuid":"PRIVATE-account","email":"PRIVATE-email"},"organization":{"uuid":"PRIVATE-other-org"},"credentials":"SECRET"});
+        let e = profile(200, &raw, &slot);
+        assert!(e.fields.iter().any(|p| p.field == Field::AccountMatches && p.boolean == Some(true)));
+        assert!(e.fields.iter().any(|p| p.field == Field::OrganizationMatches && p.boolean == Some(false)));
+        assert!(!serde_json::to_string(&e).unwrap().contains("PRIVATE"));
+        assert!(!serde_json::to_string(&e).unwrap().contains("SECRET"));
+        assert!(profile(200, &Value::Null, &slot).fields.iter().all(|p| p.state == State::Missing));
+    }
     #[test]
     fn capture_is_allowlisted_and_distinguishes_absent_null_and_invalid() {
         let raw = serde_json::json!({"identity":"PRIVATE-CANARY", "authorization":"SECRET-CANARY", "cedar_ember":null,

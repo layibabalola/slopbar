@@ -159,15 +159,15 @@ struct Fetched {
 trait Usage {
     async fn fetch(&self, provider: Provider, token: &str, account: Option<&str>, observe: &evidence::Observer<'_>) -> Result<Fetched, String>;
 }
-struct Api<'a>(&'a reqwest::Client);
+struct Api<'a>(&'a reqwest::Client, &'a Slot);
 impl Usage for Api<'_> {
     async fn fetch(&self, provider: Provider, token: &str, account: Option<&str>, observe: &evidence::Observer<'_>) -> Result<Fetched, String> {
-        fetch_token(self.0, provider, token, account, observe).await
+        fetch_token(self.0, self.1, provider, token, account, observe).await
     }
 }
 
 async fn fetch_one(client: &reqwest::Client, slot: &Slot, monitor: &Monitor, active: bool) -> Result<Fetched, String> {
-    fetch_one_with(client, slot, monitor, active, &Api(client)).await
+    fetch_one_with(client, slot, monitor, active, &Api(client, slot)).await
 }
 
 async fn fetch_one_with(client: &reqwest::Client, slot: &Slot, monitor: &Monitor, active: bool, usage: &impl Usage) -> Result<Fetched, String> {
@@ -228,9 +228,9 @@ async fn observed_usage(usage: &impl Usage, monitor: &Monitor, slot: &Slot, toke
     result
 }
 
-async fn fetch_token(client: &reqwest::Client, provider: Provider, token: &str, account: Option<&str>, observe: &evidence::Observer<'_>) -> Result<Fetched, String> {
+async fn fetch_token(client: &reqwest::Client, slot: &Slot, provider: Provider, token: &str, account: Option<&str>, observe: &evidence::Observer<'_>) -> Result<Fetched, String> {
     match provider {
-        Provider::Claude => claude::fetch(client, token, observe)
+        Provider::Claude => claude::fetch(client, token, slot, observe)
             .await.map(|u| Fetched { windows: u.windows, credits: None, resets: u.resets, monitor_error: None }),
         Provider::Codex => codex::fetch(client, token, account, observe)
             .await.map(|u| Fetched { windows: u.windows, credits: u.credits, resets: u.resets, monitor_error: None }),

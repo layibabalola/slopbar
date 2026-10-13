@@ -70,6 +70,9 @@ async fn diagnostic_refresh_trace_is_secret_free_and_recording_failure_cannot_br
     monitor.connect(&expected, &login(), &[]).await.unwrap();
     assert_eq!(monitor.token_with(&expected, &transport, None, now()).await.err().as_deref(), Some("monitor_network"));
     assert_eq!(monitor.token_with(&expected, &transport, None, now() + chrono::Duration::minutes(6)).await.unwrap().0, "PRIVATE-new-access");
+    // Storage failures are recorded asynchronously; wait for this write before
+    // asserting its result rather than racing the diagnostic worker.
+    recorder.flush();
     let report = String::from_utf8(recorder.report(&crate::model::Snapshot::default(), &crate::settings::Settings::default()).unwrap()).unwrap();
     for private in ["PRIVATE", "monitor-access-1", "monitor-refresh-1", "cli-refresh", "account:org", "test@example.invalid"] { assert!(!report.contains(private)); }
     let data: serde_json::Value = serde_json::from_str(&report).unwrap();

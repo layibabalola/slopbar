@@ -612,7 +612,7 @@ impl Recorder {
         }
     }
     // Only export/shutdown wait for the background writer. Auth callers merely notify it.
-    fn flush(&self) {
+    pub(crate) fn flush(&self) {
         if self.worker.is_none() {
             return;
         }

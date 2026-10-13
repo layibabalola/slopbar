@@ -52,7 +52,7 @@ impl AccountUsage {
 /// A usage-limit reset the account can spend to refill its limits.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResetGrant {
-    /// "full" (session + weekly) or "session".
+    /// "full", "session", "weekly", or "unknown" when the provider scope is unrecognized.
     pub kind: String,
     /// The provider's own title, when it gives one (e.g. "Full reset").
     pub title: Option<String>,

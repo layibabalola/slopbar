@@ -1,6 +1,6 @@
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
-import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetsIn, resetText, errorText, duration } from "./i18n.js";
+import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetsIn, resetText, errorText, duration, windowLabel } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -44,7 +44,7 @@ function accountRow(p, a) {
   const top = a.windows.reduce((m, w) => (w.used_percent > (m?.used_percent ?? -1) ? w : m), null);
   const meter = usage == null
     ? `<div class="meter none"><b>—</b></div>`
-    : `<div class="meter ${a.stale ? "stale" : ""}"><b>${Math.round(usage)}%</b><div class="track"><i style="width:${Math.min(100, usage)}%;background:${color(usage)}"></i></div>
+    : `<div class="meter ${a.stale ? "stale" : ""}" title="${esc(a.windows.map(w => `${windowLabel(w)}: ${w.used_percent}% ${t("used")}${w.resets_at ? ` · ${w.resets_at}` : ""}`).join("\n"))}"><b>${Math.round(usage)}%</b><small class="window-label">${esc(windowLabel(top))} · ${t("used")}</small><div class="track"><i style="width:${Math.min(100, usage)}%;background:${color(usage)}"></i></div>
         ${a.stale ? `<small>${t("lastReading")}</small>` : top?.resets_at ? `<small>${esc(resetsIn(top.resets_at))}</small>` : ""}</div>`;
   const held = a.resets ?? [];
   const total = held.reduce((n, r) => n + r.count, 0);
@@ -66,6 +66,7 @@ function accountRow(p, a) {
         </small>
       </div>
       <div class="monitor-state">
+        ${p === "claude" && a.windows.length && !a.windows.some(w => /^weekly_/.test(w.kind)) ? `<small>${t("modelUsageUnavailable")}</small>` : ""}
         ${a.stale && a.fetched_at ? `<small>${esc(t("lastObserved", { t: duration(Math.max(1, Math.round((Date.now() - new Date(a.fetched_at)) / 60000))) }))}</small>` : ""}
         ${a.error || a.monitor_error ? `<small>${esc(errorText(p, a.error ?? a.monitor_error))}</small>` : ""}
         ${!a.monitor_connected || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account", "monitor_network", "monitor_uncertain"].includes(a.monitor_error ?? a.error)

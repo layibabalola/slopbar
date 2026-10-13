@@ -116,7 +116,7 @@ pub async fn fetch(client: &reqwest::Client, token: &str, account_id: Option<&st
     let resets = if available > 0 {
         list_resets(client, token, account_id, usable_now, observe).await.unwrap_or_else(|| {
             vec![ResetGrant {
-                kind: "full".into(),
+                kind: "unknown".into(),
                 title: None,
                 count: available,
                 usable: usable_now,
@@ -160,20 +160,31 @@ async fn list_resets(
     };
     observe(super::evidence::capture(super::evidence::Endpoint::CodexResetDetails, status, &raw));
     let list: CreditList = serde_json::from_value(raw).ok()?;
-    Some(
+    Some(reset_grants(list, usable))
+}
+
+fn reset_grants(list: CreditList, usable: bool) -> Vec<ResetGrant> {
         list.credits
             .into_iter()
             .filter(|c| c.status.as_deref() == Some("available"))
             .map(|c| ResetGrant {
-                kind: if c.reset_type.as_deref().is_some_and(|t| t.contains("session")) { "session" } else { "full" }.into(),
+                kind: reset_kind(c.reset_type.as_deref()).into(),
                 title: c.title,
                 count: 1,
                 usable,
                 expires_at: c.expires_at,
                 next_available_at: None,
             })
-            .collect(),
-    )
+            .collect()
+}
+
+fn reset_kind(kind: Option<&str>) -> &'static str {
+    match kind {
+        Some("session" | "five_hour") => "session",
+        Some("weekly" | "seven_day") => "weekly",
+        Some("full") => "full",
+        _ => "unknown",
+    }
 }
 
 fn window_kind(seconds: Option<i64>) -> &'static str {
@@ -181,5 +192,33 @@ fn window_kind(seconds: Option<i64>) -> &'static str {
         Some(18_000) => "session",
         Some(604_800) => "weekly",
         _ => "window",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn available_resets_with_unrecognized_types_keep_counts_not_assumed_scope() {
+        let raw: serde_json::Value = serde_json::from_str(include_str!("fixtures/usage-divergence.json")).unwrap();
+        let list: CreditList = serde_json::from_value(raw["codex_reset_details"].clone()).unwrap();
+        let grants = reset_grants(list, true);
+        assert_eq!(grants.iter().map(|r| r.count).sum::<u32>(), 2);
+        assert!(grants.iter().all(|r| r.kind == "unknown" && r.usable && r.expires_at.is_some()));
+        let usage: Usage = serde_json::from_value(raw["codex_usage"].clone()).unwrap();
+        let counts = usage.rate_limit_reset_credits.unwrap();
+        assert_eq!(counts.available_count, Some(2));
+        assert_eq!(counts.applicable_available_count, Some(2));
+        assert_eq!(usage.rate_limit.unwrap().primary_window.unwrap().used_percent, 100.0);
+    }
+
+    #[test]
+    fn only_explicit_reset_scopes_are_recognized() {
+        assert_eq!(reset_kind(Some("full")), "full");
+        assert_eq!(reset_kind(Some("five_hour")), "session");
+        assert_eq!(reset_kind(Some("seven_day")), "weekly");
+        assert_eq!(reset_kind(None), "unknown");
+        assert_eq!(reset_kind(Some("not_a_session_reset")), "unknown");
     }
 }

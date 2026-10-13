@@ -27,7 +27,31 @@ pub struct ClaudeUsage {
 }
 
 /// Fetches the usage windows, or an error code (see `model::AccountUsage::error`).
-pub async fn fetch(client: &reqwest::Client, token: &str, observe: &super::evidence::Observer<'_>) -> Result<ClaudeUsage, String> {
+pub async fn fetch(client: &reqwest::Client, token: &str, slot: &crate::accounts::Slot, observe: &super::evidence::Observer<'_>) -> Result<ClaudeUsage, String> {
+    // Read-only identity evidence once per account per app run, using the same
+    // access token the monitor supplied. Never refresh, replace or persist a login here.
+    static CHECKED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    let first = CHECKED.get_or_init(Default::default).lock().unwrap().insert(slot.id.clone());
+    if first {
+        let response = client.get("https://api.anthropic.com/api/oauth/profile")
+            .bearer_auth(token).header("anthropic-beta", "oauth-2025-04-20").send().await;
+        match response {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if status == 429 {
+                    observe(super::evidence::Evidence::outcome(super::evidence::Endpoint::ClaudeProfile, Some(status)));
+                    return Err(super::rate_limited(&resp));
+                }
+                if resp.status().is_success() {
+                    match resp.json::<Value>().await {
+                        Ok(raw) => observe(super::evidence::profile(status, &raw, slot)),
+                        Err(_) => observe(super::evidence::Evidence::outcome(super::evidence::Endpoint::ClaudeProfile, Some(status))),
+                    }
+                } else { observe(super::evidence::Evidence::outcome(super::evidence::Endpoint::ClaudeProfile, Some(status))); }
+            }
+            Err(_) => observe(super::evidence::Evidence::outcome(super::evidence::Endpoint::ClaudeProfile, None)),
+        }
+    }
     let resp = client
         .get("https://api.anthropic.com/api/oauth/usage")
         .bearer_auth(token)

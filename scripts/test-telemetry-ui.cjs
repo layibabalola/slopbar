@@ -25,6 +25,12 @@ const data = {
     windows: [{ kind: 'session', used_percent: a.percent, resets_at: new Date(Date.now() - 3600000).toISOString(), window_seconds: 18000 }],
   })),
 };
+// Synthetic replay of the observed disagreement: one headline hides two
+// windows; available reset counts do not identify their scope.
+data.accounts[1].windows.push({ kind: 'weekly', used_percent: 58,
+  resets_at: '2026-10-16T05:59:59Z', window_seconds: 604800 });
+data.accounts[2].resets = [{ kind: 'unknown', title: 'Full reset', count: 2,
+  usable: true, expires_at: '2026-10-29T19:00:11Z', next_available_at: null }];
 
 async function setup(page, label) {
   await page.addInitScript(({ data, label }) => {
@@ -67,7 +73,12 @@ async function setup(page, label) {
     assert.equal(await settings.locator('#auto-update').isDisabled(), true);
     assert.equal(await settings.locator('#auto-update').isChecked(), false);
     assert.match(await settings.locator('[data-key="claude:connected:org"]').innerText(), /Reconnect monitoring/);
-    assert.match(await settings.locator('[data-key="claude:connected:org"] .meter').innerText(), /24%/);
+    assert.match(await settings.locator('[data-key="claude:connected:org"] .meter').innerText(), /58%[\s\S]*Weekly · used/);
+    assert.match(await settings.locator('[data-key="claude:connected:org"] .meter').getAttribute('title'), /Session \(5h\): 24% used[\s\S]*Weekly: 58% used/);
+    assert.match(await settings.locator('[data-key="claude:connected:org"]').innerText(), /Model-specific usage unavailable from this source/);
+    const resetTooltip = await settings.locator('[data-key="codex:reconnect:org"] .resets').getAttribute('title');
+    assert.match(resetTooltip, /type unknown[\s\S]*usable now/);
+    assert.doesNotMatch(resetTooltip, /Full reset/);
     assert.equal(await settings.locator('[data-key="claude:connected:org"] .meter.stale').count(), 0);
     await settings.locator('[data-key="claude:inactive:org"] [data-monitor]').click();
     assert.match(await settings.locator('#add-hint').innerText(), /Finish the monitoring sign-in/);
@@ -101,6 +112,7 @@ async function setup(page, label) {
     await setup(panel, 'panel');
     await panel.goto(base + '/index.html');
     await panel.locator('button.monitor').first().waitFor();
+    assert.match(await panel.locator('[data-key="codex:reconnect:org"] .reset-grant').innerText(), /type unknown[\s\S]*usable now/);
     const inactive = panel.locator('[data-key="claude:inactive:org"]');
     assert.match(await inactive.innerText(), /Last confirmed 2h ago/);
     assert.equal(await inactive.locator('.win .reset').count(), 0);

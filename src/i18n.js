@@ -23,6 +23,8 @@ const MESSAGES = {
     monitor_busy: "Another monitoring action is in progress for this account.",
     lastObserved: "Last confirmed {t} ago", lastReading: "Last reading", usageUnknown: "Usage unavailable",
     manualUpdates: "Manual updates only for this build.",
+    used: "used", modelUsageUnavailable: "Model-specific usage unavailable from this source",
+    resetUnknown: "Reset · type unknown", resetWeekly: "Weekly reset", resetNotUsableNow: "not usable now",
 
     title: "Plan usage", loading: "Loading…", noAccounts: "No accounts",
     noCredentials: "No Claude Code or Codex credentials found on Windows or WSL.",
@@ -538,9 +540,11 @@ export function groupResets(resets) {
 
 /** One line describing a usage-limit reset (or a group of identical ones). */
 export function resetText(r) {
-  const name = r.title || t(r.kind === "session" ? "resetSession" : "resetFull");
+  const scope = { session: "resetSession", weekly: "resetWeekly", full: "resetFull" }[r.kind];
+  const name = scope ? (r.title || t(scope)) : t("resetUnknown");
   const parts = [r.count > 1 ? `${name} ×${r.count}` : name];
   if (r.usable) parts.push(t("resetUsableNow"));
+  else if (r.count) parts.push(t("resetNotUsableNow"));
   if (r.expires_at) parts.push(t(r.entries > 1 ? "resetNextExpires" : "resetExpires", { d: shortDate(r.expires_at) }));
   if (r.next_available_at && !r.count) {
     const mins = Math.max(1, Math.round((new Date(r.next_available_at) - Date.now()) / 60000));
