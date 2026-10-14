@@ -263,6 +263,7 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
 .account > .remove { grid-column: 5; grid-row: 1; }
 .monitor-state { grid-column: 2 / -1; grid-row: 2; display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--dim); }
 .monitor-state small { display: block; white-space: normal; }
+.window-resets { display: flex; flex-direction: column; gap: 4px; font-variant-numeric: tabular-nums; }
 .monitor-state .btn { align-self: flex-start; }
 .meter.stale { opacity: .65; }
 #diagnostics-status { overflow-wrap: anywhere; }

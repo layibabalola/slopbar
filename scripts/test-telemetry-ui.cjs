@@ -20,6 +20,7 @@ const data = {
     { id: 'inactive:org', provider: 'claude', email: 'inactive@example.invalid', plan: 'max', active: false, monitor_connected: false, stale: true, error: 'monitor_setup', percent: 87 },
     { id: 'connected:org', provider: 'claude', email: 'connected@example.invalid', plan: 'max', active: true, monitor_connected: true, stale: false, error: null, monitor_error: 'monitor_reconnect', percent: 24 },
     { id: 'reconnect:org', provider: 'codex', email: 'reconnect@example.invalid', plan: 'plus', active: true, monitor_connected: true, stale: true, error: 'monitor_reconnect', percent: 52 },
+    { id: 'zero:org', provider: 'claude', email: 'zero@example.invalid', plan: 'max', active: false, monitor_connected: true, stale: false, error: null, percent: 0 },
   ].map(a => ({ ...a, alias: null, org: null, credits: null, resets: [], sources: a.active ? ['Windows'] : [],
     fetched_at: new Date(Date.now() - (a.stale ? 7200000 : 1000)).toISOString(),
     windows: [{ kind: 'session', used_percent: a.percent, resets_at: new Date(Date.now() - 3600000).toISOString(), window_seconds: 18000 }],
@@ -31,6 +32,13 @@ data.accounts[1].windows.push({ kind: 'weekly', used_percent: 58,
   resets_at: '2026-10-16T05:59:59Z', window_seconds: 604800 });
 data.accounts[2].resets = [{ kind: 'unknown', title: 'Full reset', count: 2,
   usable: true, expires_at: '2026-10-29T19:00:11Z', next_available_at: null }];
+// Reproduces a monitored idle account: the 0% session wins the headline tie,
+// but only its separate weekly window has a provider-supplied reset time.
+const idleWeeklyReset = new Date(Date.now() + 6 * 86400000).toISOString();
+data.accounts[3].windows = [
+  { kind: 'session', used_percent: 0, resets_at: null, window_seconds: 18000 },
+  { kind: 'weekly', used_percent: 0, resets_at: idleWeeklyReset, window_seconds: 604800 },
+];
 
 async function setup(page, label) {
   await page.addInitScript(({ data, label }) => {
@@ -80,6 +88,44 @@ async function setup(page, label) {
     assert.match(resetTooltip, /type unknown[\s\S]*usable now/);
     assert.doesNotMatch(resetTooltip, /Full reset/);
     assert.equal(await settings.locator('[data-key="claude:connected:org"] .meter.stale').count(), 0);
+    const idle = settings.locator('[data-key="claude:zero:org"]');
+    assert.match(await idle.locator('.meter').innerText(), /0%[\s\S]*Session \(5h\) · used/);
+    assert.match(await idle.locator('.window-resets').innerText(), /Session \(5h\): Reset time unavailable[\s\S]*Weekly: Resets in/);
+    assert.equal(await idle.locator('.window-reset').last().getAttribute('title'), idleWeeklyReset);
+    assert.equal(await settings.locator('[data-key="claude:inactive:org"] .window-resets').count(), 0);
+    assert.match(await settings.locator('[data-key="codex:reconnect:org"] .window-resets').innerText(), /Last known reset:/);
+    const resetStates = await settings.evaluate(async () => {
+      const { windowResetText } = await import('/i18n.js');
+      const future = { resets_at: new Date(Date.now() + 86400000).toISOString() };
+      const past = { resets_at: new Date(Date.now() - 3600000).toISOString() };
+      return {
+        missing: windowResetText({ resets_at: null }),
+        invalid: windowResetText({ resets_at: 'not-a-time' }),
+        stale: windowResetText(future, true),
+        elapsed: windowResetText(past),
+        fresh: windowResetText(future),
+      };
+    });
+    assert.equal(resetStates.missing, 'Reset time unavailable');
+    assert.equal(resetStates.invalid, 'Reset time unavailable');
+    assert.match(resetStates.stale, /^Last known reset:/);
+    assert.doesNotMatch(resetStates.stale, /Resets in/);
+    assert.match(resetStates.elapsed, /^Reset time passed · awaiting refresh/);
+    assert.match(resetStates.fresh, /^Resets in.* · /);
+    const expiredSnapshot = JSON.parse(JSON.stringify(data));
+    expiredSnapshot.accounts[3].windows[1].resets_at = new Date(Date.now() - 60000).toISOString();
+    await settings.evaluate(s => window.testEmit('usage-updated', s), expiredSnapshot);
+    await idle.getByText(/Weekly: Reset time passed · awaiting refresh/).waitFor();
+    assert.match(await idle.locator('.meter').innerText(), /0%/);
+    const freshSnapshot = JSON.parse(JSON.stringify(data));
+    freshSnapshot.accounts[3].provider = 'codex';
+    freshSnapshot.accounts[3].windows = [freshSnapshot.accounts[3].windows[1]];
+    await settings.evaluate(s => window.testEmit('usage-updated', s), freshSnapshot);
+    const idleCodex = settings.locator('[data-key="codex:zero:org"]');
+    await idleCodex.getByText(/Weekly: Resets in/).waitFor();
+    assert.equal(await idleCodex.locator('.window-reset').count(), 1);
+    await settings.evaluate(s => window.testEmit('usage-updated', s), data);
+    await idle.locator('.window-resets').waitFor();
     await settings.locator('[data-key="claude:inactive:org"] [data-monitor]').click();
     assert.match(await settings.locator('#add-hint').innerText(), /Finish the monitoring sign-in/);
     const called = await settings.evaluate(() => window.testCalls.filter(c => c.command === 'connect_monitoring' || c.command === 'switch_account'));
@@ -125,7 +171,7 @@ async function setup(page, label) {
     // Every supported language supplies the monitoring controls and error strings.
     const translations = await panel.evaluate(async () => {
       const { t, setLanguage, LANGUAGES } = await import('/i18n.js');
-      const keys = ['monitorDisconnect', 'monitorDisconnected', 'monitorRevokeFailed', 'monitor_uncertain', 'monitorConnect', 'monitorReconnect', 'monitorConnected', 'monitorPending', 'monitor_setup', 'monitor_reconnect', 'monitor_storage', 'monitor_network', 'monitor_wrong_account', 'monitor_shared_login', 'monitor_login_failed', 'monitor_busy', 'lastObserved', 'lastReading', 'usageUnknown', 'manualUpdates'];
+      const keys = ['monitorDisconnect', 'monitorDisconnected', 'monitorRevokeFailed', 'monitor_uncertain', 'monitorConnect', 'monitorReconnect', 'monitorConnected', 'monitorPending', 'monitor_setup', 'monitor_reconnect', 'monitor_storage', 'monitor_network', 'monitor_wrong_account', 'monitor_shared_login', 'monitor_login_failed', 'monitor_busy', 'lastObserved', 'lastReading', 'usageUnknown', 'manualUpdates', 'resetTimeUnavailable', 'lastResetAt', 'resetAwaitingRefresh'];
       setLanguage('en'); const english = keys.map(k => t(k));
       return Object.keys(LANGUAGES).filter(l => l !== 'en').map(l => {
         setLanguage(l); return { l, values: keys.map(k => t(k)), english };
