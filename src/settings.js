@@ -42,13 +42,13 @@ function accountRow(p, a) {
   const usage = peak(a);
   // Keep the usage headline independent from each window's reset schedule.
   const top = a.windows.reduce((m, w) => (w.used_percent > (m?.used_percent ?? -1) ? w : m), null);
+  const timedWindows = visibleResetWindows(a.windows);
   const meter = usage == null
     ? `<div class="meter none"><b>—</b></div>`
     : `<div class="meter ${a.stale ? "stale" : ""}" title="${esc(a.windows.map(w => `${windowLabel(w)}: ${w.used_percent}% ${t("used")}${w.resets_at ? ` · ${w.resets_at}` : ""}`).join("\n"))}"><b>${Math.round(usage)}%</b><small class="window-label">${esc(windowLabel(top))} · ${t("used")}</small><div class="track"><i style="width:${Math.min(100, usage)}%;background:${color(usage)}"></i></div>
-        ${a.stale ? `<small>${t("lastReading")}</small>` : !a.monitor_connected && top?.resets_at ? `<small>${esc(resetsIn(top.resets_at))}</small>` : ""}</div>`;
+        ${a.stale ? `<small>${t("lastReading")}</small>` : !a.monitor_connected && timedWindows.includes(top) ? `<small>${esc(resetsIn(top.resets_at))}</small>` : ""}</div>`;
   // A zero-usage session can lack a reset while its weekly window has one.
   // Never hide that weekly timestamp behind the headline's tie-breaking.
-  const timedWindows = visibleResetWindows(a.windows);
   const windowResets = a.monitor_connected && timedWindows.length
     ? `<div class="window-resets">${timedWindows.map(w => `<small class="window-reset" title="${esc(w.resets_at)}">${esc(windowLabel(w))}: ${esc(windowResetText(w, a.stale))}</small>`).join("")}</div>`
     : "";

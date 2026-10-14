@@ -153,6 +153,11 @@ async function setup(page, label) {
     await settings.evaluate(s => window.testEmit('usage-updated', s), exhaustedCodex);
     assert.match(await idleCodex.locator('.window-resets').innerText(), /^Weekly:/);
     assert.equal(await idleCodex.locator('.window-reset').count(), 1);
+    const cliFallback = JSON.parse(JSON.stringify(exhausted));
+    cliFallback.accounts[3].monitor_connected = false;
+    cliFallback.accounts[3].windows[0].used_percent = 100;
+    await settings.evaluate(s => window.testEmit('usage-updated', s), cliFallback);
+    assert.doesNotMatch(await idle.locator('.meter').innerText(), /Resets in/);
     await settings.evaluate(s => window.testEmit('usage-updated', s), data);
     await idle.locator('.window-resets').waitFor();
     await settings.locator('[data-key="claude:inactive:org"] [data-monitor]').click();
