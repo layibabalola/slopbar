@@ -1,6 +1,6 @@
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
-import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetsIn, resetText, errorText, duration, windowLabel, windowResetText } from "./i18n.js";
+import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetsIn, resetText, errorText, duration, windowLabel, windowResetText, visibleResetWindows } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -48,7 +48,7 @@ function accountRow(p, a) {
         ${a.stale ? `<small>${t("lastReading")}</small>` : !a.monitor_connected && top?.resets_at ? `<small>${esc(resetsIn(top.resets_at))}</small>` : ""}</div>`;
   // A zero-usage session can lack a reset while its weekly window has one.
   // Never hide that weekly timestamp behind the headline's tie-breaking.
-  const timedWindows = a.windows.filter(w => w.resets_at && Number.isFinite(Date.parse(w.resets_at)));
+  const timedWindows = visibleResetWindows(a.windows);
   const windowResets = a.monitor_connected && timedWindows.length
     ? `<div class="window-resets">${timedWindows.map(w => `<small class="window-reset" title="${esc(w.resets_at)}">${esc(windowLabel(w))}: ${esc(windowResetText(w, a.stale))}</small>`).join("")}</div>`
     : "";

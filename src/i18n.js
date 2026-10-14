@@ -580,6 +580,13 @@ export function windowResetText(w, stale = false) {
   return `${resetsIn(w.resets_at)} · ${date}`;
 }
 
+/** A session reset cannot restore included usage while the overall week is exhausted. */
+export function visibleResetWindows(windows) {
+  const weeklyExhausted = windows.some(w => w.kind === "weekly" && w.used_percent >= 100);
+  return windows.filter(w => w.resets_at && Number.isFinite(Date.parse(w.resets_at))
+    && !(weeklyExhausted && w.kind === "session"));
+}
+
 export function windowLabel(w) {
   if (w.kind !== "window") return t(w.kind);
   return w.window_seconds ? `${t("limit")} · ${duration(Math.round(w.window_seconds / 60))}` : t("limit");

@@ -133,6 +133,28 @@ async function setup(page, label) {
     assert.equal(await idleCodex.locator('.window-reset').count(), 1);
     await settings.evaluate(s => window.testEmit('usage-updated', s), data);
     await idle.locator('.window-resets').waitFor();
+    const exhausted = JSON.parse(JSON.stringify(data));
+    exhausted.accounts[3].windows[0].resets_at = new Date(Date.now() + 3600000).toISOString();
+    exhausted.accounts[3].windows[1].used_percent = 100;
+    await settings.evaluate(s => window.testEmit('usage-updated', s), exhausted);
+    assert.equal(await idle.locator('.window-reset').count(), 1);
+    assert.match(await idle.locator('.window-resets').innerText(), /^Weekly:/);
+    assert.match(await idle.locator('.meter').innerText(), /100%/);
+    const priorityCases = await settings.evaluate(async () => {
+      const { visibleResetWindows } = await import('/i18n.js');
+      const future = new Date(Date.now() + 86400000).toISOString();
+      const session = {kind:'session', used_percent:50, resets_at:future};
+      return [100,101,99.6,null].map(used => visibleResetWindows([session,
+        ...(used === null ? [] : [{kind:'weekly',used_percent:used,resets_at:future}])]).map(w=>w.kind));
+    });
+    assert.deepEqual(priorityCases, [['weekly'],['weekly'],['session','weekly'],['session']]);
+    const exhaustedCodex = JSON.parse(JSON.stringify(exhausted));
+    exhaustedCodex.accounts[3].provider = 'codex';
+    await settings.evaluate(s => window.testEmit('usage-updated', s), exhaustedCodex);
+    assert.match(await idleCodex.locator('.window-resets').innerText(), /^Weekly:/);
+    assert.equal(await idleCodex.locator('.window-reset').count(), 1);
+    await settings.evaluate(s => window.testEmit('usage-updated', s), data);
+    await idle.locator('.window-resets').waitFor();
     await settings.locator('[data-key="claude:inactive:org"] [data-monitor]').click();
     assert.match(await settings.locator('#add-hint').innerText(), /Finish the monitoring sign-in/);
     const called = await settings.evaluate(() => window.testCalls.filter(c => c.command === 'connect_monitoring' || c.command === 'switch_account'));
@@ -169,6 +191,15 @@ async function setup(page, label) {
     const inactive = panel.locator('[data-key="claude:inactive:org"]');
     assert.match(await inactive.innerText(), /Last confirmed 2h ago/);
     assert.equal(await inactive.locator('.win .reset').count(), 0);
+    const panelIdle = panel.locator('[data-key="claude:zero:org"]');
+    await panel.evaluate(s => window.testEmit('usage-updated', s), exhausted);
+    assert.equal(await panelIdle.locator('.win').count(), 2); // Usage percentages stay visible.
+    assert.equal(await panelIdle.locator('.win .reset').count(), 1);
+    const eligible = JSON.parse(JSON.stringify(exhausted));
+    eligible.accounts[3].windows[1].used_percent = 99.6;
+    await panel.evaluate(s => window.testEmit('usage-updated', s), eligible);
+    assert.equal(await panelIdle.locator('.win .reset').count(), 2);
+    await panel.evaluate(s => window.testEmit('usage-updated', s), data);
     await inactive.locator('button.monitor').click();
     assert.equal(await panel.locator('#panel-notice').isVisible(), true);
     await panel.evaluate(() => window.testEmit('monitoring-login', { error: 'monitor_wrong_account' }));
