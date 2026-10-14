@@ -48,10 +48,9 @@ function accountRow(p, a) {
         ${a.stale ? `<small>${t("lastReading")}</small>` : !a.monitor_connected && top?.resets_at ? `<small>${esc(resetsIn(top.resets_at))}</small>` : ""}</div>`;
   // A zero-usage session can lack a reset while its weekly window has one.
   // Never hide that weekly timestamp behind the headline's tie-breaking.
-  const windowResets = a.monitor_connected
-    ? `<div class="window-resets">${a.windows.length
-      ? a.windows.map(w => `<small class="window-reset" title="${esc(w.resets_at ?? "")}">${esc(windowLabel(w))}: ${esc(windowResetText(w, a.stale))}</small>`).join("")
-      : `<small class="window-reset">${t("resetTimeUnavailable")}</small>`}</div>`
+  const timedWindows = a.windows.filter(w => w.resets_at && Number.isFinite(Date.parse(w.resets_at)));
+  const windowResets = a.monitor_connected && timedWindows.length
+    ? `<div class="window-resets">${timedWindows.map(w => `<small class="window-reset" title="${esc(w.resets_at)}">${esc(windowLabel(w))}: ${esc(windowResetText(w, a.stale))}</small>`).join("")}</div>`
     : "";
   const held = a.resets ?? [];
   const total = held.reduce((n, r) => n + r.count, 0);
@@ -74,12 +73,11 @@ function accountRow(p, a) {
       </div>
       <div class="monitor-state">
         ${windowResets}
-        ${p === "claude" && a.windows.length && !a.windows.some(w => /^weekly_/.test(w.kind)) ? `<small>${t("modelUsageUnavailable")}</small>` : ""}
         ${a.stale && a.fetched_at ? `<small>${esc(t("lastObserved", { t: duration(Math.max(1, Math.round((Date.now() - new Date(a.fetched_at)) / 60000))) }))}</small>` : ""}
         ${a.error || a.monitor_error ? `<small>${esc(errorText(p, a.error ?? a.monitor_error))}</small>` : ""}
         ${!a.monitor_connected || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account", "monitor_network", "monitor_uncertain"].includes(a.monitor_error ?? a.error)
           ? `<button class="btn" data-monitor="${p}" data-id="${esc(a.id)}">${t(a.monitor_connected ? "monitorReconnect" : "monitorConnect")}</button>`
-          : `<small>${t("monitorConnected")}</small>`}
+          : ""}
         ${a.monitor_connected ? `<button class="btn" data-disconnect="${p}" data-id="${esc(a.id)}">${t("monitorDisconnect")}</button>` : ""}
       </div>
       ${meter}
