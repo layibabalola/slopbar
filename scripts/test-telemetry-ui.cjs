@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const { runResetScheduleMatrix } = require('./test-reset-schedule-matrix.cjs');
 
 const root = path.resolve(__dirname, '../src');
 const server = http.createServer((req, res) => {
@@ -93,7 +94,8 @@ async function setup(page, label) {
     assert.match(await idle.locator('.window-resets').innerText(), /^Weekly: Resets in/);
     assert.equal(await idle.locator('.window-reset').count(), 1);
     assert.equal(await idle.locator('.window-reset').last().getAttribute('title'), idleWeeklyReset);
-    assert.equal(await settings.locator('[data-key="claude:inactive:org"] .window-resets').count(), 0);
+    assert.equal(await settings.locator('[data-key="claude:inactive:org"] .window-reset').count(), 1);
+    assert.match(await settings.locator('[data-key="claude:inactive:org"] .window-resets').innerText(), /Last known reset:/);
     assert.match(await settings.locator('[data-key="codex:reconnect:org"] .window-resets').innerText(), /Last known reset:/);
     const resetStates = await settings.evaluate(async () => {
       const { windowResetText } = await import('/i18n.js');
@@ -153,11 +155,20 @@ async function setup(page, label) {
     await settings.evaluate(s => window.testEmit('usage-updated', s), exhaustedCodex);
     assert.match(await idleCodex.locator('.window-resets').innerText(), /^Weekly:/);
     assert.equal(await idleCodex.locator('.window-reset').count(), 1);
-    const cliFallback = JSON.parse(JSON.stringify(exhausted));
-    cliFallback.accounts[3].monitor_connected = false;
-    cliFallback.accounts[3].windows[0].used_percent = 100;
-    await settings.evaluate(s => window.testEmit('usage-updated', s), cliFallback);
+    const cliOnly = JSON.parse(JSON.stringify(exhausted));
+    cliOnly.accounts[3].monitor_connected = false;
+    cliOnly.accounts[3].windows[0].used_percent = 100;
+    await settings.evaluate(s => window.testEmit('usage-updated', s), cliOnly);
     assert.doesNotMatch(await idle.locator('.meter').innerText(), /Resets in/);
+    assert.equal(await idle.locator('.window-reset').count(), 1);
+    assert.match(await idle.locator('.window-resets').innerText(), /^Weekly: Resets in/);
+    const cliFallback = JSON.parse(JSON.stringify(cliOnly));
+    cliFallback.accounts[3].monitor_connected = true;
+    cliFallback.accounts[3].active = true;
+    cliFallback.accounts[3].monitor_error = 'monitor_reconnect';
+    await settings.evaluate(s => window.testEmit('usage-updated', s), cliFallback);
+    assert.match(await idle.locator('.window-resets').innerText(), /^Weekly: Resets in/);
+    assert.match(await idle.innerText(), /Reconnect monitoring/);
     await settings.evaluate(s => window.testEmit('usage-updated', s), data);
     await idle.locator('.window-resets').waitFor();
     await settings.locator('[data-key="claude:inactive:org"] [data-monitor]').click();
@@ -205,6 +216,7 @@ async function setup(page, label) {
     await panel.evaluate(s => window.testEmit('usage-updated', s), eligible);
     assert.equal(await panelIdle.locator('.win .reset').count(), 2);
     await panel.evaluate(s => window.testEmit('usage-updated', s), data);
+    await runResetScheduleMatrix(settings, panel, data);
     await inactive.locator('button.monitor').click();
     assert.equal(await panel.locator('#panel-notice').isVisible(), true);
     await panel.evaluate(() => window.testEmit('monitoring-login', { error: 'monitor_wrong_account' }));

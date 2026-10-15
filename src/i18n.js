@@ -563,18 +563,25 @@ export function resetText(r) {
   return parts.join(" · ");
 }
 
+function resetDate(iso) {
+  return new Date(iso).toLocaleString(LOCALE, {
+    month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short",
+  });
+}
+
 export function resetsIn(iso) {
-  const mins = Math.round((new Date(iso) - Date.now()) / 60000);
-  return mins <= 0 ? t("resetsNow") : t("resetsIn", { t: duration(mins) });
+  const at = iso ? Date.parse(iso) : NaN;
+  if (!Number.isFinite(at)) return t("resetTimeUnavailable");
+  if (at <= Date.now()) return t("resetAwaitingRefresh", { d: resetDate(at) });
+  const mins = Math.max(1, Math.ceil((at - Date.now()) / 60000));
+  return t("resetsIn", { t: duration(mins) });
 }
 
 /** Provider-supplied reset time, with separate unknown, stale and elapsed states. */
 export function windowResetText(w, stale = false) {
   const at = w.resets_at ? Date.parse(w.resets_at) : NaN;
   if (!Number.isFinite(at)) return t("resetTimeUnavailable");
-  const date = new Date(at).toLocaleString(LOCALE, {
-    month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short",
-  });
+  const date = resetDate(at);
   if (stale) return t("lastResetAt", { d: date });
   if (at <= Date.now()) return t("resetAwaitingRefresh", { d: date });
   return `${resetsIn(w.resets_at)} · ${date}`;

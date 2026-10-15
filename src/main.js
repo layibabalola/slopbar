@@ -1,4 +1,4 @@
-import { t, resetsIn, windowLabel, errorText, creditsText, time, translateDom, setLanguage, setSystemLocale, duration, resetText, groupResets, visibleResetWindows } from "./i18n.js";
+import { t, windowResetText, windowLabel, errorText, creditsText, time, translateDom, setLanguage, setSystemLocale, duration, resetText, groupResets, visibleResetWindows } from "./i18n.js";
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { checkUsage, checkSwitch } from "./alerts.js";
@@ -92,7 +92,7 @@ function bars(a) {
     <div class="win">
       <div class="row"><span>${esc(windowLabel(w))}</span><b>${Math.round(w.used_percent)}%</b></div>
       <div class="bar"><div style="width:${Math.min(100, w.used_percent)}%;background:${color(w.used_percent)}"></div></div>
-      ${resetWindows.has(w) && !a.stale ? `<div class="reset">${esc(resetsIn(w.resets_at))}</div>` : ""}
+      ${resetWindows.has(w) && !a.stale ? `<div class="reset" title="${esc(w.resets_at)}">${esc(windowResetText(w))}</div>` : ""}
     </div>`).join("");
 }
 
