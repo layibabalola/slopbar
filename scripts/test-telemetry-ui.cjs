@@ -90,7 +90,7 @@ async function setup(page, label) {
     assert.doesNotMatch(resetTooltip, /Full reset/);
     assert.equal(await settings.locator('[data-key="claude:connected:org"] .meter.stale').count(), 0);
     const idle = settings.locator('[data-key="claude:zero:org"]');
-    assert.match(await idle.locator('.meter').innerText(), /0%[\s\S]*Session \(5h\) · used/);
+    assert.match(await idle.locator('.meter').innerText(), /0%[\s\S]*Weekly · used/);
     assert.match(await idle.locator('.window-resets').innerText(), /^Weekly: Resets in/);
     assert.equal(await idle.locator('.window-reset').count(), 1);
     assert.equal(await idle.locator('.window-reset').last().getAttribute('title'), idleWeeklyReset);

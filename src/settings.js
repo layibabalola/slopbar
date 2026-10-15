@@ -35,13 +35,12 @@ function hue(id) {
   for (const c of id) h = (h * 31 + c.charCodeAt(0)) % 360;
   return h;
 }
-const peak = (a) => (a.windows.length ? Math.max(...a.windows.map((w) => w.used_percent)) : null);
-
 function accountRow(p, a) {
   const key = `${p}:${a.id}`;
-  const usage = peak(a);
-  // Keep the usage headline independent from each window's reset schedule.
-  const top = a.windows.reduce((m, w) => (w.used_percent > (m?.used_percent ?? -1) ? w : m), null);
+  // Prefer overall weekly usage in Settings; retain all windows in the tooltip/flyout.
+  const top = a.windows.find(w => w.kind === "weekly")
+    ?? a.windows.reduce((m, w) => (w.used_percent > (m?.used_percent ?? -1) ? w : m), null);
+  const usage = top?.used_percent ?? null;
   const timedWindows = visibleResetWindows(a.windows);
   const meter = usage == null
     ? `<div class="meter none"><b>—</b></div>`

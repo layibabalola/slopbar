@@ -11,6 +11,7 @@ exports.runResetScheduleMatrix = async function(settings, panel, original) {
     ['tied100', [window('session',100),window('weekly',100)], ['Weekly']],
     ['above100', [window('session',100),window('weekly',101)], ['Weekly']],
     ['rounded100', [window('session',100),window('weekly',99.6)], ['Session (5h)','Weekly']],
+    ['weeklyHeadline', [window('session',80),window('weekly',20)], ['Session (5h)','Weekly']],
     ['zeroNullSession', [window('session',0,null),window('weekly',0)], ['Weekly']],
     ['noWeekly', [window('session',42)], ['Session (5h)']],
     ['invalidSession', [window('session',42,'invalid-time'),window('weekly',60)], ['Weekly']],
@@ -52,8 +53,10 @@ exports.runResetScheduleMatrix = async function(settings, panel, original) {
         assert.equal(await row.locator('[data-monitor]').count(),(!connected||monitor_error)?1:0);
         if(monitor_error) assert.match(await row.innerText(),/Reconnect monitoring|sign-in needs reconnecting/);
         if(stale) assert.match(await row.innerText(),/Last confirmed 2h ago/);
-        const percentage=Math.round(Math.max(...windows.map(w=>w.used_percent)))+'%';
+        const weekly=windows.find(w=>w.kind==='weekly');
+        const percentage=Math.round(weekly?weekly.used_percent:Math.max(...windows.map(w=>w.used_percent)))+'%';
         assert.match(await row.locator('.meter').innerText(),new RegExp(percentage));
+        assert.match(await row.locator('.window-label').innerText(),weekly?/Weekly · used/:/Session \(5h\) · used/);
         assert.equal(await flyout.locator('.win').count(),windows.length,'all reported usage windows remain');
         assert.deepEqual(await flyout.locator('.win .row b').allTextContents(),
           windows.map(w=>Math.round(w.used_percent)+'%'),'deadlines never change reported percentages');
