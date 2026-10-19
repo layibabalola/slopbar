@@ -19,6 +19,8 @@ pub struct AppState {
     monitor: monitoring::Monitor,
     diagnostics: std::sync::Arc<diagnostics::Recorder>,
     refresh_lock: tokio::sync::Mutex<()>,
+    /// Held from reading settings to storing them, so the window and agents never lose a change.
+    settings_lock: tokio::sync::Mutex<()>,
     account_operations: monitoring::Operations,
     pub(crate) snapshot: Mutex<Snapshot>,
     pub(crate) settings: Mutex<Settings>,
@@ -79,14 +81,34 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::Refresh => value(do_refresh(&app).await),
         R::GetSettings => value(app.state::<AppState>().settings.lock().unwrap().clone()),
         R::UpdateSettings { patch } => {
+            let state = app.state::<AppState>();
+            let _held = state.settings_lock.lock().await;
             let current = app.state::<AppState>().settings.lock().unwrap().clone();
             let next = settings::patched(&current, &patch, updates_enabled())?;
-            save_settings(app.clone(), next.clone()).await?;
+            let snapshot = app.state::<AppState>().snapshot.lock().unwrap().clone();
+            for key in next.aliases.keys().filter(|k| !current.aliases.contains_key(*k)) {
+                if !snapshot.accounts.iter().any(|a| format!("{}:{}", a.provider.name(), a.id) == *key) {
+                    return Err(format!("no account {key:?}; alias keys are \"provider:id\" from get_usage"));
+                }
+            }
+            store_settings(&app, next.clone()).await?;
             value(next)
         }
-        R::SwitchAccount { provider, id } => value(switch_account(app.clone(), provider, id).await?),
+        R::SwitchAccount { provider, id } => {
+            // An agent's explicit choice gets the balancer's cooldown, as an automatic switch does,
+            // so the next poll does not switch straight back.
+            switch_to(&app, provider, id.clone(), false).await?;
+            app.state::<AppState>().last_switch.lock().unwrap().insert(provider, Instant::now());
+            let snapshot = do_refresh(&app).await;
+            let active = snapshot.accounts.iter().find(|a| a.provider == provider && a.active).map(|a| a.id.clone());
+            let mut result = value(snapshot)?;
+            result["switched_to_requested"] = (active.as_deref() == Some(id.as_str())).into();
+            Ok(result)
+        }
         R::AddAccount { provider } => {
-            add_account(app.clone(), provider).await?;
+            // One pending sign-in per provider, so a retrying agent cannot flood the desktop.
+            let pending = app.state::<AppState>().account_operations.begin(provider, "add-account")?;
+            start_add_account(app.clone(), provider, Some(pending)).await?;
             Ok(serde_json::json!({ "started": true, "next": "The user completes the sign-in in the terminal that opened; the account then appears in get_usage." }))
         }
         R::ConnectMonitoring { provider, id } => {
@@ -97,8 +119,17 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::RemoveAccount { provider, id } => value(remove_account(app.clone(), provider, id).await?),
         R::CheckForUpdates => value(check_for_updates(app.clone()).await?),
         R::InstallUpdate => {
-            install_update(app.clone()).await?;
-            Ok(serde_json::json!({ "installing": true }))
+            let latest = check_for_updates(app.clone()).await?.latest;
+            if latest.is_none() {
+                return Ok(serde_json::json!({ "installing": false, "reason": "SlopBar is up to date" }));
+            }
+            // Installing restarts SlopBar: reply first, then install.
+            let h = app.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let _ = updates::install(&h).await;
+            });
+            Ok(serde_json::json!({ "installing": true, "version": latest, "next": "SlopBar restarts into the new version shortly." }))
         }
         R::GetAppInfo => Ok(serde_json::json!({
             "version": app_version(app.clone()),
@@ -174,6 +205,11 @@ async fn switch_account(app: AppHandle, provider: Provider, id: String) -> Resul
 /// Opens a terminal running the CLI's own sign-in; the account appears once it finishes.
 #[tauri::command]
 async fn add_account(app: AppHandle, provider: Provider) -> Result<(), String> {
+    start_add_account(app, provider, None).await
+}
+
+/// Starts the CLI sign-in; `pending` (held until it finishes) keeps a second one from starting.
+async fn start_add_account(app: AppHandle, provider: Provider, pending: Option<monitoring::Operation>) -> Result<(), String> {
     let found = {
         let known = app.state::<AppState>().sources.lock().unwrap().clone();
         if known.is_empty() {
@@ -187,6 +223,7 @@ async fn add_account(app: AppHandle, provider: Provider) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())??;
     tauri::async_runtime::spawn(async move {
+        let _pending = pending;
         let added = job.wait(&http_client()).await;
         if let Some(slot) = added {
             let _ = app.emit("account-added", (slot.provider, slot.email));
@@ -320,13 +357,20 @@ fn get_settings(state: tauri::State<AppState>) -> Settings {
 
 #[tauri::command]
 async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let _held = state.settings_lock.lock().await;
+    store_settings(&app, settings).await
+}
+
+/// Saves and applies settings; callers hold `settings_lock`.
+async fn store_settings(app: &AppHandle, settings: Settings) -> Result<(), String> {
     settings::save(&settings)?;
     let previous = std::mem::replace(&mut *app.state::<AppState>().settings.lock().unwrap(), settings.clone());
-    apply_settings(&app);
+    apply_settings(app);
     let providers_changed = previous.providers.claude != settings.providers.claude
         || previous.providers.codex != settings.providers.codex;
     if providers_changed {
-        do_refresh(&app).await;
+        do_refresh(app).await;
     }
     Ok(())
 }
@@ -525,6 +569,7 @@ pub fn run() {
         monitor: monitoring::Monitor::new(settings::app_dir().expect("config directory").join("monitoring")).with_diagnostics(diagnostics.clone()),
         diagnostics: diagnostics.clone(),
         refresh_lock: tokio::sync::Mutex::new(()),
+        settings_lock: tokio::sync::Mutex::new(()),
         account_operations: monitoring::Operations::default(),
         last_switch: Mutex::default(),
         sources: Mutex::default(),

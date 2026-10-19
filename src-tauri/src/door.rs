@@ -24,8 +24,9 @@ const MAX_REQUEST: u64 = 16 * 1024;
 const MAX_REPLY: u64 = 4 * 1024 * 1024;
 /// A repeated export request within this window gets the export just written.
 pub const REUSE_WINDOW: Duration = Duration::from_secs(30);
-/// How long the client waits for a reply (a full refresh polls every account).
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long the client waits for a reply: under MCP clients' usual 60-second tool timeout, so the
+/// agent hears "still working" rather than nothing. The app finishes the operation regardless.
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(55);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -134,58 +135,89 @@ mod imp {
     use windows_sys::Win32::Foundation::HANDLE;
 
     /// Connections served at once; more wait for a slot.
-    const MAX_CONNECTIONS: usize = 4;
+    const MAX_CONNECTIONS: usize = 16;
     /// Reading the request and writing the reply; the operation itself is not bounded here.
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const RETRY: Duration = if cfg!(test) { Duration::from_secs(1) } else { Duration::from_secs(15) };
 
-    /// The user SID of a process (as text, e.g. "S-1-5-21-…").
-    fn process_user(process: HANDLE) -> std::io::Result<String> {
+    /// What the door needs to know about a process's token.
+    struct Identity {
+        /// The user SID as text (e.g. "S-1-5-21-…").
+        user: String,
+        /// Mandatory integrity RID: 0x2000 medium, 0x3000 high.
+        integrity: u32,
+        elevated: bool,
+        app_container: bool,
+    }
+
+    /// Reads one token information class into an aligned buffer.
+    ///
+    /// SAFETY: `token` must be an open token handle with TOKEN_QUERY access.
+    unsafe fn token_info(token: HANDLE, class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS) -> std::io::Result<Vec<u64>> {
+        use windows_sys::Win32::Security::GetTokenInformation;
+        let mut len = 0u32;
+        GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut len);
+        let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+        // Fixed-size classes (elevation, AppContainer) require exactly the length reported.
+        if GetTokenInformation(token, class, buf.as_mut_ptr().cast(), len, &mut len) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(buf)
+    }
+
+    fn identity(process: HANDLE) -> std::io::Result<Identity> {
         use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
         use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-        use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+        use windows_sys::Win32::Security::{GetSidSubAuthority, GetSidSubAuthorityCount, TokenElevation, TokenIntegrityLevel,
+            TokenIsAppContainer, TokenUser, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER};
         use windows_sys::Win32::System::Threading::OpenProcessToken;
-        // SAFETY: standard token query. Every pointer passed is valid for the call, the buffer is
-        // u64-aligned and sized by the first GetTokenInformation call, and each handle or
-        // allocation is released once.
+        // SAFETY: standard token queries. Buffers are u64-aligned and sized by the system, every
+        // pointer is valid for its call, and each handle or allocation is released once.
         unsafe {
             let mut token = std::ptr::null_mut();
             if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            let mut len = 0u32;
-            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
-            let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
-            let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
-            let error = std::io::Error::last_os_error();
+            let read = || -> std::io::Result<Identity> {
+                let user = token_info(token, TokenUser)?;
+                let sid = (*(user.as_ptr() as *const TOKEN_USER)).User.Sid;
+                let mut text = std::ptr::null_mut();
+                if ConvertSidToStringSidW(sid, &mut text) == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let n = (0..).take_while(|&i| *text.add(i) != 0).count();
+                let user = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
+                LocalFree(text.cast());
+                let label = token_info(token, TokenIntegrityLevel)?;
+                let label_sid = (*(label.as_ptr() as *const TOKEN_MANDATORY_LABEL)).Label.Sid;
+                let count = *GetSidSubAuthorityCount(label_sid) as u32;
+                let integrity = if count == 0 { 0 } else { *GetSidSubAuthority(label_sid, count - 1) };
+                let elevation = token_info(token, TokenElevation)?;
+                let elevated = (*(elevation.as_ptr() as *const TOKEN_ELEVATION)).TokenIsElevated != 0;
+                let container = token_info(token, TokenIsAppContainer)?;
+                let app_container = *(container.as_ptr() as *const u32) != 0;
+                Ok(Identity { user, integrity, elevated, app_container })
+            };
+            let result = read();
             CloseHandle(token);
-            if ok == 0 {
-                return Err(error);
-            }
-            let user = &*(buf.as_ptr() as *const TOKEN_USER);
-            let mut text = std::ptr::null_mut();
-            if ConvertSidToStringSidW(user.User.Sid, &mut text) == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let n = (0..).take_while(|&i| *text.add(i) != 0).count();
-            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
-            LocalFree(text.cast());
-            Ok(sid)
+            result
         }
     }
 
-    fn own_user() -> std::io::Result<String> {
+    fn own_identity() -> std::io::Result<Identity> {
         // SAFETY: the pseudo-handle of the current process needs no closing.
-        process_user(unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() })
+        identity(unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() })
     }
 
-    /// Whether the process serving this pipe runs as the same Windows user as this one. A
-    /// process of another user that took the pipe name fails here (or cannot even be opened).
+    /// Whether the process serving this pipe is trustworthy: the same Windows user as this one,
+    /// at least medium integrity and not sandboxed. Another user's process, or a low-integrity or
+    /// AppContainer process of this user, that took the pipe name fails here.
     fn served_by_same_user(pipe: &std::fs::File) -> bool {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
         use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        const MEDIUM: u32 = 0x2000;
         let mut pid = 0u32;
         // SAFETY: `pipe` is an open pipe handle; the process handle is closed once below.
         unsafe {
@@ -196,20 +228,27 @@ mod imp {
             if process.is_null() {
                 return false;
             }
-            let theirs = process_user(process);
+            let theirs = identity(process);
             CloseHandle(process);
-            matches!((theirs, own_user()), (Ok(a), Ok(b)) if a == b)
+            match (theirs, own_identity()) {
+                (Ok(server), Ok(me)) => server.user == me.user && server.integrity >= MEDIUM && !server.app_container,
+                _ => false,
+            }
         }
     }
 
-    /// Owned by and open to the signed-in user (named explicitly, so an elevated app still admits
-    /// the user's agents) and SYSTEM; protected from inherited ACEs.
+    /// Owned by and open to the signed-in user (named explicitly) and SYSTEM; protected from
+    /// inherited ACEs. When the app runs elevated, only elevated clients may connect.
     fn create(name: &str, first: bool) -> std::io::Result<NamedPipeServer> {
         use windows_sys::Win32::Foundation::LocalFree;
         use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
         use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-        let sid = own_user()?;
-        let sddl: Vec<u16> = format!("O:{sid}D:P(A;;GA;;;{sid})(A;;GA;;;SY)").encode_utf16().chain([0]).collect();
+        let me = own_identity()?;
+        let sid = &me.user;
+        // An elevated app only admits elevated clients: otherwise any ordinary process of the user
+        // could have it start sign-ins or installs with admin rights.
+        let label = if me.elevated { "S:(ML;;NWNR;;;HI)" } else { "" };
+        let sddl: Vec<u16> = format!("O:{sid}D:P(A;;GA;;;{sid})(A;;GA;;;SY){label}").encode_utf16().chain([0]).collect();
         let mut descriptor = std::ptr::null_mut();
         // SAFETY: `sddl` is NUL-terminated and outlives the call; the descriptor it allocates is
         // freed below after the pipe has copied it.
@@ -494,7 +533,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         // Every slot plus the waiting instance taken by clients that never send anything.
         let n = name.clone();
-        let idle = tokio::task::spawn_blocking(move || (0..5).map(|_| loop {
+        let idle = tokio::task::spawn_blocking(move || (0..17).map(|_| loop {
             match std::fs::OpenOptions::new().read(true).write(true).open(&n) {
                 Ok(pipe) => break pipe,
                 Err(_) => std::thread::sleep(Duration::from_millis(20)),

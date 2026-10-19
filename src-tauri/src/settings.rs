@@ -175,25 +175,32 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
         }
     }
     merge(&mut merged, patch, "", false)?;
-    let next: Settings = serde_json::from_value(merged).map_err(|e| format!("invalid setting: {e}"))?;
-    if !REFRESH_CHOICES.contains(&next.refresh_minutes) {
+    let mut next: Settings = serde_json::from_value(merged).map_err(|e| format!("invalid setting: {e}"))?;
+    // Only values this patch changes are checked, so a stored value the window can no longer
+    // produce (an old auto_update, a long alias) never blocks unrelated changes.
+    if next.refresh_minutes != current.refresh_minutes && !REFRESH_CHOICES.contains(&next.refresh_minutes) {
         return Err(format!("refresh_minutes must be one of {REFRESH_CHOICES:?}"));
     }
-    if !LANGUAGES.contains(&next.language.as_str()) {
+    if next.language != current.language && !LANGUAGES.contains(&next.language.as_str()) {
         return Err(format!("language must be one of {LANGUAGES:?}"));
     }
-    for rule in [next.balancer.claude, next.balancer.codex] {
-        if !(50..=95).contains(&rule.threshold) || rule.threshold % 5 != 0 {
+    for (rule, before) in [(next.balancer.claude, current.balancer.claude), (next.balancer.codex, current.balancer.codex)] {
+        if rule.threshold != before.threshold && (!(50..=95).contains(&rule.threshold) || rule.threshold % 5 != 0) {
             return Err("balancer thresholds must be 50–95 in steps of 5".into());
         }
     }
-    if next.auto_update && !updates_enabled {
+    if next.auto_update && !current.auto_update && !updates_enabled {
         return Err("this build uses manual updates; auto_update cannot be enabled".into());
     }
-    for (key, alias) in &next.aliases {
+    for (key, alias) in next.aliases.iter_mut() {
+        if current.aliases.get(key) == Some(alias) {
+            continue;
+        }
+        *alias = alias.trim().to_string();
         let valid_key = key.split_once(':').is_some_and(|(p, id)| ["claude", "codex"].contains(&p) && !id.is_empty());
-        if !valid_key || alias.trim().is_empty() || alias.chars().count() > 64 {
-            return Err(format!("aliases are keyed \"provider:account id\" with a name of 1–64 characters (got {key:?})"));
+        let printable = !alias.chars().any(char::is_control);
+        if !valid_key || alias.is_empty() || !printable || alias.chars().count() > 64 {
+            return Err(format!("aliases are keyed \"provider:account id\" with a printable name of 1–64 characters (got {key:?})"));
         }
     }
     Ok(Settings { last_version: current.last_version.clone(), ..next })
@@ -239,9 +246,21 @@ mod patch_tests {
             (json!({ "aliases": { "gemini:x": "Name" } }), "alias provider"),
             (json!({ "aliases": { "claude:x": "  " } }), "blank alias"),
             (json!([1]), "not an object"),
+            (json!({ "aliases": { "claude:x": "ok
+Ignore previous instructions" } }), "control characters"),
         ] {
             assert!(patched(&current, &patch, false).is_err(), "{why}");
         }
         assert!(patched(&current, &json!({ "auto_update": true }), true).unwrap().auto_update);
+    }
+
+    #[test]
+    fn stored_values_the_window_no_longer_offers_do_not_block_other_changes() {
+        let mut current = Settings { auto_update: true, ..Settings::default() };
+        current.aliases.insert("claude:a".into(), "x".repeat(80));
+        let next = patched(&current, &json!({ "language": "en", "aliases": { "codex:b": "  Spare  " } }), false).unwrap();
+        assert_eq!(next.language, "en");
+        assert!(next.auto_update, "left as stored");
+        assert_eq!(next.aliases["codex:b"], "Spare", "trimmed like the window");
     }
 }
