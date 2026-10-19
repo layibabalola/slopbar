@@ -87,9 +87,12 @@ command = 'C:\Users\<you>\AppData\Local\SlopBar\slopbar-mcp.exe'
 | `switch_account`, `remove_account` | Use or remove a saved account, as in Settings. |
 | `add_account`, `connect_monitoring`, `disconnect_monitoring` | Start the CLI's own sign-in for the user to complete, or revoke a monitoring sign-in. |
 | `check_for_updates`, `install_update`, `get_app_info`, `open_settings` | Updates (builds with automatic updates only), version and build, and showing the Settings window. |
+| `quit_app`, `restart_app` | Quit as the tray's Quit does, or quit and start the installed executable again. |
 | `export_diagnostics`, `list_diagnostic_exports` | Write a diagnostics export (a repeat within 30 seconds returns the same file) or list earlier ones; listing works while SlopBar is closed. |
 
 The server never starts SlopBar, reads credentials or contacts a provider itself: each tool asks the running app, which performs the same action as the matching Settings control. They talk over a named pipe that only the signed-in user and SYSTEM can open and that rejects remote clients. The server checks that the process answering runs as the same Windows user, connects so that process cannot act as the agent's, bounds every reply in size and time, and only passes on an export path inside the export folder. Sign-ins always happen in the CLI's own login, completed by the user. Usage results include account emails, so treat them like the Settings window. `slopbar-mcp.exe` is a separate executable so that app updates, which stop `slopbar.exe`, do not cut agents off mid-session.
+
+To install a local release build without quitting SlopBar by hand, run `scripts/install-local-build.ps1` after `cargo build --locked --release --features tauri/custom-protocol --manifest-path src-tauri/Cargo.toml`. It checks the build matches the clean checkout, moves the running executables into a rollback folder under `%LOCALAPPDATA%\SlopBar-Rollback`, copies the new ones in and restarts SlopBar through `restart_app`.
 
 ## Build
 

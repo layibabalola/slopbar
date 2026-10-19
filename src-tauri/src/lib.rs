@@ -11,6 +11,7 @@ mod private_store;
 mod diagnostics;
 pub use diagnostics::write_build_info;
 mod door;
+pub use door::wait_for_exit;
 mod mcp;
 pub use mcp::serve_stdio as serve_mcp;
 #[cfg(feature = "desktop")]

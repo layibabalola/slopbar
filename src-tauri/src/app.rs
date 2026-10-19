@@ -75,7 +75,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
     fn value(x: impl Serialize) -> Result<serde_json::Value, String> {
         serde_json::to_value(x).map_err(|e| e.to_string())
     }
-    match request {
+    match request.clone() {
         R::ExportDiagnostics => Ok(serde_json::json!({ "path": write_export(&app).await? })),
         R::GetUsage => value(app.state::<AppState>().snapshot.lock().unwrap().clone()),
         R::Refresh => value(do_refresh(&app).await),
@@ -139,6 +139,23 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::OpenSettings => {
             show_settings(&app);
             Ok(serde_json::json!({ "opened": true }))
+        }
+        R::QuitApp | R::RestartApp => {
+            let restart = matches!(request, R::RestartApp);
+            if restart {
+                // The installed executable, even if this one was renamed aside for an update.
+                let exe = std::env::current_exe().map_err(|e| e.to_string())?
+                    .with_file_name(if cfg!(windows) { "slopbar.exe" } else { "slopbar" });
+                std::process::Command::new(&exe).arg("--after").arg(std::process::id().to_string())
+                    .spawn().map_err(|e| format!("restart failed: {e}"))?;
+            }
+            // Reply first, then exit exactly as the tray's Quit does (journal flushed on Exit).
+            let h = app.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                h.exit(0);
+            });
+            Ok(serde_json::json!({ "quitting": true, "restarting": restart }))
         }
     }
 }

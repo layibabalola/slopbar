@@ -46,6 +46,10 @@ pub enum Request {
     InstallUpdate,
     GetAppInfo,
     OpenSettings,
+    /// Quit as the tray's Quit does.
+    QuitApp,
+    /// Quit, then start the installed executable again (picking up a new build).
+    RestartApp,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -386,6 +390,28 @@ mod imp {
         };
         serde_json::from_slice(&answer).map_err(|_| "bad_door_reply".into())
     }
+}
+
+/// Waits (up to `limit`) for process `pid` to exit; used by a restarted app so the single-instance
+/// check never sees the old one still running.
+#[cfg(windows)]
+pub fn wait_for_exit(pid: u32, limit: Duration) {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    // SAFETY: the handle, if any, is waited on and closed once.
+    unsafe {
+        let process = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if process.is_null() {
+            return; // Already gone.
+        }
+        let _ = WaitForSingleObject(process, limit.as_millis().min(u32::MAX as u128) as u32) == WAIT_OBJECT_0;
+        CloseHandle(process);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn wait_for_exit(_pid: u32, limit: Duration) {
+    std::thread::sleep(limit.min(Duration::from_secs(2)));
 }
 
 #[cfg(windows)]
