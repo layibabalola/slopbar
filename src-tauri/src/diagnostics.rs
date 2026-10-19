@@ -814,6 +814,11 @@ impl Build {
         }
     }
 }
+/// The executable's own build metadata (as `--build-info-to` writes it).
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+pub fn build_info() -> serde_json::Value {
+    serde_json::to_value(Build::current()).unwrap_or_default()
+}
 pub fn write_build_info(path: &std::path::Path) -> std::io::Result<()> {
     let bytes = serde_json::to_vec_pretty(&Build::current()).map_err(std::io::Error::other)?;
     std::fs::write(path, bytes)

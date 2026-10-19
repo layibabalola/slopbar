@@ -65,9 +65,9 @@ The journal retains at most **7 days or 10,000 events**, whichever limit is reac
 
 For automated build verification, `slopbar.exe --build-info-to <path>` writes the executable's own commit, tree, dirty-checkout flag, and Tauri/updater configuration without launching the GUI or reading credentials. CI packaging checks this output against the checkout before producing the ZIP.
 
-### Exporting diagnostics from an agent (MCP)
+### Agent access (MCP)
 
-`slopbar-mcp.exe`, built next to `slopbar.exe`, is a stdio [MCP](https://modelcontextprotocol.io) server that lets coding agents export diagnostics without driving the UI. Register it with your agent, for example:
+`slopbar-mcp.exe`, built next to `slopbar.exe`, is a stdio [MCP](https://modelcontextprotocol.io) server that gives coding agents what the Settings window offers, without driving the UI. Register it with your agent, for example:
 
 ```
 claude mcp add --scope user slopbar -- "%LOCALAPPDATA%\SlopBar\slopbar-mcp.exe"
@@ -80,7 +80,16 @@ or in Codex's `~/.codex/config.toml`:
 command = 'C:\Users\<you>\AppData\Local\SlopBar\slopbar-mcp.exe'
 ```
 
-It has two tools. `export_diagnostics` asks the running SlopBar to write the same report as the Settings button (without opening a folder) and returns its path; a repeat request within 30 seconds returns that export instead of writing another. `list_diagnostic_exports` lists earlier exports and works while SlopBar is closed. The server never starts SlopBar, reads credentials or contacts a provider. It reaches the app through a named pipe that only the signed-in user and SYSTEM can open, which rejects remote clients and accepts only the export request. The app cannot act as the agent's process through it, and the agent only ever receives the path of an export file in the export folder. It is a separate executable so that app updates, which stop `slopbar.exe`, do not cut agents off mid-session.
+| Tool | Does |
+| --- | --- |
+| `get_usage`, `refresh_usage` | Every account's usage windows, resets, monitoring state and errors (as last refreshed, or polled now). |
+| `get_settings`, `update_settings` | Read settings, or change them with a JSON merge patch. Only values the Settings window offers are accepted; unknown fields are refused. |
+| `switch_account`, `remove_account` | Use or remove a saved account, as in Settings. |
+| `add_account`, `connect_monitoring`, `disconnect_monitoring` | Start the CLI's own sign-in for the user to complete, or revoke a monitoring sign-in. |
+| `check_for_updates`, `install_update`, `get_app_info`, `open_settings` | Updates (builds with automatic updates only), version and build, and showing the Settings window. |
+| `export_diagnostics`, `list_diagnostic_exports` | Write a diagnostics export (a repeat within 30 seconds returns the same file) or list earlier ones; listing works while SlopBar is closed. |
+
+The server never starts SlopBar, reads credentials or contacts a provider itself: each tool asks the running app, which performs the same action as the matching Settings control. They talk over a named pipe that only the signed-in user and SYSTEM can open and that rejects remote clients. The server checks that the process answering runs as the same Windows user, connects so that process cannot act as the agent's, bounds every reply in size and time, and only passes on an export path inside the export folder. Sign-ins always happen in the CLI's own login, completed by the user. Usage results include account emails, so treat them like the Settings window. `slopbar-mcp.exe` is a separate executable so that app updates, which stop `slopbar.exe`, do not cut agents off mid-session.
 
 ## Build
 

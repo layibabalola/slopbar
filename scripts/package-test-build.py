@@ -65,7 +65,7 @@ Build and checks: {ci or 'see BUILD-MANIFEST.json'}
    Reports show the actual retained period. Keep the exported report private
    until you choose to share it. Prior independent monitoring logins are reused.
 
-slopbar-mcp.exe is an optional MCP server so agents can export diagnostics
+slopbar-mcp.exe is an optional MCP server so agents can use SlopBar's settings
 (see source/README.md). It only talks to the running SlopBar on this machine.
 
 This build uses manual updates. Install a newer reviewed build to get fixes.

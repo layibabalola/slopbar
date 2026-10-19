@@ -66,6 +66,52 @@ async fn export_diagnostics(app: AppHandle) -> Result<String, String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// One operation for an agent, through the door (see `door` and `mcp`). Each runs the same code as
+/// the matching Settings action, so the windows and journal see it the same way.
+async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json::Value, String> {
+    use door::Request as R;
+    fn value(x: impl Serialize) -> Result<serde_json::Value, String> {
+        serde_json::to_value(x).map_err(|e| e.to_string())
+    }
+    match request {
+        R::ExportDiagnostics => Ok(serde_json::json!({ "path": write_export(&app).await? })),
+        R::GetUsage => value(app.state::<AppState>().snapshot.lock().unwrap().clone()),
+        R::Refresh => value(do_refresh(&app).await),
+        R::GetSettings => value(app.state::<AppState>().settings.lock().unwrap().clone()),
+        R::UpdateSettings { patch } => {
+            let current = app.state::<AppState>().settings.lock().unwrap().clone();
+            let next = settings::patched(&current, &patch, updates_enabled())?;
+            save_settings(app.clone(), next.clone()).await?;
+            value(next)
+        }
+        R::SwitchAccount { provider, id } => value(switch_account(app.clone(), provider, id).await?),
+        R::AddAccount { provider } => {
+            add_account(app.clone(), provider).await?;
+            Ok(serde_json::json!({ "started": true, "next": "The user completes the sign-in in the terminal that opened; the account then appears in get_usage." }))
+        }
+        R::ConnectMonitoring { provider, id } => {
+            connect_monitoring(app.clone(), provider, id).await?;
+            Ok(serde_json::json!({ "started": true, "next": "The user completes the monitoring sign-in that opened; get_usage then shows monitor_connected." }))
+        }
+        R::DisconnectMonitoring { provider, id } => value(disconnect_monitoring(app.clone(), provider, id).await?),
+        R::RemoveAccount { provider, id } => value(remove_account(app.clone(), provider, id).await?),
+        R::CheckForUpdates => value(check_for_updates(app.clone()).await?),
+        R::InstallUpdate => {
+            install_update(app.clone()).await?;
+            Ok(serde_json::json!({ "installing": true }))
+        }
+        R::GetAppInfo => Ok(serde_json::json!({
+            "version": app_version(app.clone()),
+            "updates_enabled": updates_enabled(),
+            "build": diagnostics::build_info(),
+        })),
+        R::OpenSettings => {
+            show_settings(&app);
+            Ok(serde_json::json!({ "opened": true }))
+        }
+    }
+}
+
 #[tauri::command]
 fn record_frontend_error(state: tauri::State<AppState>, surface: diagnostics::Surface, kind: diagnostics::FrontendKind, line: Option<u32>, column: Option<u32>) {
     state.diagnostics.record(None, None, diagnostics::Event::Frontend { surface, kind, line, column });
@@ -603,13 +649,12 @@ pub fn run() {
             std::thread::spawn(move || dock::keep_docked(h));
             tauri::async_runtime::spawn(refresh_loop(handle.clone()));
             tauri::async_runtime::spawn(updates::run_loop(handle.clone()));
-            // Agents export diagnostics through `slopbar-mcp`, which knocks here; no window opens.
+            // Agents use Settings' operations through `slopbar-mcp`, which knocks here.
             #[cfg(windows)]
             {
                 let h = handle.clone();
                 tauri::async_runtime::spawn(async move {
-                    let export = move || { let h = h.clone(); async move { write_export(&h).await } };
-                    door::serve(door::pipe_name(), export).await;
+                    door::serve(door::pipe_name(), move |request| door_call(h.clone(), request)).await;
                 });
             }
             Ok(())
