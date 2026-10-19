@@ -17,6 +17,7 @@ def require_clean_checkout():
 
 require_clean_checkout()
 exe = root / "src-tauri/target/release/slopbar.exe"
+mcp = exe.with_name("slopbar-mcp.exe")
 head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
 base = "60a7c8e0835b4cd320dba3e0b1352d7a8161c9e1"
 repository = os.environ.get("GITHUB_REPOSITORY", "layibabalola/slopbar")
@@ -35,6 +36,7 @@ manifest = {
     "source_tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=root, text=True).strip(),
     "base": base,
     "executable_sha256": hashlib.sha256(exe.read_bytes()).hexdigest(),
+    "mcp_executable_sha256": hashlib.sha256(mcp.read_bytes()).hexdigest(),
     "target": "x86_64-pc-windows-msvc",
     "signed": False,
     "upstream_updates": False,
@@ -63,6 +65,9 @@ Build and checks: {ci or 'see BUILD-MANIFEST.json'}
    Reports show the actual retained period. Keep the exported report private
    until you choose to share it. Prior independent monitoring logins are reused.
 
+slopbar-mcp.exe is an optional MCP server so agents can export diagnostics
+(see source/README.md). It only talks to the running SlopBar on this machine.
+
 This build uses manual updates. Install a newer reviewed build to get fixes.
 It uses Tauri's release custom-protocol configuration with embedded assets.
 It reads your existing settings/accounts from the usual SlopBar data folder.
@@ -80,6 +85,7 @@ require_clean_checkout()
 output = root / "SlopBar-Independent-Monitoring.zip"
 with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as bundle:
     bundle.write(exe, "slopbar.exe")
+    bundle.write(mcp, "slopbar-mcp.exe")
     loader = exe.with_name("WebView2Loader.dll")
     if loader.exists():
         bundle.write(loader, loader.name)

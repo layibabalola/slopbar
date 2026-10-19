@@ -65,6 +65,23 @@ The journal retains at most **7 days or 10,000 events**, whichever limit is reac
 
 For automated build verification, `slopbar.exe --build-info-to <path>` writes the executable's own commit, tree, dirty-checkout flag, and Tauri/updater configuration without launching the GUI or reading credentials. CI packaging checks this output against the checkout before producing the ZIP.
 
+### Exporting diagnostics from an agent (MCP)
+
+`slopbar-mcp.exe`, built next to `slopbar.exe`, is a stdio [MCP](https://modelcontextprotocol.io) server that lets coding agents export diagnostics without driving the UI. Register it with your agent, for example:
+
+```
+claude mcp add --scope user slopbar -- "%LOCALAPPDATA%\SlopBar\slopbar-mcp.exe"
+```
+
+or in Codex's `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.slopbar]
+command = 'C:\Users\<you>\AppData\Local\SlopBar\slopbar-mcp.exe'
+```
+
+It has two tools. `export_diagnostics` asks the running SlopBar to write the same report as the Settings button (without opening a folder) and returns its path; a repeat request within 30 seconds returns that export instead of writing another. `list_diagnostic_exports` lists earlier exports and works while SlopBar is closed. The server never starts SlopBar, reads credentials or contacts a provider. It reaches the app through a named pipe that only the signed-in user and SYSTEM can open, which rejects remote clients and accepts only the export request. The app cannot act as the agent's process through it, and the agent only ever receives the path of an export file in the export folder. It is a separate executable so that app updates, which stop `slopbar.exe`, do not cut agents off mid-session.
+
 ## Build
 
 On Windows, with Rust and the usual Tauri prerequisites installed:

@@ -7,10 +7,5 @@ fn main() {
         let status = slopbar_lib::write_build_info(std::path::Path::new(&args[2]));
         std::process::exit(if status.is_ok() { 0 } else { 1 });
     }
-    if args.len() == 2 && args[1] == "--mcp" {
-        // Agents' stdio MCP server. No Tauri, credentials or provider requests: exports go
-        // through the running app's local door.
-        std::process::exit(if slopbar_lib::serve_mcp().is_ok() { 0 } else { 1 });
-    }
     slopbar_lib::run()
 }

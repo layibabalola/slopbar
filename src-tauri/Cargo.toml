@@ -2,6 +2,7 @@
 name = "slopbar"
 version = "0.1.0"
 edition = "2021"
+default-run = "slopbar"
 license = "GPL-3.0-only"
 repository = "https://github.com/thelioo/slopbar"
 
@@ -19,6 +20,11 @@ upstream-updates = ["desktop"]
 name = "slopbar"
 path = "src/main.rs"
 required-features = ["desktop"]
+
+# Agents' stdio MCP server. Separate so app updates never stop an agent's server mid-session.
+[[bin]]
+name = "slopbar-mcp"
+path = "src/bin/slopbar-mcp.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }

@@ -1,4 +1,4 @@
-//! `slopbar --mcp`: a stdio MCP server for agents. It never starts the app, reads credentials or
+//! `slopbar-mcp`: a stdio MCP server for agents. It never starts the app, reads credentials or
 //! contacts a provider. Exports go through the running app's door (see `door`); listing reads only
 //! file names, sizes and times in the export folder.
 
@@ -34,17 +34,9 @@ fn tools() -> Value {
     ])
 }
 
-fn exports_dir() -> Option<std::path::PathBuf> {
-    crate::settings::app_dir().map(|d| d.join("diagnostics").join("exports"))
-}
-
 fn export(pipe: &str) -> Result<Value, String> {
-    let reply = crate::door::request(pipe, &crate::door::Request::ExportDiagnostics)?;
-    match (reply.error, reply.path) {
-        (Some(error), _) => Err(error),
-        (None, Some(path)) => Ok(json!({ "path": path, "bytes": reply.bytes })),
-        (None, None) => Err("bad_door_reply".into()),
-    }
+    let reply = crate::door::export(pipe)?;
+    Ok(json!({ "path": reply.path, "bytes": reply.bytes, "reused_recent_export": reply.reused }))
 }
 
 fn list(dir: Option<std::path::PathBuf>) -> Result<Value, String> {
@@ -77,15 +69,23 @@ fn explain(error: &str) -> String {
         "not_running" => "SlopBar is not running, or the running copy predates this agent door. Start (or restart) SlopBar, then try again; this tool never starts it.".into(),
         "diagnostic_storage" => "SlopBar could not write the export (disk or file access problem).".into(),
         "unsupported_platform" => "Exporting through this tool is only supported on Windows.".into(),
-        "unsupported_request" | "bad_door_reply" => "The running SlopBar is a different version that does not understand this request. Restart SlopBar after updating.".into(),
-        other => format!("SlopBar export failed: {other}"),
+        "unsupported_request" => "The running SlopBar is a different version that does not understand this request. Restart SlopBar after updating.".into(),
+        "timeout" => "SlopBar did not finish the export in time. Try again shortly.".into(),
+        "no_config_directory" => "The SlopBar data folder could not be located.".into(),
+        "export_folder_unreadable" => "The diagnostics export folder could not be read.".into(),
+        // Includes replies that failed vetting: never relay text from the pipe to the agent.
+        _ => "SlopBar's diagnostics door gave an unusable answer. Restart SlopBar and try again.".into(),
     }
 }
 
 /// Answers one JSON-RPC message; `None` for notifications.
 fn handle(message: &Value, pipe: &str, exports: &dyn Fn() -> Option<std::path::PathBuf>) -> Option<Value> {
-    let id = message.get("id").cloned()?;
-    let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+    // Notifications, client responses (no method) and null ids get no reply.
+    let id = message.get("id").filter(|id| id.is_string() || id.is_number()).cloned()?;
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        if message.get("result").is_some() || message.get("error").is_some() { return None; }
+        return Some(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32600, "message": "Invalid Request" } }));
+    };
     let result = match method {
         "initialize" => {
             let asked = message.pointer("/params/protocolVersion").and_then(Value::as_str);
@@ -125,19 +125,24 @@ fn handle(message: &Value, pipe: &str, exports: &dyn Fn() -> Option<std::path::P
 /// Serves MCP over stdin/stdout (newline-delimited JSON-RPC) until stdin closes.
 pub fn serve_stdio() -> std::io::Result<()> {
     let pipe = crate::door::pipe_name();
-    let stdin = std::io::stdin();
+    let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if stdin.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(Value::Array(batch)) => {
-                let replies: Vec<Value> = batch.iter().filter_map(|m| handle(m, &pipe, &exports_dir)).collect();
+        let reply = match serde_json::from_slice::<Value>(&line) {
+            Ok(Value::Array(batch)) if !batch.is_empty() => {
+                let replies: Vec<Value> = batch.iter().filter_map(|m| handle(m, &pipe, &crate::door::exports_dir)).collect();
                 (!replies.is_empty()).then(|| Value::Array(replies))
             }
-            Ok(message) => handle(&message, &pipe, &exports_dir),
+            Ok(message @ Value::Object(_)) => handle(&message, &pipe, &crate::door::exports_dir),
+            Ok(_) => Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32600, "message": "Invalid Request" } })),
             Err(_) => Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "Parse error" } })),
         };
         if let Some(reply) = reply {
@@ -146,7 +151,6 @@ pub fn serve_stdio() -> std::io::Result<()> {
             stdout.flush()?;
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -175,6 +179,10 @@ mod tests {
         assert_eq!(missing["error"]["code"], -32601);
         let tool = call(json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": { "name": "switch_account" } }), None).unwrap();
         assert_eq!(tool["error"]["code"], -32602);
+        assert!(call(json!({ "jsonrpc": "2.0", "id": 6, "result": {} }), None).is_none(), "client responses get no reply");
+        assert!(call(json!({ "jsonrpc": "2.0", "id": null, "method": "ping" }), None).is_none(), "null ids get no reply");
+        let no_method = call(json!({ "jsonrpc": "2.0", "id": 7 }), None).unwrap();
+        assert_eq!(no_method["error"]["code"], -32600);
     }
 
     #[test]

@@ -603,15 +603,13 @@ pub fn run() {
             std::thread::spawn(move || dock::keep_docked(h));
             tauri::async_runtime::spawn(refresh_loop(handle.clone()));
             tauri::async_runtime::spawn(updates::run_loop(handle.clone()));
-            // Agents export diagnostics through `slopbar --mcp`, which knocks here; no window opens.
+            // Agents export diagnostics through `slopbar-mcp`, which knocks here; no window opens.
             #[cfg(windows)]
             {
                 let h = handle.clone();
                 tauri::async_runtime::spawn(async move {
                     let export = move || { let h = h.clone(); async move { write_export(&h).await } };
-                    if let Err(e) = door::serve(door::pipe_name(), export).await {
-                        eprintln!("diagnostics door closed: {e}");
-                    }
+                    door::serve(door::pipe_name(), export).await;
                 });
             }
             Ok(())
