@@ -37,9 +37,10 @@ function hue(id) {
 }
 function accountRow(p, a) {
   const key = `${p}:${a.id}`;
-  // Prefer overall weekly usage in Settings; retain all windows in the tooltip/flyout.
-  const top = a.windows.find(w => w.kind === "weekly")
-    ?? a.windows.reduce((m, w) => (w.used_percent > (m?.used_percent ?? -1) ? w : m), null);
+  // The fullest window is the limit that binds next (and what the balancer compares), so it is
+  // the headline; on a tie prefer the overall weekly window, whose reset lies further out.
+  const top = a.windows.reduce((m, w) => (!m || w.used_percent > m.used_percent
+    || (w.used_percent === m.used_percent && w.kind === "weekly") ? w : m), null);
   const usage = top?.used_percent ?? null;
   const timedWindows = visibleResetWindows(a.windows);
   const meter = usage == null
@@ -49,7 +50,7 @@ function accountRow(p, a) {
   // A zero-usage session can lack a reset while its weekly window has one.
   // Never hide that weekly timestamp behind the headline's tie-breaking.
   const windowResets = timedWindows.length
-    ? `<div class="window-resets">${timedWindows.map(w => `<small class="window-reset" title="${esc(w.resets_at)}">${esc(windowLabel(w))}: ${esc(windowResetText(w, a.stale))}</small>`).join("")}</div>`
+    ? `<div class="window-resets">${timedWindows.map(w => `<small class="window-reset" title="${esc(w.resets_at)}">${esc(windowLabel(w))}: ${Math.round(w.used_percent)}% ${t("used")} · ${esc(windowResetText(w, a.stale))}</small>`).join("")}</div>`
     : "";
   const held = a.resets ?? [];
   const total = held.reduce((n, r) => n + r.count, 0);
