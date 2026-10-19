@@ -39,14 +39,29 @@ if ($info.commit -ne $head -or $info.source_tree -ne $tree -or $info.dirty -or $
   throw "Built executable does not match a clean build of $head; rebuild first."
 }
 
-# Talks to the running app through slopbar-mcp.exe; returns the tool result, or $null if unreachable.
+# Runs slopbar-mcp.exe with these JSON-RPC lines on stdin and returns its output lines. (PowerShell's
+# `&` does not capture a windowless executable's output, so this uses Process directly.)
+function Invoke-Mcp([string]$mcp, [string[]]$lines) {
+  $info = [Diagnostics.ProcessStartInfo]::new($mcp)
+  $info.UseShellExecute = $false
+  $info.RedirectStandardInput = $true
+  $info.RedirectStandardOutput = $true
+  $info.CreateNoWindow = $true
+  $process = [Diagnostics.Process]::Start($info)
+  foreach ($line in $lines) { $process.StandardInput.WriteLine($line) }
+  $process.StandardInput.Close()
+  $output = $process.StandardOutput.ReadToEnd()
+  if (-not $process.WaitForExit(90000)) { $process.Kill(); throw 'slopbar-mcp did not finish.' }
+  return $output -split "`r?`n" | Where-Object { $_ }
+}
+
+# Calls one door tool through slopbar-mcp.exe; returns the tool result, or $null if unreachable.
 function Invoke-Door([string]$mcp, [string]$tool) {
-  $lines = @(
+  $out = Invoke-Mcp $mcp @(
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"install-local-build","version":"1"}}}',
     '{"jsonrpc":"2.0","method":"notifications/initialized"}',
     ('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"' + $tool + '","arguments":{}}}')
   )
-  $out = $lines | & $mcp
   foreach ($line in $out) {
     $m = $line | ConvertFrom-Json
     if ($m.id -eq 2) { return $m.result }
@@ -54,16 +69,13 @@ function Invoke-Door([string]$mcp, [string]$tool) {
   return $null
 }
 
+# The text of a failed tool result, for error messages.
+function Get-DoorError($result) {
+  if ($result -and $result.content) { return $result.content[0].text }
+  return 'SlopBar did not answer'
+}
+
 $running = Get-Process -Name slopbar -ErrorAction SilentlyContinue | Where-Object { $_.Path -and (Split-Path $_.Path) -ieq $InstallDir }
-$oldMcp = Join-Path $InstallDir 'slopbar-mcp.exe'
-$canRestart = $false
-if ($running -and (Test-Path -LiteralPath $oldMcp)) {
-  $tools = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | & $oldMcp
-  $canRestart = [bool]($tools | Select-String -SimpleMatch '"restart_app"')
-}
-if ($running -and -not $canRestart -and -not $StopAfterRefresh) {
-  throw 'The running SlopBar cannot restart itself (older build). Re-run with -StopAfterRefresh.'
-}
 
 # 2. Swap executables; the running ones move aside intact.
 $backup = Join-Path $RollbackRoot (Get-Date -Format 'yyyyMMdd-HHmmss')
@@ -79,15 +91,17 @@ $newMcp = Join-Path $InstallDir 'slopbar-mcp.exe'
 # 3. Restart into the new build.
 if (-not $running) {
   Start-Process -FilePath (Join-Path $InstallDir 'slopbar.exe') -WindowStyle Hidden
-} elseif ($canRestart) {
-  $r = Invoke-Door $newMcp 'restart_app'
-  if (-not $r -or $r.isError) { throw "restart_app failed: $($r.content[0].text). Executables are swapped; restart SlopBar to use them." }
 } else {
-  $r = Invoke-Door $newMcp 'refresh_usage'
-  if (-not $r -or $r.isError) { throw "refresh_usage failed: $($r.content[0].text). Executables are swapped; nothing was stopped." }
-  $running | Stop-Process -Force
-  $running | Wait-Process -Timeout 30
-  Start-Process -FilePath (Join-Path $InstallDir 'slopbar.exe') -WindowStyle Hidden
+  $r = Invoke-Door $newMcp 'restart_app'
+  if (-not $r -or $r.isError) {
+    # A running build older than restart_app does not understand it.
+    if (-not $StopAfterRefresh) { throw "restart_app failed: $(Get-DoorError $r). Executables are swapped; re-run with -StopAfterRefresh if the running build predates restart_app." }
+    $r = Invoke-Door $newMcp 'refresh_usage'
+    if (-not $r -or $r.isError) { throw "refresh_usage failed: $(Get-DoorError $r). Executables are swapped; nothing was stopped." }
+    $running | Stop-Process -Force
+    $running | Wait-Process -Timeout 30
+    Start-Process -FilePath (Join-Path $InstallDir 'slopbar.exe') -WindowStyle Hidden
+  }
 }
 
 # Confirm the new build answers on the door.
