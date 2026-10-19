@@ -1,4 +1,4 @@
-use crate::{accounts, balancer, diagnostics, dock, migrate, model, monitoring, notify, panel, providers, settings, sources, updates};
+use crate::{accounts, balancer, diagnostics, dock, door, migrate, model, monitoring, notify, panel, providers, settings, sources, updates};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -44,14 +44,19 @@ fn get_usage(state: tauri::State<AppState>) -> Snapshot {
     state.snapshot.lock().unwrap().clone()
 }
 
-#[tauri::command]
-async fn export_diagnostics(app: AppHandle) -> Result<String, String> {
+/// Writes a diagnostics export; shared by Settings and the agents' door.
+async fn write_export(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     let state = app.state::<AppState>();
     let recorder = state.diagnostics.clone();
     let snapshot = state.snapshot.lock().unwrap().clone();
     let settings = state.settings.lock().unwrap().clone();
-    let path = tauri::async_runtime::spawn_blocking(move || recorder.export(&snapshot, &settings))
-        .await.map_err(|_| "diagnostic_storage")?.map_err(String::from)?;
+    tauri::async_runtime::spawn_blocking(move || recorder.export(&snapshot, &settings))
+        .await.map_err(|_| "diagnostic_storage")?.map_err(String::from)
+}
+
+#[tauri::command]
+async fn export_diagnostics(app: AppHandle) -> Result<String, String> {
+    let path = write_export(&app).await?;
     #[cfg(windows)]
     if let Some(parent) = path.parent() {
         let folder = parent.to_owned();
@@ -598,6 +603,17 @@ pub fn run() {
             std::thread::spawn(move || dock::keep_docked(h));
             tauri::async_runtime::spawn(refresh_loop(handle.clone()));
             tauri::async_runtime::spawn(updates::run_loop(handle.clone()));
+            // Agents export diagnostics through `slopbar --mcp`, which knocks here; no window opens.
+            #[cfg(windows)]
+            {
+                let h = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let export = move || { let h = h.clone(); async move { write_export(&h).await } };
+                    if let Err(e) = door::serve(door::pipe_name(), export).await {
+                        eprintln!("diagnostics door closed: {e}");
+                    }
+                });
+            }
             Ok(())
         })
         .build(tauri::generate_context!())
