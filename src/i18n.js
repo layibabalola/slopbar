@@ -31,6 +31,7 @@ const MESSAGES = {
     searching: "Looking for accounts…", refresh: "Refresh",
     session: "Session (5h)", weekly: "Weekly", weekly_opus: "Weekly · Opus", weekly_sonnet: "Weekly · Sonnet", limit: "Limit",
     resetsIn: "Resets in {t}", resetsNow: "Resets now", credits: "Credits: {v}", unlimited: "Unlimited",
+    windowNotStarted: "Not started · begins on first use",
     resetTimeUnavailable: "Reset time unavailable", lastResetAt: "Last known reset: {d}", resetAwaitingRefresh: "Reset time passed · awaiting refresh ({d})",
     token_expired: "Token expired — open {provider} to renew it",
     token_invalid: "Invalid token — open {provider} to sign in again",
@@ -78,6 +79,7 @@ const MESSAGES = {
     searching: "Procurando contas…", refresh: "Atualizar",
     session: "Sessão (5h)", weekly: "Semana", weekly_opus: "Semana · Opus", weekly_sonnet: "Semana · Sonnet", limit: "Limite",
     resetsIn: "Reinicia em {t}", resetsNow: "Reinicia agora", credits: "Créditos: {v}", unlimited: "Ilimitado",
+    windowNotStarted: "Não iniciado · começa no primeiro uso",
     resetTimeUnavailable: "Horário de reinício indisponível", lastResetAt: "Último reinício conhecido: {d}", resetAwaitingRefresh: "Horário de reinício passou · aguardando atualização ({d})",
     token_expired: "Token expirado — abra o {provider} para renovar",
     token_invalid: "Token inválido — abra o {provider} para entrar de novo",
@@ -125,6 +127,7 @@ const MESSAGES = {
     searching: "Buscando cuentas…", refresh: "Actualizar",
     session: "Sesión (5 h)", weekly: "Semana", weekly_opus: "Semana · Opus", weekly_sonnet: "Semana · Sonnet", limit: "Límite",
     resetsIn: "Se reinicia en {t}", resetsNow: "Se reinicia ahora", credits: "Créditos: {v}", unlimited: "Ilimitado",
+    windowNotStarted: "Sin iniciar · empieza con el primer uso",
     resetTimeUnavailable: "Hora de reinicio no disponible", lastResetAt: "Último reinicio conocido: {d}", resetAwaitingRefresh: "La hora de reinicio pasó · esperando actualización ({d})",
     token_expired: "Token caducado: abre {provider} para renovarlo",
     token_invalid: "Token no válido: abre {provider} para volver a iniciar sesión",
@@ -172,6 +175,7 @@ const MESSAGES = {
     searching: "Recherche des comptes…", refresh: "Actualiser",
     session: "Session (5 h)", weekly: "Semaine", weekly_opus: "Semaine · Opus", weekly_sonnet: "Semaine · Sonnet", limit: "Limite",
     resetsIn: "Réinitialisation dans {t}", resetsNow: "Réinitialisation imminente", credits: "Crédits : {v}", unlimited: "Illimité",
+    windowNotStarted: "Pas commencé · démarre à la première utilisation",
     resetTimeUnavailable: "Heure de réinitialisation indisponible", lastResetAt: "Dernière réinitialisation connue : {d}", resetAwaitingRefresh: "Heure de réinitialisation passée · en attente d’actualisation ({d})",
     token_expired: "Jeton expiré — ouvrez {provider} pour le renouveler",
     token_invalid: "Jeton invalide — ouvrez {provider} pour vous reconnecter",
@@ -219,6 +223,7 @@ const MESSAGES = {
     searching: "Konten werden gesucht…", refresh: "Aktualisieren",
     session: "Sitzung (5 Std.)", weekly: "Woche", weekly_opus: "Woche · Opus", weekly_sonnet: "Woche · Sonnet", limit: "Limit",
     resetsIn: "Zurückgesetzt in {t}", resetsNow: "Wird jetzt zurückgesetzt", credits: "Guthaben: {v}", unlimited: "Unbegrenzt",
+    windowNotStarted: "Nicht gestartet · beginnt bei der ersten Nutzung",
     resetTimeUnavailable: "Rücksetzzeit nicht verfügbar", lastResetAt: "Letzte bekannte Rücksetzzeit: {d}", resetAwaitingRefresh: "Rücksetzzeit verstrichen · Aktualisierung ausstehend ({d})",
     token_expired: "Token abgelaufen – öffne {provider}, um es zu erneuern",
     token_invalid: "Token ungültig – öffne {provider}, um dich neu anzumelden",
@@ -266,6 +271,7 @@ const MESSAGES = {
     searching: "Ricerca account…", refresh: "Aggiorna",
     session: "Sessione (5 h)", weekly: "Settimana", weekly_opus: "Settimana · Opus", weekly_sonnet: "Settimana · Sonnet", limit: "Limite",
     resetsIn: "Si azzera tra {t}", resetsNow: "Si azzera ora", credits: "Crediti: {v}", unlimited: "Illimitati",
+    windowNotStarted: "Non iniziato · inizia al primo utilizzo",
     resetTimeUnavailable: "Orario di azzeramento non disponibile", lastResetAt: "Ultimo azzeramento noto: {d}", resetAwaitingRefresh: "Orario di azzeramento trascorso · in attesa di aggiornamento ({d})",
     token_expired: "Token scaduto: apri {provider} per rinnovarlo",
     token_invalid: "Token non valido: apri {provider} per accedere di nuovo",
@@ -313,6 +319,7 @@ const MESSAGES = {
     searching: "アカウントを検索中…", refresh: "更新",
     session: "セッション（5時間）", weekly: "週間", weekly_opus: "週間 · Opus", weekly_sonnet: "週間 · Sonnet", limit: "上限",
     resetsIn: "{t}後にリセット", resetsNow: "まもなくリセット", credits: "クレジット: {v}", unlimited: "無制限",
+    windowNotStarted: "未開始 · 初回使用時に開始",
     resetTimeUnavailable: "リセット時刻は不明です", lastResetAt: "最後に確認したリセット時刻: {d}", resetAwaitingRefresh: "リセット予定時刻を過ぎています · 更新待ち ({d})",
     token_expired: "トークンの期限切れ — {provider} を開いて更新してください",
     token_invalid: "トークンが無効です — {provider} を開いて再ログインしてください",
@@ -360,6 +367,7 @@ const MESSAGES = {
     searching: "正在查找账户…", refresh: "刷新",
     session: "会话（5 小时）", weekly: "每周", weekly_opus: "每周 · Opus", weekly_sonnet: "每周 · Sonnet", limit: "限额",
     resetsIn: "{t}后重置", resetsNow: "即将重置", credits: "额度：{v}", unlimited: "无限",
+    windowNotStarted: "未开始 · 首次使用时开始",
     resetTimeUnavailable: "重置时间不可用", lastResetAt: "上次确认的重置时间：{d}", resetAwaitingRefresh: "已过重置时间 · 等待刷新（{d}）",
     token_expired: "令牌已过期 — 请打开 {provider} 续期",
     token_invalid: "令牌无效 — 请打开 {provider} 重新登录",
@@ -407,6 +415,7 @@ const MESSAGES = {
     searching: "계정을 찾는 중…", refresh: "새로 고침",
     session: "세션 (5시간)", weekly: "주간", weekly_opus: "주간 · Opus", weekly_sonnet: "주간 · Sonnet", limit: "한도",
     resetsIn: "{t} 후 초기화", resetsNow: "곧 초기화", credits: "크레딧: {v}", unlimited: "무제한",
+    windowNotStarted: "시작 전 · 처음 사용할 때 시작",
     resetTimeUnavailable: "초기화 시간 정보 없음", lastResetAt: "마지막으로 확인된 초기화: {d}", resetAwaitingRefresh: "초기화 시간 지남 · 새로 고침 대기 중 ({d})",
     token_expired: "토큰 만료 — {provider}을(를) 열어 갱신하세요",
     token_invalid: "토큰이 유효하지 않음 — {provider}을(를) 열어 다시 로그인하세요",
@@ -454,6 +463,7 @@ const MESSAGES = {
     searching: "Поиск аккаунтов…", refresh: "Обновить",
     session: "Сессия (5 ч)", weekly: "Неделя", weekly_opus: "Неделя · Opus", weekly_sonnet: "Неделя · Sonnet", limit: "Лимит",
     resetsIn: "Сброс через {t}", resetsNow: "Сброс сейчас", credits: "Кредиты: {v}", unlimited: "Без ограничений",
+    windowNotStarted: "Не начато · начнётся при первом использовании",
     resetTimeUnavailable: "Время сброса недоступно", lastResetAt: "Последнее известное время сброса: {d}", resetAwaitingRefresh: "Время сброса прошло · ожидание обновления ({d})",
     token_expired: "Токен истёк — откройте {provider}, чтобы обновить его",
     token_invalid: "Недействительный токен — откройте {provider}, чтобы войти снова",
@@ -577,10 +587,22 @@ export function resetsIn(iso) {
   return t("resetsIn", { t: duration(mins) });
 }
 
-/** Provider-supplied reset time, with separate unknown, stale and elapsed states. */
-export function windowResetText(w, stale = false) {
+/**
+ * Whether a window has not started yet. Codex reports an unused window as resetting one full
+ * window length after the request, a time that moves with every poll rather than a real reset.
+ */
+export function notStarted(w, fetchedAt) {
+  const at = w.resets_at ? Date.parse(w.resets_at) : NaN;
+  const fetched = fetchedAt ? Date.parse(fetchedAt) : NaN;
+  return w.used_percent === 0 && w.window_seconds > 0 && Number.isFinite(at) && Number.isFinite(fetched)
+    && Math.abs(at - fetched - w.window_seconds * 1000) <= 120000;
+}
+
+/** Provider-supplied reset time, with separate unknown, not-started, stale and elapsed states. */
+export function windowResetText(w, stale = false, fetchedAt = null) {
   const at = w.resets_at ? Date.parse(w.resets_at) : NaN;
   if (!Number.isFinite(at)) return t("resetTimeUnavailable");
+  if (notStarted(w, fetchedAt)) return t("windowNotStarted");
   const date = resetDate(at);
   if (stale) return t("lastResetAt", { d: date });
   if (at <= Date.now()) return t("resetAwaitingRefresh", { d: date });

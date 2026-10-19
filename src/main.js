@@ -92,7 +92,7 @@ function bars(a) {
     <div class="win">
       <div class="row"><span>${esc(windowLabel(w))}</span><b>${Math.round(w.used_percent)}%</b></div>
       <div class="bar"><div style="width:${Math.min(100, w.used_percent)}%;background:${color(w.used_percent)}"></div></div>
-      ${resetWindows.has(w) && !a.stale ? `<div class="reset" title="${esc(w.resets_at)}">${esc(windowResetText(w))}</div>` : ""}
+      ${resetWindows.has(w) && !a.stale ? `<div class="reset" title="${esc(w.resets_at)}">${esc(windowResetText(w, false, a.fetched_at))}</div>` : ""}
     </div>`).join("");
 }
 
@@ -111,7 +111,7 @@ function renderDetails(snap) {
     .filter(([, list]) => list.length);
   patch($accounts, groups.map(([provider, list]) => `
     <section>
-      <div class="acc-head"><span class="name">${PROVIDER_NAME[provider]}</span></div>
+      <div class="acc-head"><span class="logo ${provider}">${MARK[provider]}</span><span class="name">${PROVIDER_NAME[provider]}</span></div>
       ${list.map((a) => {
         const stale = a.stale && a.fetched_at
           ? t("lastObserved", { t: duration(Math.max(1, Math.round((Date.now() - new Date(a.fetched_at)) / 60000))) })
@@ -121,6 +121,7 @@ function renderDetails(snap) {
         return `
         <div class="acct ${a.active ? "active" : ""}" data-key="${provider}:${esc(a.id)}">
           <div class="acct-head">
+            <span class="provider-mark ${provider}" title="${PROVIDER_NAME[provider]}">${MARK[provider]}</span>
             <span class="who">${esc(accountName(a))}</span>
             ${a.plan ? `<span class="plan">${esc(a.plan)}</span>` : ""}
             ${a.active
@@ -197,7 +198,9 @@ $accounts.addEventListener("click", async (e) => {
 /** Sizes the window to its content: the widget's width, or the flyout's height. */
 function layout() {
   if (IS_DOCK) invoke("set_dock_width", { width: Math.ceil($widget.offsetWidth) });
-  else invoke("set_panel_height", { height: Math.ceil($details.scrollHeight) });
+  // The account list scrolls once the flyout reaches the screen's height (the app caps the
+  // window there), so ask for the height it would need unclipped.
+  else invoke("set_panel_height", { height: Math.ceil($details.scrollHeight - $accounts.clientHeight + $accounts.scrollHeight) });
 }
 
 function render(snap) {

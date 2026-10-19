@@ -50,7 +50,7 @@ function accountRow(p, a) {
   // A zero-usage session can lack a reset while its weekly window has one.
   // Never hide that weekly timestamp behind the headline's tie-breaking.
   const windowResets = timedWindows.length
-    ? `<div class="window-resets">${timedWindows.map(w => `<small class="window-reset" title="${esc(w.resets_at)}">${esc(windowLabel(w))}: ${Math.round(w.used_percent)}% ${t("used")} · ${esc(windowResetText(w, a.stale))}</small>`).join("")}</div>`
+    ? `<div class="window-resets">${timedWindows.map(w => `<small class="window-reset" title="${esc(w.resets_at)}">${esc(windowLabel(w))}: ${Math.round(w.used_percent)}% ${t("used")} · ${esc(windowResetText(w, a.stale, a.fetched_at))}</small>`).join("")}</div>`
     : "";
   const held = a.resets ?? [];
   const total = held.reduce((n, r) => n + r.count, 0);

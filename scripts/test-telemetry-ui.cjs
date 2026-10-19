@@ -223,10 +223,54 @@ async function setup(page, label) {
     assert.match(await panel.locator('#panel-notice').innerText(), /different account/);
     if (process.env.UI_SCREENSHOT_DIR) await panel.screenshot({ path: path.join(process.env.UI_SCREENSHOT_DIR, 'slopbar-panel.png'), fullPage: true });
 
+    // Every flyout row carries its provider's mark, and each section its logo: one person's
+    // Claude and Codex accounts share an email, so the name alone does not tell them apart.
+    for (const section of await panel.locator('#accounts section').all()) {
+      const provider = (await section.locator('.acc-head .logo').getAttribute('class')).split(' ')[1];
+      for (const row of await section.locator('.acct').all()) {
+        assert.equal(await row.locator(`.provider-mark.${provider}`).count(), 1, 'row marked with its provider');
+      }
+    }
+
+    // Many accounts on a short screen: the header and the first provider stay on screen, the
+    // account list scrolls, and the app is asked for the full unclipped height (it caps it).
+    const many = JSON.parse(JSON.stringify(data));
+    for (let i = 0; i < 12; i++) for (const provider of ['claude', 'codex']) {
+      many.accounts.push({ ...JSON.parse(JSON.stringify(data.accounts[1])), id: `${provider}-${i}:org`, provider, email: `same${i}@example.invalid`, active: false });
+    }
+    await panel.setViewportSize({ width: 380, height: 500 });
+    await panel.evaluate(() => { window.testCalls = []; });
+    await panel.evaluate(s => window.testEmit('usage-updated', s), many);
+    await panel.waitForTimeout(100);
+    const box = await panel.locator('header').boundingBox();
+    assert.ok(box && box.y >= 0 && box.y + box.height <= 500, 'flyout header stays visible');
+    const firstHead = await panel.locator('#accounts section .acc-head').first().boundingBox();
+    assert.ok(firstHead && firstHead.y + firstHead.height <= 500, 'first provider heading visible');
+    const scroll = await panel.locator('#accounts').evaluate(el => ({ s: el.scrollHeight, c: el.clientHeight, o: getComputedStyle(el).overflowY }));
+    assert.ok(scroll.s > scroll.c && scroll.o === 'auto', 'account list scrolls');
+    const asked = await panel.evaluate(() => window.testCalls.filter(c => c.command === 'set_panel_height').map(c => c.args.height));
+    assert.ok(asked.length && Math.max(...asked) > 500, `unclipped height requested (${asked})`);
+    await panel.setViewportSize({ width: 380, height: 1100 });
+
+    // An unused Codex window is reported as resetting one window length after the request: a
+    // time that moves with every poll. It reads as not started, not as a countdown.
+    const fetchedAt = new Date(Date.now() - 1000).toISOString();
+    const unstartedCodex = JSON.parse(JSON.stringify(data));
+    unstartedCodex.accounts = [{ ...unstartedCodex.accounts[3], provider: 'codex', id: 'idle:org', fetched_at: fetchedAt, stale: false, error: null, monitor_error: null,
+      windows: [{ kind: 'weekly', used_percent: 0, window_seconds: 604800, resets_at: new Date(Date.parse(fetchedAt) + 604800000).toISOString() }] },
+      { ...unstartedCodex.accounts[3], provider: 'codex', id: 'used:org', fetched_at: fetchedAt, stale: false, error: null, monitor_error: null,
+      windows: [{ kind: 'weekly', used_percent: 75, window_seconds: 604800, resets_at: new Date(Date.parse(fetchedAt) + 5 * 86400000).toISOString() }] }];
+    for (const page of [panel, settings]) await page.evaluate(s => window.testEmit('usage-updated', s), unstartedCodex);
+    assert.match(await panel.locator('[data-key="codex:idle:org"] .win .reset').innerText(), /^Not started · begins on first use$/);
+    assert.match(await panel.locator('[data-key="codex:used:org"] .win .reset').innerText(), /^Resets in 5d/);
+    assert.match(await settings.locator('[data-key="codex:idle:org"] .window-reset').innerText(), /^Weekly: 0% used · Not started/);
+    assert.match(await settings.locator('[data-key="codex:used:org"] .window-reset').innerText(), /^Weekly: 75% used · Resets in 5d/);
+    for (const page of [panel, settings]) await page.evaluate(s => window.testEmit('usage-updated', s), data);
+
     // Every supported language supplies the monitoring controls and error strings.
     const translations = await panel.evaluate(async () => {
       const { t, setLanguage, LANGUAGES } = await import('/i18n.js');
-      const keys = ['monitorDisconnect', 'monitorDisconnected', 'monitorRevokeFailed', 'monitor_uncertain', 'monitorConnect', 'monitorReconnect', 'monitorConnected', 'monitorPending', 'monitor_setup', 'monitor_reconnect', 'monitor_storage', 'monitor_network', 'monitor_wrong_account', 'monitor_shared_login', 'monitor_login_failed', 'monitor_busy', 'lastObserved', 'lastReading', 'usageUnknown', 'manualUpdates', 'resetTimeUnavailable', 'lastResetAt', 'resetAwaitingRefresh'];
+      const keys = ['monitorDisconnect', 'monitorDisconnected', 'monitorRevokeFailed', 'monitor_uncertain', 'monitorConnect', 'monitorReconnect', 'monitorConnected', 'monitorPending', 'monitor_setup', 'monitor_reconnect', 'monitor_storage', 'monitor_network', 'monitor_wrong_account', 'monitor_shared_login', 'monitor_login_failed', 'monitor_busy', 'lastObserved', 'lastReading', 'usageUnknown', 'manualUpdates', 'resetTimeUnavailable', 'lastResetAt', 'resetAwaitingRefresh', 'windowNotStarted'];
       setLanguage('en'); const english = keys.map(k => t(k));
       return Object.keys(LANGUAGES).filter(l => l !== 'en').map(l => {
         setLanguage(l); return { l, values: keys.map(k => t(k)), english };
