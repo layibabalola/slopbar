@@ -260,9 +260,11 @@ function renewalText(e) {
   if (!e.renewal) return e.plan_kind === "personal" ? t("subRenewUnknown") : "";
   // An entered billing day is a calendar day; the others are moments.
   const when = e.renewal.source === "entered" ? shortDay(e.renewal.at) : shortDate(e.renewal.at);
-  const days = Math.max(0, Math.ceil((new Date(e.renewal.at) - Date.now()) / 86400000));
+  // Calendar days, as people count them: tomorrow is 1 day away whatever the hour.
+  const midnight = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; };
+  const days = Math.max(0, Math.round((midnight(e.renewal.at) - midnight(Date.now())) / 86400000));
   const source = t({ entered: "subSourceEntered", provider: "subSourceProvider", estimated: "subSourceEstimated" }[e.renewal.source]);
-  return t("subRenews", { d: when, n: days, source });
+  return t(days === 0 ? "subRenewsToday" : days === 1 ? "subRenewsTomorrow" : "subRenews", { d: when, n: days, source });
 }
 
 function adviceText(e) {

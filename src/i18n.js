@@ -57,7 +57,7 @@ const MESSAGES = {
     subModelCap: "{window} keeps reaching its limit.", subLowConfidence: "Few readings: treat this as a first impression.",
     subThisWeek: "This week: {p} used, resets in {t}.", subThisWeekFast: "This week: {p} used, resets in {t} — on pace to run out early.",
     subNoWeekly: "No weekly limit reported yet.",
-    subRenews: "Renews {d} · in {n} days ({source})", subRenewUnknown: "Renewal date not reported yet",
+    subRenews: "Renews {d} · in {n} days ({source})", subRenewsToday: "Renews today ({source})", subRenewsTomorrow: "Renews tomorrow, {d} ({source})", subRenewUnknown: "Renewal date not reported yet",
     subSourceEntered: "corrected by you", subSourceProvider: "from the provider", subSourceEstimated: "monthly from the plan's start",
     subProviderStale: "The sign-in last reported this plan paid until {d}; the next renewal is counted monthly from there.",
     subCostList: "{v}/mo", subCostEntered: "{v}/mo", subCostUnknown: "Cost unknown",
