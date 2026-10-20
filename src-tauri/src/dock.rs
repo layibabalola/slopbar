@@ -1,6 +1,7 @@
 //! The taskbar widget: laid over the Windows taskbar, just left of the notification area, so it
 //! looks and behaves like a built-in tray item.
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewWindow};
@@ -131,6 +132,55 @@ mod win {
         }
     }
 
+    /// Where the taskbar's Widgets (weather) button is. It is drawn inside the taskbar and has
+    /// no window of its own, so only UI Automation can see it. `None` when it is turned off.
+    /// The caller's thread must have initialized COM.
+    pub fn widgets_button() -> Option<Rect> {
+        use std::mem::ManuallyDrop;
+        use windows::core::BSTR;
+        use windows::Win32::Foundation::HWND as Hwnd;
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+        use windows::Win32::System::Variant::{VariantClear, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BSTR};
+        use windows::Win32::UI::Accessibility::{
+            CUIAutomation, IUIAutomation, TreeScope_Descendants, UIA_AutomationIdPropertyId,
+        };
+        thread_local! {
+            static UIA: Option<IUIAutomation> =
+                unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok() };
+        }
+        let bar = unsafe { FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null()) };
+        if bar.is_null() {
+            return None;
+        }
+        UIA.with(|uia| unsafe {
+            let uia = uia.as_ref()?;
+            let root = uia.ElementFromHandle(Hwnd(bar)).ok()?;
+            let mut id = VARIANT {
+                Anonymous: VARIANT_0 {
+                    Anonymous: ManuallyDrop::new(VARIANT_0_0 {
+                        vt: VT_BSTR,
+                        Anonymous: VARIANT_0_0_0 { bstrVal: ManuallyDrop::new(BSTR::from("WidgetsButton")) },
+                        ..Default::default()
+                    }),
+                },
+            };
+            let cond = uia.CreatePropertyCondition(UIA_AutomationIdPropertyId, &id);
+            let _ = VariantClear(&mut id);
+            let cond = cond.ok()?;
+            let button = root.FindFirst(TreeScope_Descendants, &cond).ok()?;
+            if button.CurrentIsOffscreen().is_ok_and(|off| off.as_bool()) {
+                return None;
+            }
+            let r = button.CurrentBoundingRectangle().ok()?;
+            (r.right > r.left).then_some(Rect { left: r.left, top: r.top, right: r.right, bottom: r.bottom })
+        })
+    }
+
+    pub fn init_com() {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    }
+
     /// If the taskbar sits above `hwnd` in the z-order, moves `hwnd` to just above the taskbar
     /// (not to the very top, so tray flyouts, the calendar and Start stay above it). Returns
     /// whether it had to move. Windows 11 re-asserts the taskbar on top at times without
@@ -246,6 +296,10 @@ mod win {
     pub fn fullscreen_monitor() -> Option<Rect> {
         None
     }
+    pub fn widgets_button() -> Option<Rect> {
+        None
+    }
+    pub fn init_com() {}
     pub fn own_by_taskbar(_: ()) -> bool {
         false
     }
@@ -278,6 +332,34 @@ fn window(app: &AppHandle) -> Option<WebviewWindow> {
     app.get_webview_window(LABEL)
 }
 
+/// The taskbar's Widgets button, as last seen by `watch_widgets`.
+static WIDGETS: Mutex<Option<Rect>> = Mutex::new(None);
+
+/// Looks for the Widgets button every couple of seconds. It moves when the weather text
+/// changes length or the user switches the taskbar alignment. A thread of its own, because UI
+/// Automation asks Explorer, which can be slow to answer, and docking must never wait on it.
+fn watch_widgets() {
+    win::init_com();
+    loop {
+        *WIDGETS.lock().unwrap() = win::widgets_button();
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Left edge of a widget `width` wide, docked against the notification area. With the taskbar
+/// left-aligned, Windows 11 puts the Widgets (weather) button there too; the widget then sits
+/// left of it instead of on top of it. Centered, that button is at the far left, out of the way.
+pub fn dock_left(bar: Rect, tray: Rect, widgets: Option<Rect>, width: i32) -> i32 {
+    let mut right = tray.left;
+    if let Some(w) = widgets {
+        let on_bar = w.top < bar.bottom && w.bottom > bar.top;
+        if on_bar && w.left < right && w.right > right - width - GAP {
+            right = w.left;
+        }
+    }
+    right - width - GAP
+}
+
 /// Docks the widget over the taskbar, left of the notification area. `raise` brings it back
 /// above the taskbar (only needed when the taskbar has just been activated).
 fn place_docked(app: &AppHandle, win: &WebviewWindow, raise: bool) -> bool {
@@ -285,7 +367,8 @@ fn place_docked(app: &AppHandle, win: &WebviewWindow, raise: bool) -> bool {
     let scale = win.scale_factor().unwrap_or(1.0);
     let width = (*app.state::<AppState>().dock_width.lock().unwrap() * scale).ceil() as i32;
     let height = bar.bottom - bar.top;
-    let pos = PhysicalPosition::new(tray.left - width - GAP, bar.top);
+    let widgets = *WIDGETS.lock().unwrap();
+    let pos = PhysicalPosition::new(dock_left(bar, tray, widgets, width), bar.top);
     let size = PhysicalSize::new(width as u32, height as u32);
     if win.outer_position().ok() != Some(pos) {
         let _ = win.set_position(pos);
@@ -310,6 +393,7 @@ fn place_docked(app: &AppHandle, win: &WebviewWindow, raise: bool) -> bool {
 
 /// Keeps the docked widget glued to the taskbar (it moves, resizes, and fights for z-order).
 pub fn keep_docked(app: AppHandle) {
+    std::thread::spawn(watch_widgets);
     loop {
         std::thread::sleep(Duration::from_millis(100));
         let Some(win) = window(&app) else { continue };
@@ -355,5 +439,37 @@ pub fn exclude_from_peek(window: &WebviewWindow) {
             &value as *const i32 as *const _,
             std::mem::size_of::<i32>() as u32,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Measured on a 3840-wide taskbar with the weather showing next to the tray.
+    const BAR: Rect = Rect { left: 0, top: 2328, right: 3840, bottom: 2400 };
+    const TRAY: Rect = Rect { left: 3279, top: 2328, right: 3840, bottom: 2400 };
+
+    #[test]
+    fn docks_against_the_tray_without_widgets() {
+        assert_eq!(dock_left(BAR, TRAY, None, 98), 3279 - 98 - GAP);
+    }
+
+    #[test]
+    fn steps_left_of_the_weather_next_to_the_tray() {
+        let weather = Rect { left: 3033, top: 2328, right: 3261, bottom: 2400 };
+        assert_eq!(dock_left(BAR, TRAY, Some(weather), 98), 3033 - 98 - GAP);
+    }
+
+    #[test]
+    fn ignores_widgets_at_the_far_left_of_a_centered_taskbar() {
+        let weather = Rect { left: 0, top: 2328, right: 228, bottom: 2400 };
+        assert_eq!(dock_left(BAR, TRAY, Some(weather), 98), 3279 - 98 - GAP);
+    }
+
+    #[test]
+    fn ignores_widgets_on_another_taskbar() {
+        let elsewhere = Rect { left: 3033, top: 1000, right: 3261, bottom: 1072 };
+        assert_eq!(dock_left(BAR, TRAY, Some(elsewhere), 98), 3279 - 98 - GAP);
     }
 }
