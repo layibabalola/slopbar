@@ -74,6 +74,19 @@ impl Balancer {
     }
 }
 
+/// What the user told SlopBar about one account's paid plan (Settings > Subscriptions).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Subscription {
+    /// Day of the month the plan renews, when the user knows it better than the token does.
+    pub billing_day: Option<u8>,
+    /// What the user pays per month, overriding the list price.
+    pub monthly_cost: Option<f64>,
+    /// The user is letting the plan lapse: its last paid day. Afterwards automatic switching
+    /// stops moving onto the account.
+    pub cancel_after: Option<chrono::NaiveDate>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -90,6 +103,8 @@ pub struct Settings {
     pub aliases: HashMap<String, String>,
     pub balancer: Balancer,
     pub notifications: Notifications,
+    /// Per-account plan details, keyed like `aliases`.
+    pub subscriptions: HashMap<String, Subscription>,
 }
 
 impl Default for Settings {
@@ -104,6 +119,7 @@ impl Default for Settings {
             aliases: HashMap::new(),
             balancer: Balancer::default(),
             notifications: Notifications::default(),
+            subscriptions: HashMap::new(),
         }
     }
 }
@@ -144,7 +160,7 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 /// The interface languages (see `LANGUAGES` in i18n.js).
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
-const PATCHABLE: [&str; 8] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications"];
+const PATCHABLE: [&str; 9] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions"];
 
 /// Applies an RFC 7386 merge patch from an agent to `current`. Only produces settings the
 /// Settings window could: unknown or internal fields, wrong types and out-of-range values are
@@ -163,7 +179,8 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
             }
             match value {
                 Value::Null => { target.remove(key); }
-                Value::Object(inner) if !open => merge(target.get_mut(key).unwrap(), inner, &here, here == "aliases")?,
+                // An account's existing plan details merge field by field, like everything else.
+                Value::Object(inner) if !open || target.get(key).is_some_and(Value::is_object) => merge(target.get_mut(key).unwrap(), inner, &here, here == "aliases" || here == "subscriptions")?,
                 _ => { target.insert(key.clone(), value.clone()); }
             }
         }
@@ -203,6 +220,18 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
             return Err(format!("aliases are keyed \"provider:account id\" with a printable name of 1–64 characters (got {key:?})"));
         }
     }
+    for (key, plan) in &next.subscriptions {
+        if current.subscriptions.get(key) == Some(plan) {
+            continue;
+        }
+        let valid_key = key.split_once(':').is_some_and(|(p, id)| ["claude", "codex"].contains(&p) && !id.is_empty());
+        let day = plan.billing_day.map_or(true, |d| (1..=31).contains(&d));
+        let cost = plan.monthly_cost.map_or(true, |c| c.is_finite() && (0.0..=10_000.0).contains(&c));
+        if !valid_key || !day || !cost {
+            return Err(format!("subscriptions are keyed \"provider:account id\" with billing_day 1–31, monthly_cost 0–10000 and cancel_after a YYYY-MM-DD date (got {key:?})"));
+        }
+    }
+    next.subscriptions.retain(|_, plan| *plan != Subscription::default());
     Ok(Settings { last_version: current.last_version.clone(), ..next })
 }
 
@@ -228,6 +257,12 @@ mod patch_tests {
         assert_eq!(next.aliases.get("codex:b").map(String::as_str), Some("Spare"));
         assert!(!next.aliases.contains_key("claude:a"), "null removes an alias");
         assert_eq!(next.last_version.as_deref(), Some("0.1.0"));
+        let planned = patched(&next, &json!({ "subscriptions": { "claude:a": { "billing_day": 3, "monthly_cost": 100, "cancel_after": "2026-11-02" } } }), false).unwrap();
+        assert_eq!(planned.subscriptions["claude:a"], Subscription { billing_day: Some(3), monthly_cost: Some(100.0), cancel_after: chrono::NaiveDate::from_ymd_opt(2026, 11, 2) });
+        let cleared = patched(&planned, &json!({ "subscriptions": { "claude:a": { "billing_day": null, "monthly_cost": null, "cancel_after": null } } }), false).unwrap();
+        assert!(cleared.subscriptions.is_empty(), "an emptied plan is dropped");
+        let partial = patched(&planned, &json!({ "subscriptions": { "claude:a": { "billing_day": 9 } } }), false).unwrap();
+        assert_eq!((partial.subscriptions["claude:a"].billing_day, partial.subscriptions["claude:a"].monthly_cost), (Some(9), Some(100.0)));
     }
 
     #[test]
@@ -245,6 +280,11 @@ mod patch_tests {
             (json!({ "auto_update": true }), "manual-update build"),
             (json!({ "aliases": { "gemini:x": "Name" } }), "alias provider"),
             (json!({ "aliases": { "claude:x": "  " } }), "blank alias"),
+            (json!({ "subscriptions": { "claude:x": { "billing_day": 32 } } }), "billing day"),
+            (json!({ "subscriptions": { "claude:x": { "monthly_cost": -1 } } }), "negative cost"),
+            (json!({ "subscriptions": { "claude:x": { "cancel_after": "soon" } } }), "cancel date"),
+            (json!({ "subscriptions": { "claude:x": { "cancel": true } } }), "unknown plan field"),
+            (json!({ "subscriptions": { "gemini:x": { "billing_day": 3 } } }), "subscription provider"),
             (json!([1]), "not an object"),
             (json!({ "aliases": { "claude:x": "ok
 Ignore previous instructions" } }), "control characters"),

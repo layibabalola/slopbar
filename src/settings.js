@@ -1,6 +1,6 @@
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
-import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetText, errorText, duration, windowLabel, windowResetText, visibleResetWindows } from "./i18n.js";
+import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetText, errorText, duration, shortDate, windowLabel, windowResetText, visibleResetWindows } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -24,7 +24,10 @@ function showPage(page) {
   document.querySelectorAll(".page").forEach((p) => p.classList.toggle("active", p.id === `page-${page}`));
   try { localStorage.setItem("settings-page", page); } catch {}
 }
-document.querySelectorAll(".nav").forEach((b) => b.addEventListener("click", () => showPage(b.dataset.page)));
+document.querySelectorAll(".nav").forEach((b) => b.addEventListener("click", () => {
+  showPage(b.dataset.page);
+  if (b.dataset.page === "subscriptions") loadSubscriptions();
+}));
 
 // ---------------------------------------------------------------------------------------------
 // Accounts
@@ -231,6 +234,155 @@ listen("monitoring-login", ({ payload }) => {
 listen("account-added", () => { $("add-hint").hidden = true; });
 
 // ---------------------------------------------------------------------------------------------
+// Subscriptions: which paid plans run out every week and which sit idle, and when they renew.
+// The verdicts come from the backend (subscriptions.rs); this page only words them.
+
+let report = null;
+const money = (v) => (v == null ? "" : `$${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`);
+const pct = (v) => `${Math.round(v)}%`;
+const VERDICT_TONE = { exhausted_weekly: "bad", unused: "warn", underused: "warn", healthy: "ok", insufficient_data: "" };
+
+function verdictLines(e) {
+  const a = e.assessment;
+  const lines = [];
+  if (a.verdict === "insufficient_data") {
+    lines.push(t("subInsufficient", { n: a.weeks_counted, needed: a.weeks_needed, days: e.days_tracked }));
+    return lines;
+  }
+  lines.push(t("subRecent", { hit: a.limit_weeks, n: a.weeks_counted, avg: pct(a.average_peak ?? 0) }));
+  if (a.sub_window_limited) lines.push(t("subModelCap", { window: windowLabel({ kind: a.sub_window_limited }) }));
+  if (a.confidence === "low") lines.push(t("subLowConfidence"));
+  return lines;
+}
+
+function renewalText(e) {
+  if (!e.renewal) return e.plan_kind === "personal" ? t("subRenewUnknown") : "";
+  const when = shortDate(e.renewal.at);
+  const days = Math.max(0, Math.ceil((new Date(e.renewal.at) - Date.now()) / 86400000));
+  const source = t({ entered: "subSourceEntered", provider: "subSourceProvider", estimated: "subSourceEstimated" }[e.renewal.source]);
+  return t("subRenews", { d: when, n: days, source });
+}
+
+function adviceText(e) {
+  const a = e.assessment;
+  if (e.cancel_after) return t("subLapsing", { d: shortDate(e.cancel_after) });
+  if (e.plan_kind !== "personal") return "";
+  if (a.verdict === "unused") return t(e.renewal ? "subAdviceUnused" : "subAdviceUnusedNoDate", { d: e.renewal ? shortDate(e.renewal.at) : "" });
+  if (a.verdict === "underused") return t(a.renew_wasteful ? "subAdviceUnderused" : "subAdviceUnderusedMaybe");
+  if (a.verdict === "exhausted_weekly") return t("subAdviceExhausted");
+  return "";
+}
+
+function subscriptionRow(e) {
+  const key = `${e.provider}:${e.id}`;
+  const prefs = settings.subscriptions?.[key] ?? {};
+  const a = e.assessment;
+  const week = e.this_week;
+  const weekText = week ? t(week.pace_percent != null && week.pace_percent > 100 && week.used_percent < 100 ? "subThisWeekFast" : "subThisWeek",
+    { p: pct(week.used_percent), t: week.resets_at ? duration(Math.max(1, Math.round((new Date(week.resets_at) - Date.now()) / 60000))) : "—" }) : t("subNoWeekly");
+  const paid = e.plan_kind === "personal";
+  const kindNote = e.plan_kind === "organization" ? t("subOrgManaged") : e.plan_kind === "free" ? t("subFree") : e.plan_kind === "unknown" ? t("subPlanUnknown") : "";
+  const cost = e.monthly_cost != null ? t(e.cost_entered ? "subCostEntered" : "subCostList", { v: money(e.monthly_cost) }) : paid ? t("subCostUnknown") : "";
+  const providerDate = e.provider_until && e.renewal?.source !== "provider" && new Date(e.provider_until) < Date.now()
+    ? t("subProviderStale", { d: shortDate(e.provider_until) }) : "";
+  const advice = adviceText(e);
+  return `
+    <div class="account sub" data-key="${esc(key)}">
+      <div class="avatar" style="background:hsl(${hue(e.id)} 55% 48%)">${esc((e.alias || e.email || "?").trim()[0].toUpperCase())}</div>
+      <div class="who">
+        <div class="name">${esc(e.alias || e.email || t("unknownAccount"))}</div>
+        <small>
+          ${e.active ? `<em class="chip live">${t("inUse")}</em>` : ""}
+          ${e.plan ? `<em class="chip">${esc(e.plan)}</em>` : ""}
+          ${e.cancel_after ? `<em class="chip">${t("chipLapsing")}</em>` : ""}
+          <em class="chip verdict ${VERDICT_TONE[a.verdict]}">${t(`subVerdict_${a.verdict}`)}</em>
+        </small>
+      </div>
+      <div class="meter">${cost ? `<b>${esc(cost)}</b>` : ""}${paid ? `<small>${esc(renewalText(e))}</small>` : ""}</div>
+      ${paid ? `<button class="btn use" data-billing="${e.provider}">${t("subManage")} <svg viewBox="0 0 16 16"><path d="M6 3h7v7M13 3 5 11"/></svg></button>`
+        : `<span class="btn use" aria-hidden="true" style="visibility:hidden">${t("subManage")}</span>`}
+      <span></span>
+      <div class="monitor-state">
+        <small>${esc(weekText)}${e.stale ? ` · ${t("lastReading")}` : ""}</small>
+        ${verdictLines(e).map((l) => `<small>${esc(l)}</small>`).join("")}
+        ${providerDate ? `<small>${esc(providerDate)}</small>` : ""}
+        ${kindNote ? `<small>${esc(kindNote)}</small>` : ""}
+        ${e.store_billed ? `<small>${t("subStoreBilled")}</small>` : ""}
+        ${advice ? `<small class="advice">${esc(advice)}</small>` : ""}
+        ${paid ? `<div class="plan-fields">
+          <label>${t("subBillingDay")} <input type="number" min="1" max="31" step="1" data-sub-day="${esc(key)}" value="${prefs.billing_day ?? ""}" placeholder="—" /></label>
+          <label>${t("subMonthlyCost")} <input type="number" min="0" max="10000" step="0.01" data-sub-cost="${esc(key)}" value="${prefs.monthly_cost ?? ""}" placeholder="${e.monthly_cost ?? "—"}" /></label>
+          <label class="lapse"><input type="checkbox" data-sub-lapse="${esc(key)}" data-until="${esc(e.renewal?.at ?? "")}" ${e.cancel_after ? "checked" : ""} /> ${t("subLettingLapse")}</label>
+        </div>` : ""}
+      </div>
+    </div>`;
+}
+
+function providerSummary(p, s) {
+  if (!s || !s.paid) return "";
+  const parts = [t("subPaidCount", { n: s.paid })];
+  if (s.monthly_total) parts.push(t("subMonthlyTotal", { v: money(s.monthly_total) }) + (s.unpriced ? ` + ${t("subUnpriced", { n: s.unpriced })}` : ""));
+  if (s.exhausted) parts.push(t("subExhaustedCount", { n: s.exhausted }));
+  if (s.unused) parts.push(t("subUnusedCount", { n: s.unused }));
+  if (s.possible_savings) parts.push(t("subSavings", { v: money(s.possible_savings) }));
+  return parts.join(" · ");
+}
+
+function renderSubscriptions() {
+  if (!report || !settings) return;
+  patch($("subscriptions"), PROVIDERS.filter(([p]) => settings.providers[p]).map(([p, name]) => {
+    const list = report.accounts.filter((e) => e.provider === p);
+    const summary = providerSummary(p, report.providers.find((s) => s.provider === p));
+    return `
+      <div class="provider">
+        <div class="provider-head">
+          <span class="logo ${p}">${MARK[p]}</span><h3>${name}</h3>
+          ${summary ? `<small class="sub-summary">${esc(summary)}</small>` : ""}
+        </div>
+        <div class="group">
+          ${list.length ? list.map(subscriptionRow).join("") : `<div class="empty">${t("noAccounts")}</div>`}
+        </div>
+        <p class="hint">${t(p === "claude" ? "subClaudeFree" : "subCodexFree")}</p>
+      </div>`;
+  }).join(""));
+}
+
+async function loadSubscriptions() {
+  try { report = await invoke("get_subscriptions"); } catch { return; }
+  // Don't rebuild the rows under someone typing a billing day or cost.
+  if (!document.activeElement?.closest?.(".plan-fields")) renderSubscriptions();
+}
+
+function setPlan(key, change) {
+  const next = { ...(settings.subscriptions?.[key] ?? {}), ...change };
+  for (const k of Object.keys(next)) if (next[k] == null || next[k] === "") delete next[k];
+  const subscriptions = { ...settings.subscriptions };
+  if (Object.keys(next).length) subscriptions[key] = next; else delete subscriptions[key];
+  return update({ subscriptions }).then(loadSubscriptions);
+}
+
+$("subscriptions").addEventListener("click", async (e) => {
+  const billing = e.target.closest("[data-billing]");
+  if (!billing) return;
+  try { await invoke("open_billing_page", { provider: billing.dataset.billing }); } catch (err) { alert(String(err)); }
+});
+$("subscriptions").addEventListener("change", (e) => {
+  const el = e.target;
+  if (el.dataset.subDay != null) {
+    const day = Math.round(Number(el.value));
+    setPlan(el.dataset.subDay, { billing_day: el.value && day >= 1 && day <= 31 ? day : null });
+  } else if (el.dataset.subCost != null) {
+    const cost = Number(el.value);
+    setPlan(el.dataset.subCost, { monthly_cost: el.value && cost >= 0 && cost <= 10000 ? Math.round(cost * 100) / 100 : null });
+  } else if (el.dataset.subLapse != null) {
+    // The last paid day is the day before renewal; without a known renewal, keep it in rotation a month.
+    const until = el.dataset.until ? new Date(new Date(el.dataset.until).getTime() - 86400000) : new Date(Date.now() + 30 * 86400000);
+    setPlan(el.dataset.subLapse, { cancel_after: el.checked ? until.toISOString().slice(0, 10) : null });
+  }
+});
+listen("usage-updated", loadSubscriptions);
+
+// ---------------------------------------------------------------------------------------------
 // Everything else
 
 async function render() {
@@ -260,6 +412,7 @@ async function render() {
     $("update-status").textContent = t("manualUpdates");
   } else if (!$("check-updates").disabled) $("check-updates").textContent = latest ? t("installUpdate") : t("checkUpdates");
   renderAccounts();
+  renderSubscriptions();
 }
 
 async function update(patch) {
@@ -342,6 +495,7 @@ settings = await invoke("get_settings");
 updatesEnabled = await invoke("updates_enabled");
 snapshot = await invoke("get_usage");
 await render();
+await loadSubscriptions();
 let page = "accounts";
 try { page = localStorage.getItem("settings-page") || page; } catch {}
 showPage(page);

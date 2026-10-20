@@ -113,6 +113,7 @@ pub async fn fetch_all(
                 stale: false,
                 fetched_at: None,
                 monitor_connected: monitor.connected(slot),
+                billing: slot.billing(),
             };
             let entry = cache.entry(monitoring::key(slot)).or_default();
             match result {

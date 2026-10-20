@@ -40,6 +40,24 @@ pub struct AccountUsage {
     pub stale: bool,
     pub fetched_at: Option<DateTime<Utc>>,
     pub monitor_connected: bool,
+    /// What the saved login says about the plan's billing (see `Slot::billing`).
+    #[serde(default)]
+    pub billing: BillingHints,
+}
+
+/// Plan and billing facts the saved login carries. None of them is a promise: token claims are
+/// only as current as the token, so the report labels every date with where it came from.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct BillingHints {
+    /// Claude's rate-limit tier ("default_claude_max_20x"), which tells Max 5x from 20x.
+    pub tier: Option<String>,
+    /// How the plan is paid ("stripe_subscription"; app stores bill differently).
+    pub billing_type: Option<String>,
+    /// When the subscription started (Claude) or its current period began (Codex).
+    pub started_at: Option<DateTime<Utc>>,
+    /// Codex: the end of the paid period, as of `checked_at`.
+    pub active_until: Option<DateTime<Utc>>,
+    pub checked_at: Option<DateTime<Utc>>,
 }
 
 impl AccountUsage {

@@ -77,6 +77,34 @@ impl Slot {
         }
     }
 
+    /// Plan and billing facts the saved login carries: Claude's rate-limit tier and account record,
+    /// Codex's subscription claims in its id token. Never a token, email or account id.
+    pub fn billing(&self) -> crate::model::BillingHints {
+        let date = |v: &Value| v.as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|t| t.with_timezone(&chrono::Utc));
+        let text = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(String::from);
+        match self.provider {
+            Provider::Claude => {
+                let account = &self.data["oauth_account"];
+                crate::model::BillingHints {
+                    tier: text(&self.data["credentials"]["claudeAiOauth"]["rateLimitTier"]).or_else(|| text(&account["organizationRateLimitTier"])),
+                    billing_type: text(&account["billingType"]),
+                    started_at: date(&account["subscriptionCreatedAt"]),
+                    ..Default::default()
+                }
+            }
+            Provider::Codex => {
+                let claims = self.data["auth"]["tokens"]["id_token"].as_str().and_then(jwt_claims).unwrap_or(Value::Null);
+                let openai = &claims["https://api.openai.com/auth"];
+                crate::model::BillingHints {
+                    started_at: date(&openai["chatgpt_subscription_active_start"]),
+                    active_until: date(&openai["chatgpt_subscription_active_until"]),
+                    checked_at: date(&openai["chatgpt_subscription_last_checked"]),
+                    ..Default::default()
+                }
+            }
+        }
+    }
+
     /// Whether the saved access token has certainly expired (Claude records its expiry).
     pub fn expired(&self) -> bool {
         match self.provider {
@@ -555,4 +583,34 @@ async fn with_claude_profile(client: &reqwest::Client, slot: Slot) -> Option<Slo
     let (token, _) = slot.access()?;
     let account = claude_profile(client, &token).await?;
     claude_slot(slot.data["credentials"].clone(), Some(account))
+}
+
+#[cfg(test)]
+mod billing_tests {
+    use super::*;
+
+    #[test]
+    fn billing_hints_come_from_the_saved_login_without_identities() {
+        let claims = json!({ "email": "test@example.invalid", "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "plus", "chatgpt_account_id": "acct",
+            "chatgpt_subscription_active_start": "2026-09-18T21:26:13+00:00",
+            "chatgpt_subscription_active_until": "2026-10-18T21:26:13+00:00",
+            "chatgpt_subscription_last_checked": "2026-10-09T16:01:36.550331+00:00",
+        } });
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+        let codex = codex_slot(json!({ "tokens": { "access_token": "a", "id_token": format!("h.{payload}.s") } })).unwrap();
+        let b = codex.billing();
+        assert_eq!(b.active_until.unwrap().to_rfc3339(), "2026-10-18T21:26:13+00:00");
+        assert!(b.started_at.is_some() && b.checked_at.is_some() && b.tier.is_none());
+
+        let claude = claude_slot(json!({ "claudeAiOauth": { "accessToken": "a", "subscriptionType": "max", "rateLimitTier": "default_claude_max_5x" } }),
+            Some(json!({ "accountUuid": "u", "emailAddress": "test@example.invalid", "billingType": "stripe_subscription",
+                "subscriptionCreatedAt": "2026-08-03T09:00:00.000000Z" }))).unwrap();
+        let b = claude.billing();
+        assert_eq!((b.tier.as_deref(), b.billing_type.as_deref()), (Some("default_claude_max_5x"), Some("stripe_subscription")));
+        assert_eq!(b.started_at.unwrap().to_rfc3339(), "2026-08-03T09:00:00+00:00");
+        let text = serde_json::to_string(&b).unwrap();
+        assert!(!text.contains("example.invalid") && !text.contains("\"a\""), "{text}");
+        assert!(codex_slot(json!({ "tokens": { "access_token": "a" } })).unwrap().billing().active_until.is_none());
+    }
 }

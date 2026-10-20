@@ -35,6 +35,8 @@ pub enum Request {
     GetUsage,
     Refresh,
     GetSettings,
+    /// Each account's plan, weekly usage history, verdict and next renewal (see `subscriptions`).
+    GetSubscriptions,
     /// An RFC 7386 merge patch over the current settings (see `settings::patched`).
     UpdateSettings { patch: Value },
     SwitchAccount { provider: Provider, id: String },

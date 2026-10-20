@@ -78,6 +78,7 @@ pub enum Action {
     SwitchAuto,
     Cleanup,
     CacheSave,
+    HistorySave,
     MonitorSave,
     TokenRead,
     Revoke,
@@ -385,7 +386,7 @@ fn observation(event: &Event) -> Option<(Family, Event)> {
             action, elapsed_ms, ..
         } if matches!(
             action,
-            Action::TokenRead | Action::CacheSave | Action::MonitorSave
+            Action::TokenRead | Action::CacheSave | Action::HistorySave | Action::MonitorSave
         ) =>
         {
             *elapsed_ms = 0;
@@ -859,6 +860,7 @@ mod tests {
             stale: true,
             fetched_at: None,
             monitor_connected: true,
+            billing: crate::model::BillingHints { tier: Some(canary.into()), billing_type: Some(canary.into()), ..Default::default() },
         };
         let snapshot = Snapshot {
             accounts: vec![a],

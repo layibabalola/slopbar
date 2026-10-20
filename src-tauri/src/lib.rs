@@ -9,6 +9,7 @@ mod providers;
 mod monitoring;
 mod private_store;
 mod diagnostics;
+mod subscriptions;
 pub use diagnostics::write_build_info;
 mod door;
 pub use door::wait_for_exit;

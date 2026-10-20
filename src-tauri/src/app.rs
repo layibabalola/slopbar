@@ -1,4 +1,4 @@
-use crate::{accounts, balancer, diagnostics, dock, door, migrate, model, monitoring, notify, panel, providers, settings, sources, updates};
+use crate::{accounts, balancer, diagnostics, dock, door, migrate, model, monitoring, notify, panel, providers, settings, sources, subscriptions, updates};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -35,6 +35,8 @@ pub struct AppState {
     pub(crate) dock_width: Mutex<f64>,
     /// Last known usage per account, for accounts whose saved token can't be used right now.
     pub(crate) usage_cache: Mutex<providers::Cache>,
+    /// Every account's completed weekly windows, for the Subscriptions page.
+    pub(crate) usage_history: Mutex<subscriptions::History>,
     /// When each provider was last switched automatically (the balancer's cooldown).
     pub(crate) last_switch: Mutex<HashMap<Provider, Instant>>,
     /// Sources found by the last refresh, where switches are written.
@@ -44,6 +46,26 @@ pub struct AppState {
 #[tauri::command]
 fn get_usage(state: tauri::State<AppState>) -> Snapshot {
     state.snapshot.lock().unwrap().clone()
+}
+
+fn subscription_report(state: &AppState) -> subscriptions::Report {
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    let settings = state.settings.lock().unwrap().clone();
+    subscriptions::report(&snapshot, &state.usage_history.lock().unwrap(), &settings, chrono::Utc::now())
+}
+
+#[tauri::command]
+fn get_subscriptions(state: tauri::State<AppState>) -> subscriptions::Report {
+    subscription_report(&state)
+}
+
+/// Opens the provider's billing page in the browser. The address is fixed per provider, so the
+/// window can only choose which of the two opens.
+#[tauri::command]
+async fn open_billing_page(provider: Provider) -> Result<(), String> {
+    let url = subscriptions::billing_page(provider);
+    tauri::async_runtime::spawn_blocking(move || std::process::Command::new("explorer.exe").arg(url).spawn().map(|_| ()))
+        .await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
 }
 
 /// Writes a diagnostics export; shared by Settings and the agents' door.
@@ -80,6 +102,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::GetUsage => value(app.state::<AppState>().snapshot.lock().unwrap().clone()),
         R::Refresh => value(do_refresh(&app).await),
         R::GetSettings => value(app.state::<AppState>().settings.lock().unwrap().clone()),
+        R::GetSubscriptions => value(subscription_report(&app.state::<AppState>())),
         R::UpdateSettings { patch } => {
             let state = app.state::<AppState>();
             let _held = state.settings_lock.lock().await;
@@ -547,6 +570,12 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
 
     let snapshot = Snapshot { accounts: list, updated_at: Some(chrono::Utc::now()) };
     state.diagnostics.samples(&snapshot);
+    let history = {
+        let mut history = state.usage_history.lock().unwrap();
+        subscriptions::record(&mut history, &snapshot, &valid, chrono::Utc::now());
+        history.clone()
+    };
+    if subscriptions::save(&history).is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::HistorySave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
     state.diagnostics.record(None, None, diagnostics::Event::PollFinished { elapsed_ms: diagnostics::millis(started), accounts: snapshot.accounts.len(),
         native_sources: found.iter().filter(|s| s.distro.is_none()).count(), wsl_sources: found.iter().filter(|s| s.distro.is_some()).count() });
     *state.snapshot.lock().unwrap() = snapshot.clone();
@@ -583,6 +612,7 @@ pub fn run() {
         panel_hidden_at: Mutex::default(),
         dock_width: Mutex::new(160.0),
         usage_cache: Mutex::new(providers::load_cache()),
+        usage_history: Mutex::new(subscriptions::load()),
         monitor: monitoring::Monitor::new(settings::app_dir().expect("config directory").join("monitoring")).with_diagnostics(diagnostics.clone()),
         diagnostics: diagnostics.clone(),
         refresh_lock: tokio::sync::Mutex::new(()),
@@ -603,6 +633,8 @@ pub fn run() {
         ))
         .invoke_handler(tauri::generate_handler![
             get_usage,
+            get_subscriptions,
+            open_billing_page,
             export_diagnostics,
             record_frontend_error,
             refresh,

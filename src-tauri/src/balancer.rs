@@ -35,6 +35,8 @@ pub fn decide(
         let best = of_provider
             .iter()
             .filter(|a| !a.active)
+            // A plan the user is letting lapse is no target once its last paid day has passed.
+            .filter(|a| !crate::subscriptions::lapsed(settings, provider, &a.id, chrono::Utc::now()))
             .filter(|a| a.peak().is_some_and(|p| p < threshold - HYSTERESIS))
             .min_by(|a, b| {
                 let key = |x: &AccountUsage| x.peak().unwrap_or(f64::MAX);
@@ -58,7 +60,7 @@ mod tests {
             active, sources: vec![], windows: percent.map(|used_percent| UsageWindow {
                 kind: "session".into(), window_seconds: None, used_percent, resets_at: None,
             }).into_iter().collect(), credits: None, resets: vec![], error: None, monitor_error: None, stale: false,
-            fetched_at: Some(chrono::Utc::now()), monitor_connected: true,
+            fetched_at: Some(chrono::Utc::now()), monitor_connected: true, billing: Default::default(),
         }
     }
 
@@ -81,5 +83,17 @@ mod tests {
         let mut stale_current = current;
         stale_current.stale = true;
         assert!(decide(&[stale_current, target], &settings, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn a_lapsed_plan_is_never_a_switch_target() {
+        let mut settings = Settings::default();
+        settings.balancer.claude.auto = true;
+        let accounts = [account("active", true, Some(95.0)), account("inactive", false, Some(10.0))];
+        let plan = |days: i64| crate::settings::Subscription { cancel_after: Some((chrono::Utc::now() + chrono::Duration::days(days)).date_naive()), ..Default::default() };
+        settings.subscriptions.insert("claude:inactive".into(), plan(3));
+        assert_eq!(decide(&accounts, &settings, &HashMap::new()).len(), 1, "still paid for: use it up");
+        settings.subscriptions.insert("claude:inactive".into(), plan(-1));
+        assert!(decide(&accounts, &settings, &HashMap::new()).is_empty());
     }
 }
