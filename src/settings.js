@@ -256,6 +256,7 @@ function verdictLines(e) {
 }
 
 function renewalText(e) {
+  if (e.ends_at) return t("subEnds", { d: shortDate(e.ends_at) });
   if (!e.renewal) return e.plan_kind === "personal" ? t("subRenewUnknown") : "";
   // An entered billing day is a calendar day; the others are moments.
   const when = e.renewal.source === "entered" ? shortDay(e.renewal.at) : shortDate(e.renewal.at);
@@ -266,6 +267,7 @@ function renewalText(e) {
 
 function adviceText(e) {
   const a = e.assessment;
+  if (e.ends_at) return t("subAdviceEnding", { d: shortDate(e.ends_at) });
   if (e.cancel_after) return t("subLapsing", { d: shortDay(e.cancel_after) });
   if (e.plan_kind !== "personal") return "";
   if (a.verdict === "unused") return t(e.renewal ? "subAdviceUnused" : "subAdviceUnusedNoDate", { d: e.renewal ? (e.renewal.source === "entered" ? shortDay : shortDate)(e.renewal.at) : "" });
@@ -295,7 +297,7 @@ function subscriptionRow(e) {
         <small>
           ${e.active ? `<em class="chip live">${t("inUse")}</em>` : ""}
           ${e.plan ? `<em class="chip">${esc(e.plan)}</em>` : ""}
-          ${e.cancel_after ? `<em class="chip">${t("chipLapsing")}</em>` : ""}
+          ${e.ends_at ? `<em class="chip">${t("chipCancelled")}</em>` : e.cancel_after ? `<em class="chip">${t("chipLapsing")}</em>` : ""}
           <em class="chip verdict ${VERDICT_TONE[a.verdict]}">${t(`subVerdict_${a.verdict}`)}</em>
         </small>
       </div>
@@ -309,9 +311,11 @@ function subscriptionRow(e) {
         ${providerDate ? `<small>${esc(providerDate)}</small>` : ""}
         ${kindNote ? `<small>${esc(kindNote)}</small>` : ""}
         ${e.store_billed ? `<small>${t("subStoreBilled")}</small>` : ""}
+        ${e.delinquent ? `<small class="advice">${t("subDelinquent")}</small>` : ""}
         ${advice ? `<small class="advice">${esc(advice)}</small>` : ""}
         ${paid ? `<div class="plan-fields">
-          <label>${t("subBillingDay")} <input type="number" min="1" max="31" step="1" data-sub-day="${esc(key)}" value="${prefs.billing_day ?? ""}" placeholder="—" /></label>
+          <label>${t("subNextBilling")} <input type="date" data-sub-date="${esc(key)}" value="${e.renewal ? e.renewal.at.slice(0, 10) : ""}" title="${t("subCorrectHint")}" /></label>
+          ${prefs.next_billing || prefs.billing_day ? `<button class="link" data-sub-reset="${esc(key)}">${t("subResetDate")}</button>` : ""}
           <label>${t("subMonthlyCost")} <input type="number" min="0" max="10000" step="0.01" data-sub-cost="${esc(key)}" value="${prefs.monthly_cost ?? ""}" placeholder="${e.monthly_cost ?? "—"}" /></label>
           <label class="lapse"><input type="checkbox" data-sub-lapse="${esc(key)}" data-until="${esc(e.renewal?.at ?? "")}" ${e.cancel_after ? "checked" : ""} /> ${t("subLettingLapse")}</label>
         </div>` : ""}
@@ -368,15 +372,17 @@ function setPlan(key, change) {
 }
 
 $("subscriptions").addEventListener("click", async (e) => {
+  const reset = e.target.closest("[data-sub-reset]");
+  if (reset) { setPlan(reset.dataset.subReset, { next_billing: null, billing_day: null }); return; }
   const billing = e.target.closest("[data-billing]");
   if (!billing) return;
   try { await invoke("open_billing_page", { provider: billing.dataset.billing }); } catch (err) { alert(String(err)); }
 });
 $("subscriptions").addEventListener("change", (e) => {
   const el = e.target;
-  if (el.dataset.subDay != null) {
-    const day = Math.round(Number(el.value));
-    setPlan(el.dataset.subDay, { billing_day: el.value && day >= 1 && day <= 31 ? day : null });
+  if (el.dataset.subDate != null) {
+    // A corrected date replaces any older billing-day override.
+    setPlan(el.dataset.subDate, { next_billing: /^\d{4}-\d{2}-\d{2}$/.test(el.value) ? el.value : null, billing_day: null });
   } else if (el.dataset.subCost != null) {
     const cost = Number(el.value);
     setPlan(el.dataset.subCost, { monthly_cost: el.value && cost >= 0 && cost <= 10000 ? Math.round(cost * 100) / 100 : null });

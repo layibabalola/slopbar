@@ -80,6 +80,8 @@ impl Balancer {
 pub struct Subscription {
     /// Day of the month the plan renews, when the user knows it better than the token does.
     pub billing_day: Option<u8>,
+    /// A billing date the user corrected; later renewals count on from it by the plan's period.
+    pub next_billing: Option<chrono::NaiveDate>,
     /// What the user pays per month, overriding the list price.
     pub monthly_cost: Option<f64>,
     /// The user is letting the plan lapse: its last paid day. Afterwards automatic switching
@@ -162,7 +164,7 @@ pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
 const PATCHABLE: [&str; 9] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions"];
 
-const SUBSCRIPTION_FIELDS: [&str; 3] = ["billing_day", "monthly_cost", "cancel_after"];
+const SUBSCRIPTION_FIELDS: [&str; 4] = ["billing_day", "next_billing", "monthly_cost", "cancel_after"];
 
 /// Applies an RFC 7386 merge patch from an agent to `current`. Only produces settings the
 /// Settings window could: unknown or internal fields, wrong types and out-of-range values are
@@ -267,7 +269,9 @@ mod patch_tests {
         assert!(!next.aliases.contains_key("claude:a"), "null removes an alias");
         assert_eq!(next.last_version.as_deref(), Some("0.1.0"));
         let planned = patched(&next, &json!({ "subscriptions": { "claude:a": { "billing_day": 3, "monthly_cost": 100, "cancel_after": "2026-11-02" } } }), false).unwrap();
-        assert_eq!(planned.subscriptions["claude:a"], Subscription { billing_day: Some(3), monthly_cost: Some(100.0), cancel_after: chrono::NaiveDate::from_ymd_opt(2026, 11, 2) });
+        assert_eq!(planned.subscriptions["claude:a"], Subscription { billing_day: Some(3), monthly_cost: Some(100.0), cancel_after: chrono::NaiveDate::from_ymd_opt(2026, 11, 2), ..Default::default() });
+        let corrected = patched(&planned, &json!({ "subscriptions": { "claude:a": { "next_billing": "2026-11-07" } } }), false).unwrap();
+        assert_eq!(corrected.subscriptions["claude:a"].next_billing, chrono::NaiveDate::from_ymd_opt(2026, 11, 7));
         let cleared = patched(&planned, &json!({ "subscriptions": { "claude:a": { "billing_day": null, "monthly_cost": null, "cancel_after": null } } }), false).unwrap();
         assert!(cleared.subscriptions.is_empty(), "an emptied plan is dropped");
         let partial = patched(&planned, &json!({ "subscriptions": { "claude:a": { "billing_day": 9 } } }), false).unwrap();

@@ -45,9 +45,11 @@ pub struct AccountUsage {
     pub billing: BillingHints,
 }
 
-/// Plan and billing facts the saved login carries. None of them is a promise: token claims are
-/// only as current as the token, so the report labels every date with where it came from.
+/// Plan and billing facts from the saved login and, when SlopBar asked the provider, its own
+/// account record. None of them is a promise: token claims are only as current as the token, so
+/// the report labels every date with where it came from.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct BillingHints {
     /// Claude's rate-limit tier ("default_claude_max_20x"), which tells Max 5x from 20x.
     pub tier: Option<String>,
@@ -58,6 +60,27 @@ pub struct BillingHints {
     /// Codex: the end of the paid period, as of `checked_at`.
     pub active_until: Option<DateTime<Utc>>,
     pub checked_at: Option<DateTime<Utc>>,
+    /// Codex's account record: the next charge, and the day a cancelled plan ends.
+    pub renews_at: Option<DateTime<Utc>>,
+    pub cancels_at: Option<DateTime<Utc>>,
+    pub will_renew: Option<bool>,
+    /// A payment failed and the provider is waiting for it.
+    pub delinquent: Option<bool>,
+    /// "monthly" or "yearly".
+    pub billing_period: Option<String>,
+    /// Claude's organization status ("active").
+    pub status: Option<String>,
+    /// When SlopBar last read the provider's account record (for the fields above).
+    pub fetched_at: Option<DateTime<Utc>>,
+}
+
+impl BillingHints {
+    /// These hints with every field the provider's own record answered taking precedence.
+    pub fn overlay(mut self, provider: &BillingHints) -> BillingHints {
+        macro_rules! take { ($($f:ident),*) => { $( if provider.$f.is_some() { self.$f = provider.$f.clone(); } )* } }
+        take!(tier, billing_type, started_at, active_until, checked_at, renews_at, cancels_at, will_renew, delinquent, billing_period, status, fetched_at);
+        self
+    }
 }
 
 impl AccountUsage {

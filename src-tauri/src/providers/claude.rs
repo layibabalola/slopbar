@@ -24,15 +24,30 @@ struct Window {
 pub struct ClaudeUsage {
     pub windows: Vec<UsageWindow>,
     pub resets: Vec<ResetGrant>,
+    pub billing: Option<crate::model::BillingHints>,
+}
+
+/// The plan facts in the profile: when the subscription started, its status and tier. Claude
+/// exposes no renewal date or cancellation to this token.
+fn billing(raw: &Value) -> crate::model::BillingHints {
+    let org = &raw["organization"];
+    let text = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(String::from);
+    crate::model::BillingHints {
+        tier: text(&org["rate_limit_tier"]),
+        billing_type: text(&org["billing_type"]),
+        started_at: org["subscription_created_at"].as_str().and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|t| t.with_timezone(&Utc)),
+        status: text(&org["subscription_status"]),
+        fetched_at: Some(Utc::now()),
+        ..Default::default()
+    }
 }
 
 /// Fetches the usage windows, or an error code (see `model::AccountUsage::error`).
 pub async fn fetch(client: &reqwest::Client, token: &str, slot: &crate::accounts::Slot, observe: &super::evidence::Observer<'_>) -> Result<ClaudeUsage, String> {
-    // Read-only identity evidence once per account per app run, using the same
+    // Read-only identity evidence and plan facts every twelve hours per account, using the same
     // access token the monitor supplied. Never refresh, replace or persist a login here.
-    static CHECKED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
-    let first = CHECKED.get_or_init(Default::default).lock().unwrap().insert(slot.id.clone());
-    if first {
+    let mut plan = None;
+    if super::billing_due(&format!("claude:{}", slot.id)) {
         let response = client.get("https://api.anthropic.com/api/oauth/profile")
             .bearer_auth(token).header("anthropic-beta", "oauth-2025-04-20").send().await;
         match response {
@@ -44,7 +59,7 @@ pub async fn fetch(client: &reqwest::Client, token: &str, slot: &crate::accounts
                 }
                 if resp.status().is_success() {
                     match resp.json::<Value>().await {
-                        Ok(raw) => observe(super::evidence::profile(status, &raw, slot)),
+                        Ok(raw) => { plan = Some(billing(&raw)); observe(super::evidence::profile(status, &raw, slot)) }
                         Err(_) => observe(super::evidence::Evidence::outcome(super::evidence::Endpoint::ClaudeProfile, Some(status))),
                     }
                 } else { observe(super::evidence::Evidence::outcome(super::evidence::Endpoint::ClaudeProfile, Some(status))); }
@@ -94,7 +109,7 @@ pub async fn fetch(client: &reqwest::Client, token: &str, slot: &crate::accounts
             })
         })
         .collect();
-    Ok(ClaudeUsage { windows, resets })
+    Ok(ClaudeUsage { windows, resets, billing: plan })
 }
 
 /// A field under either of its spellings (the API is snake_case; be lenient).

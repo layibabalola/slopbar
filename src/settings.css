@@ -284,7 +284,13 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
   width: 84px; height: 28px; padding: 0 8px; font: inherit; color: var(--text);
   background: var(--control); border: 1px solid var(--control-stroke); border-bottom-color: var(--control-stroke-bottom); border-radius: 4px;
 }
-.plan-fields input[type="number"]:focus { outline: none; border-bottom: 2px solid var(--accent); }
+.plan-fields input[type="number"]:focus, .plan-fields input[type="date"]:focus { outline: none; border-bottom: 2px solid var(--accent); }
+.plan-fields input[type="date"] {
+  height: 28px; padding: 0 8px; font: inherit; color: var(--text); color-scheme: light dark;
+  background: var(--control); border: 1px solid var(--control-stroke); border-bottom-color: var(--control-stroke-bottom); border-radius: 4px;
+}
+.plan-fields .link { border: 0; background: none; padding: 0; color: var(--accent); cursor: pointer; }
+.plan-fields .link:hover { text-decoration: underline; }
 @media (max-width: 900px) {
   .account { grid-template-columns: 32px minmax(0, 1fr) 90px auto 20px; gap: 8px; }
   .account .meter { width: 90px; }

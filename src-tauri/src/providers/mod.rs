@@ -26,6 +26,8 @@ pub struct Cached {
     blocked_until: Option<DateTime<Utc>>,
     error: Option<String>,
     monitor_error: Option<String>,
+    /// The provider's own billing record, last read at most a few times a day.
+    billing: Option<crate::model::BillingHints>,
     #[serde(skip)]
     verified: bool,
 }
@@ -117,9 +119,11 @@ pub async fn fetch_all(
             };
             let entry = cache.entry(monitoring::key(slot)).or_default();
             match result {
-                Some(Ok(Fetched { windows, credits, resets, monitor_error })) => {
+                Some(Ok(Fetched { windows, credits, resets, monitor_error, billing })) => {
+                    // Billing is read less often than usage: keep the last record between reads.
+                    let billing = billing.or_else(|| entry.billing.take());
                     *entry = Cached { windows, credits, resets, at: Some(Utc::now()),
-                        blocked_until: None, error: None, monitor_error, verified: true };
+                        blocked_until: None, error: None, monitor_error, billing, verified: true };
                 }
                 Some(Err(err)) => {
                     let backoff = err.strip_prefix("rate_limited:").and_then(|s| s.parse::<i64>().ok())
@@ -138,12 +142,24 @@ pub async fn fetch_all(
             acc.stale = !entry.verified || entry.error.is_some();
             acc.error = entry.error.clone();
             acc.monitor_error = entry.monitor_error.clone();
+            if let Some(b) = &entry.billing { acc.billing = acc.billing.clone().overlay(b); }
             acc
         })
         .collect();
     // A stable order: switching accounts must not reshuffle the list.
     out.sort_by_key(|a| (a.provider != Provider::Claude, a.email.clone(), a.id.clone()));
     out
+}
+
+/// Whether an account's billing record is due for another read: at most every twelve hours per
+/// account and app run, since it changes about once a month.
+pub(crate) fn billing_due(key: &str) -> bool {
+    use std::time::{Duration, Instant};
+    static LAST: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Instant>>> = std::sync::OnceLock::new();
+    let mut last = LAST.get_or_init(Default::default).lock().unwrap();
+    let due = last.get(key).map_or(true, |t| t.elapsed() >= Duration::from_secs(12 * 3600));
+    if due { last.insert(key.to_string(), Instant::now()); }
+    due
 }
 
 pub fn alias_key(provider: Provider, id: &str) -> String {
@@ -155,6 +171,7 @@ struct Fetched {
     credits: Option<String>,
     resets: Vec<ResetGrant>,
     monitor_error: Option<String>,
+    billing: Option<crate::model::BillingHints>,
 }
 
 trait Usage {
@@ -232,9 +249,9 @@ async fn observed_usage(usage: &impl Usage, monitor: &Monitor, slot: &Slot, toke
 async fn fetch_token(client: &reqwest::Client, slot: &Slot, provider: Provider, token: &str, account: Option<&str>, observe: &evidence::Observer<'_>) -> Result<Fetched, String> {
     match provider {
         Provider::Claude => claude::fetch(client, token, slot, observe)
-            .await.map(|u| Fetched { windows: u.windows, credits: None, resets: u.resets, monitor_error: None }),
+            .await.map(|u| Fetched { windows: u.windows, credits: None, resets: u.resets, monitor_error: None, billing: u.billing }),
         Provider::Codex => codex::fetch(client, token, account, observe)
-            .await.map(|u| Fetched { windows: u.windows, credits: u.credits, resets: u.resets, monitor_error: None }),
+            .await.map(|u| Fetched { windows: u.windows, credits: u.credits, resets: u.resets, monitor_error: None, billing: u.billing }),
     }
 }
 
@@ -250,7 +267,7 @@ mod tests {
             async fn fetch(&self, _: Provider, token: &str, _: Option<&str>, _: &evidence::Observer<'_>) -> Result<Fetched, String> {
                 self.0.lock().unwrap().push(token.to_owned());
                 if token == "monitor-access" { return Err("bad_response".into()); }
-                Ok(Fetched { windows: observed(24.0).windows, credits: None, resets: vec![], monitor_error: None })
+                Ok(Fetched { windows: observed(24.0).windows, credits: None, resets: vec![], monitor_error: None, billing: None })
             }
         }
         let dir = TempDir::new();
@@ -289,7 +306,7 @@ mod tests {
         impl Usage for Observed {
             async fn fetch(&self, _: Provider, token: &str, _: Option<&str>, _: &evidence::Observer<'_>) -> Result<Fetched, String> {
                 self.0.lock().unwrap().push(token.to_owned());
-                Ok(Fetched { windows: observed(24.0).windows, credits: None, resets: vec![], monitor_error: None })
+                Ok(Fetched { windows: observed(24.0).windows, credits: None, resets: vec![], monitor_error: None, billing: None })
             }
         }
         for active in [false, true] {

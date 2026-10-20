@@ -332,23 +332,42 @@ pub fn list_price(acc: &AccountUsage) -> Option<f64> {
     })
 }
 
-/// The next renewal after `now`: the user's billing day first, then the provider's own end of
-/// period while it is still ahead, then a monthly count from the last known date.
-pub fn next_renewal(acc: &AccountUsage, billing_day: Option<u8>, now: DateTime<Utc>) -> Option<Renewal> {
-    if let Some(day) = billing_day.filter(|d| (1..=31).contains(d)) {
+/// The next renewal after `now`: the user's billing day first, then the provider's own next
+/// charge (Codex's account record), then the end of the paid period while it is still ahead,
+/// then a monthly count from the last known date. A plan set to cancel has no renewal.
+pub fn next_renewal(acc: &AccountUsage, prefs: &crate::settings::Subscription, now: DateTime<Utc>) -> Option<Renewal> {
+    if ends_at(acc, now).is_some() { return None; }
+    if let Some(date) = prefs.next_billing {
+        // A corrected date stays right for later periods too: count on from it.
+        let step = Months::new(if matches!(acc.billing.billing_period.as_deref(), Some("yearly" | "annual" | "year")) { 12 } else { 1 });
+        let mut d = date;
+        while d < now.date_naive() { d = d.checked_add_months(step)?; }
+        return Some(Renewal { at: Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0)?), source: DateSource::Entered });
+    }
+    if let Some(day) = prefs.billing_day.filter(|d| (1..=31).contains(d)) {
         return Some(Renewal { at: next_day_of_month(day, now)?, source: DateSource::Entered });
     }
     let b = &acc.billing;
+    if let Some(at) = b.renews_at.filter(|t| *t > now) {
+        return Some(Renewal { at, source: DateSource::Provider });
+    }
     if let Some(until) = b.active_until.filter(|t| *t > now) {
         return Some(Renewal { at: until, source: DateSource::Provider });
     }
-    let anchor = b.active_until.or(b.started_at)?;
+    let anchor = b.renews_at.or(b.active_until).or(b.started_at)?;
     let mut at = anchor;
     for months in 1..=240u32 {
         if at > now { break; }
         at = anchor.checked_add_months(Months::new(months))?;
     }
     (at > now).then_some(Renewal { at, source: DateSource::Estimated })
+}
+
+/// When a plan the provider says will not renew stops being paid for.
+pub fn ends_at(acc: &AccountUsage, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let b = &acc.billing;
+    let ending = b.cancels_at.is_some() || b.will_renew == Some(false);
+    ending.then(|| b.cancels_at.or(b.active_until).or(b.renews_at)).flatten().filter(|t| *t > now)
 }
 
 fn next_day_of_month(day: u8, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
@@ -407,6 +426,10 @@ pub struct Entry {
     /// The cost came from the user rather than the list price.
     pub cost_entered: bool,
     pub cancel_after: Option<NaiveDate>,
+    /// The provider says this plan is cancelled and ends then: it will not charge again.
+    pub ends_at: Option<DateTime<Utc>>,
+    /// A payment failed and the provider is waiting for it.
+    pub delinquent: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -450,13 +473,15 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, now: 
             this_week: this_week(acc, now),
             assessment: assess(h, now),
             days_tracked: h.first_seen.map_or(0, |t| (now - t).num_days().max(0)),
-            renewal: if paid { next_renewal(acc, prefs.billing_day, now) } else { None },
+            renewal: if paid { next_renewal(acc, &prefs, now) } else { None },
             provider_until: acc.billing.active_until,
             provider_checked: acc.billing.checked_at,
             store_billed: acc.billing.billing_type.as_deref().is_some_and(|t| t.contains("apple") || t.contains("google") || t.contains("app_store") || t.contains("play")),
             cost_entered: prefs.monthly_cost.is_some(),
             monthly_cost,
             cancel_after: prefs.cancel_after,
+            ends_at: if paid { ends_at(acc, now) } else { None },
+            delinquent: acc.billing.delinquent == Some(true),
         }
     }).collect();
     let providers = Provider::ALL.into_iter().filter(|p| accounts.iter().any(|a| a.provider == *p)).map(|provider| {
@@ -468,7 +493,8 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, now: 
             unused: paid.iter().filter(|a| a.assessment.verdict == Verdict::Unused).count(),
             monthly_total: paid.iter().filter_map(|a| a.monthly_cost).sum(),
             unpriced: paid.iter().filter(|a| a.monthly_cost.is_none()).count(),
-            possible_savings: paid.iter().filter(|a| a.assessment.renew_wasteful).filter_map(|a| a.monthly_cost).sum(),
+            // A plan already cancelled saves nothing more.
+            possible_savings: paid.iter().filter(|a| a.assessment.renew_wasteful && a.ends_at.is_none()).filter_map(|a| a.monthly_cost).sum(),
         }
     }).collect();
     Report { accounts, providers, generated_at: now }
@@ -497,6 +523,7 @@ mod tests {
     use chrono::Duration;
 
     fn days(n: i64) -> Duration { Duration::days(n) }
+    fn day(billing_day: Option<u8>) -> crate::settings::Subscription { crate::settings::Subscription { billing_day, ..Default::default() } }
 
     fn at(s: &str) -> DateTime<Utc> { DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc) }
 
@@ -688,21 +715,62 @@ mod tests {
     fn renewal_prefers_the_billing_day_then_the_provider_then_an_estimate() {
         let now = at("2026-10-20T12:00:00Z");
         let mut acc = reading("weekly", 0.0, now);
-        assert!(next_renewal(&acc, None, now).is_none());
+        assert!(next_renewal(&acc, &day(None), now).is_none());
         acc.billing.started_at = Some(at("2026-08-03T09:00:00Z"));
-        let r = next_renewal(&acc, None, now).unwrap();
+        let r = next_renewal(&acc, &day(None), now).unwrap();
         assert_eq!((r.at, r.source), (at("2026-11-03T09:00:00Z"), DateSource::Estimated));
         acc.billing.active_until = Some(at("2026-10-28T00:00:00Z"));
-        assert_eq!(next_renewal(&acc, None, now).unwrap().source, DateSource::Provider);
+        assert_eq!(next_renewal(&acc, &day(None), now).unwrap().source, DateSource::Provider);
         // A provider date that has passed is stale: count on from it, labelled as an estimate.
         acc.billing.active_until = Some(at("2026-10-18T21:26:13Z"));
-        let r = next_renewal(&acc, None, now).unwrap();
+        let r = next_renewal(&acc, &day(None), now).unwrap();
         assert_eq!((r.at, r.source), (at("2026-11-18T21:26:13Z"), DateSource::Estimated));
-        let r = next_renewal(&acc, Some(31), now).unwrap();
+        let r = next_renewal(&acc, &day(Some(31)), now).unwrap();
         assert_eq!((r.at, r.source), (at("2026-10-31T00:00:00Z"), DateSource::Entered));
-        assert_eq!(next_renewal(&acc, Some(5), now).unwrap().at, at("2026-11-05T00:00:00Z"));
-        assert_eq!(next_renewal(&acc, Some(20), now).unwrap().at, at("2026-11-20T00:00:00Z"), "today's billing has passed");
+        assert_eq!(next_renewal(&acc, &day(Some(5)), now).unwrap().at, at("2026-11-05T00:00:00Z"));
+        assert_eq!(next_renewal(&acc, &day(Some(20)), now).unwrap().at, at("2026-11-20T00:00:00Z"), "today's billing has passed");
         assert_eq!(next_day_of_month(31, at("2027-02-10T00:00:00Z")).unwrap(), at("2027-02-28T00:00:00Z"));
+    }
+
+    #[test]
+    fn a_corrected_date_wins_and_rolls_on_by_the_plan_period() {
+        let now = at("2026-10-20T12:00:00Z");
+        let mut acc = reading("weekly", 0.0, now);
+        acc.billing.renews_at = Some(at("2026-11-18T21:26:13Z"));
+        let fix = |d: &str| crate::settings::Subscription { next_billing: Some(d.parse().unwrap()), ..Default::default() };
+        let r = next_renewal(&acc, &fix("2026-11-07"), now).unwrap();
+        assert_eq!((r.at, r.source), (at("2026-11-07T00:00:00Z"), DateSource::Entered));
+        assert_eq!(next_renewal(&acc, &fix("2026-09-07"), now).unwrap().at, at("2026-11-07T00:00:00Z"), "a past correction counts on monthly");
+        assert_eq!(next_renewal(&acc, &fix("2026-10-20"), now).unwrap().at, at("2026-10-20T00:00:00Z"), "billing today");
+        acc.billing.billing_period = Some("yearly".into());
+        assert_eq!(next_renewal(&acc, &fix("2026-03-01"), now).unwrap().at, at("2027-03-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn codex_account_record_gives_the_next_charge_and_a_cancellation() {
+        let now = at("2026-10-20T12:00:00Z");
+        let mut acc = reading("weekly", 0.0, now);
+        acc.billing.active_until = Some(at("2026-10-18T21:26:13Z"));
+        let record = serde_json::json!({ "accounts": { "acct": {
+            "entitlement": { "renews_at": "2026-11-18T21:26:13+00:00", "expires_at": "2026-11-19T03:26:13+00:00", "cancels_at": null,
+                "is_delinquent": false, "billing_period": "monthly", "subscription_id": "secret" },
+            "last_active_subscription": { "will_renew": true, "cancellation_outcome": null } } } });
+        let b = crate::providers::codex::billing(&record, Some("acct")).unwrap();
+        acc.billing = acc.billing.clone().overlay(&b);
+        let r = next_renewal(&acc, &day(None), now).unwrap();
+        assert_eq!((r.at, r.source), (at("2026-11-18T21:26:13Z"), DateSource::Provider));
+        assert!(ends_at(&acc, now).is_none());
+        assert!(!serde_json::to_string(&acc.billing).unwrap().contains("secret"));
+        // The default entry answers when the token's account is not listed by id.
+        let fallback = serde_json::json!({ "accounts": { "default": record["accounts"]["acct"].clone() } });
+        assert!(crate::providers::codex::billing(&fallback, Some("other")).unwrap().renews_at.is_some());
+
+        let mut cancelled = record.clone();
+        cancelled["accounts"]["acct"]["entitlement"]["cancels_at"] = "2026-11-18T21:26:13+00:00".into();
+        cancelled["accounts"]["acct"]["last_active_subscription"]["will_renew"] = false.into();
+        acc.billing = acc.billing.clone().overlay(&crate::providers::codex::billing(&cancelled, Some("acct")).unwrap());
+        assert_eq!(ends_at(&acc, now), Some(at("2026-11-18T21:26:13Z")));
+        assert!(next_renewal(&acc, &day(Some(5)), now).is_none(), "a cancelled plan does not renew, whatever day was entered");
     }
 
     #[test]

@@ -44,6 +44,36 @@ pub struct CodexUsage {
     pub windows: Vec<UsageWindow>,
     pub credits: Option<String>,
     pub resets: Vec<ResetGrant>,
+    pub billing: Option<crate::model::BillingHints>,
+}
+
+/// The plan's billing from ChatGPT's account record: the next charge, a cancellation's end, and
+/// whether it renews. Only dates, flags and the period are kept; ids and offers are ignored.
+pub(crate) fn billing(raw: &serde_json::Value, account_id: Option<&str>) -> Option<crate::model::BillingHints> {
+    let accounts = &raw["accounts"];
+    let a = account_id.map(|id| &accounts[id]).filter(|a| a.is_object()).unwrap_or(&accounts["default"]);
+    if !a.is_object() { return None; }
+    let e = &a["entitlement"];
+    let last = &a["last_active_subscription"];
+    let date = |v: &serde_json::Value| v.as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|t| t.with_timezone(&Utc));
+    let cancelling = !last["cancellation_outcome"].is_null();
+    Some(crate::model::BillingHints {
+        renews_at: date(&e["renews_at"]),
+        cancels_at: date(&e["cancels_at"]),
+        active_until: date(&e["expires_at"]),
+        will_renew: last["will_renew"].as_bool().map(|w| w && !cancelling),
+        delinquent: e["is_delinquent"].as_bool(),
+        billing_period: e["billing_period"].as_str().map(String::from),
+        fetched_at: Some(Utc::now()),
+        ..Default::default()
+    })
+}
+
+async fn account_record(client: &reqwest::Client, token: &str, account_id: Option<&str>) -> Option<crate::model::BillingHints> {
+    let mut req = client.get("https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27").bearer_auth(token).header("User-Agent", "codex-cli");
+    if let Some(id) = account_id { req = req.header("ChatGPT-Account-Id", id); }
+    let raw: serde_json::Value = req.send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
+    billing(&raw, account_id)
 }
 
 #[derive(Deserialize)]
@@ -127,7 +157,12 @@ pub async fn fetch(client: &reqwest::Client, token: &str, account_id: Option<&st
     } else {
         vec![]
     };
-    Ok(CodexUsage { windows, credits, resets })
+    // Billing changes about once a month; read it a couple of times a day at most.
+    let billing = match account_id {
+        Some(id) if super::billing_due(&format!("codex:{id}")) => account_record(client, token, account_id).await,
+        _ => None,
+    };
+    Ok(CodexUsage { windows, credits, resets, billing })
 }
 
 /// Details of the account's reset credits: title and expiry of each available one.

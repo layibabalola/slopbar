@@ -64,6 +64,7 @@ fn settings_patch_schema() -> Value {
         "subscriptions": { "type": "object", "description": "Plan details keyed \"provider:id\" (ids from get_usage); null removes one. cancel_after is the last paid day of a plan the user is letting lapse: after it, automatic switching skips the account.",
             "additionalProperties": { "type": ["object", "null"], "additionalProperties": false, "properties": {
                 "billing_day": { "type": ["integer", "null"], "minimum": 1, "maximum": 31 },
+                "next_billing": { "type": ["string", "null"], "format": "date", "description": "A corrected next billing date; later renewals count on from it." },
                 "monthly_cost": { "type": ["number", "null"], "minimum": 0, "maximum": 10000 },
                 "cancel_after": { "type": ["string", "null"], "format": "date" },
             } } },
