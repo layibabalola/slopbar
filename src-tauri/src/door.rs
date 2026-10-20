@@ -48,11 +48,32 @@ pub enum Request {
     InstallUpdate,
     GetAppInfo,
     OpenSettings,
+    /// The visible text of a SlopBar window and a PNG of it, drawn off-screen when it is closed.
+    InspectWindow {
+        window: InspectTarget,
+        #[serde(default)]
+        page: Option<String>,
+        #[serde(default = "yes")]
+        screenshot: bool,
+    },
     /// Quit as the tray's Quit does.
     QuitApp,
     /// Quit, then start the installed executable again (picking up a new build).
     RestartApp,
 }
+
+/// Settings pages `InspectWindow` can show (its sidebar's `data-page` values).
+pub const SETTINGS_PAGES: [&str; 5] = ["accounts", "subscriptions", "notifications", "data", "general"];
+
+/// A window `InspectWindow` can look at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectTarget {
+    Settings,
+    Flyout,
+}
+
+fn yes() -> bool { true }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Reply {

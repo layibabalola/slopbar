@@ -1,4 +1,4 @@
-use crate::{accounts, balancer, diagnostics, dock, door, migrate, model, monitoring, notify, panel, providers, settings, sources, subscriptions, updates};
+use crate::{accounts, balancer, diagnostics, dock, door, inspect, migrate, model, monitoring, notify, panel, providers, settings, sources, subscriptions, updates};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -159,6 +159,10 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             "updates_enabled": updates_enabled(),
             "build": diagnostics::build_info(),
         })),
+        R::InspectWindow { window, page, screenshot } => {
+            let target = match window { door::InspectTarget::Settings => inspect::Target::Settings, door::InspectTarget::Flyout => inspect::Target::Flyout };
+            value(inspect::inspect(&app, target, page, screenshot).await?)
+        }
         R::OpenSettings => {
             show_settings(&app);
             Ok(serde_json::json!({ "opened": true }))

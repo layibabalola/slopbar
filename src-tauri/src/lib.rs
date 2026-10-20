@@ -18,6 +18,8 @@ pub use mcp::serve_stdio as serve_mcp;
 #[cfg(feature = "desktop")]
 mod dock;
 #[cfg(feature = "desktop")]
+mod inspect;
+#[cfg(feature = "desktop")]
 mod migrate;
 #[cfg(feature = "desktop")]
 mod notify;
