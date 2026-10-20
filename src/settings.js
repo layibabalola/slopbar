@@ -1,6 +1,6 @@
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
-import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetText, errorText, duration, shortDate, windowLabel, windowResetText, visibleResetWindows } from "./i18n.js";
+import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetText, errorText, duration, shortDate, shortDay, windowLabel, windowResetText, visibleResetWindows } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -257,7 +257,8 @@ function verdictLines(e) {
 
 function renewalText(e) {
   if (!e.renewal) return e.plan_kind === "personal" ? t("subRenewUnknown") : "";
-  const when = shortDate(e.renewal.at);
+  // An entered billing day is a calendar day; the others are moments.
+  const when = e.renewal.source === "entered" ? shortDay(e.renewal.at) : shortDate(e.renewal.at);
   const days = Math.max(0, Math.ceil((new Date(e.renewal.at) - Date.now()) / 86400000));
   const source = t({ entered: "subSourceEntered", provider: "subSourceProvider", estimated: "subSourceEstimated" }[e.renewal.source]);
   return t("subRenews", { d: when, n: days, source });
@@ -265,9 +266,9 @@ function renewalText(e) {
 
 function adviceText(e) {
   const a = e.assessment;
-  if (e.cancel_after) return t("subLapsing", { d: shortDate(e.cancel_after) });
+  if (e.cancel_after) return t("subLapsing", { d: shortDay(e.cancel_after) });
   if (e.plan_kind !== "personal") return "";
-  if (a.verdict === "unused") return t(e.renewal ? "subAdviceUnused" : "subAdviceUnusedNoDate", { d: e.renewal ? shortDate(e.renewal.at) : "" });
+  if (a.verdict === "unused") return t(e.renewal ? "subAdviceUnused" : "subAdviceUnusedNoDate", { d: e.renewal ? (e.renewal.source === "entered" ? shortDay : shortDate)(e.renewal.at) : "" });
   if (a.verdict === "underused") return t(a.renew_wasteful ? "subAdviceUnderused" : "subAdviceUnderusedMaybe");
   if (a.verdict === "exhausted_weekly") return t("subAdviceExhausted");
   return "";
@@ -350,10 +351,15 @@ function renderSubscriptions() {
 async function loadSubscriptions() {
   try { report = await invoke("get_subscriptions"); } catch { return; }
   // Don't rebuild the rows under someone typing a billing day or cost.
-  if (!document.activeElement?.closest?.(".plan-fields")) renderSubscriptions();
+  if (!editingPlan()) renderSubscriptions();
 }
 
+const editingPlan = () => !!document.activeElement?.closest?.(".plan-fields");
+
 function setPlan(key, change) {
+  // Show the change at once; the report reloads with the backend's view of it.
+  const entry = report?.accounts.find((e) => `${e.provider}:${e.id}` === key);
+  if (entry && "cancel_after" in change) entry.cancel_after = change.cancel_after;
   const next = { ...(settings.subscriptions?.[key] ?? {}), ...change };
   for (const k of Object.keys(next)) if (next[k] == null || next[k] === "") delete next[k];
   const subscriptions = { ...settings.subscriptions };
@@ -380,6 +386,8 @@ $("subscriptions").addEventListener("change", (e) => {
     setPlan(el.dataset.subLapse, { cancel_after: el.checked ? until.toISOString().slice(0, 10) : null });
   }
 });
+// Rows skipped while a plan was being edited catch up once focus leaves the fields.
+$("subscriptions").addEventListener("focusout", () => setTimeout(() => { if (!editingPlan()) renderSubscriptions(); }));
 listen("usage-updated", loadSubscriptions);
 
 // ---------------------------------------------------------------------------------------------
@@ -412,7 +420,7 @@ async function render() {
     $("update-status").textContent = t("manualUpdates");
   } else if (!$("check-updates").disabled) $("check-updates").textContent = latest ? t("installUpdate") : t("checkUpdates");
   renderAccounts();
-  renderSubscriptions();
+  if (!editingPlan()) renderSubscriptions();
 }
 
 async function update(patch) {

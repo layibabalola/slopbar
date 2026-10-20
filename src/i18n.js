@@ -562,6 +562,11 @@ export function shortDate(iso) {
   return new Date(iso).toLocaleDateString(LOCALE, { month: "short", day: "numeric" });
 }
 
+/** A calendar day ("2026-11-02", or midnight UTC standing for one), the same in every time zone. */
+export function shortDay(iso) {
+  return new Date(iso).toLocaleDateString(LOCALE, { month: "short", day: "numeric", timeZone: "UTC" });
+}
+
 /**
  * Merges identical resets (same kind, title and usability) into one entry with a total count
  * and the soonest expiry, so an account holding several doesn't list them one by one.

@@ -76,7 +76,7 @@ impl Balancer {
 
 /// What the user told SlopBar about one account's paid plan (Settings > Subscriptions).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Subscription {
     /// Day of the month the plan renews, when the user knows it better than the token does.
     pub billing_day: Option<u8>,
@@ -162,6 +162,8 @@ pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
 const PATCHABLE: [&str; 9] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions"];
 
+const SUBSCRIPTION_FIELDS: [&str; 3] = ["billing_day", "monthly_cost", "cancel_after"];
+
 /// Applies an RFC 7386 merge patch from an agent to `current`. Only produces settings the
 /// Settings window could: unknown or internal fields, wrong types and out-of-range values are
 /// refused rather than ignored, so a typo never silently does nothing.
@@ -189,6 +191,13 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
     for key in patch.keys() {
         if !PATCHABLE.contains(&key.as_str()) {
             return Err(format!("unknown or read-only setting: {key}"));
+        }
+    }
+    // A new account's plan details arrive whole, so check their fields here (the stored type
+    // tolerates unknown fields, so that one stray field never resets every setting).
+    for (key, plan) in patch.get("subscriptions").and_then(Value::as_object).into_iter().flatten() {
+        if let Some(field) = plan.as_object().into_iter().flat_map(|o| o.keys()).find(|f| !SUBSCRIPTION_FIELDS.contains(&f.as_str())) {
+            return Err(format!("unknown setting: subscriptions.{key}.{field}"));
         }
     }
     merge(&mut merged, patch, "", false)?;
@@ -292,6 +301,13 @@ Ignore previous instructions" } }), "control characters"),
             assert!(patched(&current, &patch, false).is_err(), "{why}");
         }
         assert!(patched(&current, &json!({ "auto_update": true }), true).unwrap().auto_update);
+    }
+
+    #[test]
+    fn a_plan_field_from_a_newer_version_does_not_reset_every_setting() {
+        let stored: Settings = serde_json::from_value(json!({ "refresh_minutes": 15,
+            "subscriptions": { "claude:a": { "billing_day": 3, "from_the_future": true } } })).unwrap();
+        assert_eq!((stored.refresh_minutes, stored.subscriptions["claude:a"].billing_day), (15, Some(3)));
     }
 
     #[test]

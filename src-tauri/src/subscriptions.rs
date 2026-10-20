@@ -30,6 +30,9 @@ const WEEK_SECONDS: i64 = 7 * 86400;
 /// Two readings of one window can report a reset a little apart.
 const SAME_WINDOW_SECONDS: i64 = 3600;
 const MAX_FILE: u64 = 4 << 20;
+/// An unused window's reset sits this close to a full week ahead.
+const IDLE_SLACK_SECONDS: i64 = 15 * 60;
+const FORGET_DAYS: i64 = 14;
 
 /// Weekly windows the history records. Session windows say nothing about a plan's value.
 const KINDS: [&str; 3] = ["weekly", "weekly_opus", "weekly_sonnet"];
@@ -46,6 +49,8 @@ pub struct History {
 #[serde(default)]
 pub struct AccountHistory {
     pub first_seen: Option<DateTime<Utc>>,
+    /// The last poll that listed this account, readable or not.
+    pub last_seen: Option<DateTime<Utc>>,
     pub windows: Vec<WindowRecord>,
 }
 
@@ -61,6 +66,11 @@ pub struct WindowRecord {
     /// Distinct clock hours and calendar days (UTC) with a fresh reading.
     pub hours: u16,
     pub days: u8,
+    /// An idle stretch rather than a provider window: an unused week has no fixed reset (Codex
+    /// reports one a full week ahead on every poll, Claude none), so it is cut into weeks from
+    /// when SlopBar started watching it, and ends early when usage begins.
+    #[serde(default)]
+    pub idle: bool,
 }
 
 impl WindowRecord {
@@ -98,35 +108,71 @@ pub fn observe(h: &mut AccountHistory, acc: &AccountUsage, now: DateTime<Utc>) {
         if !KINDS.contains(&w.kind.as_str()) { continue; }
         // Codex says how long a window is; only a true week is a weekly record.
         if w.window_seconds.is_some_and(|s| s != WEEK_SECONDS) { continue; }
+        let week_ahead = w.resets_at.map_or(true, |r| (r - now).num_seconds() > WEEK_SECONDS - IDLE_SLACK_SECONDS);
+        if w.used_percent <= 0.0 && week_ahead {
+            observe_idle(h, &w.kind, now);
+            continue;
+        }
         let Some(resets_at) = w.resets_at else { continue };
         // A window whose reset has passed belongs to the next poll's numbers, not this one.
         if resets_at <= now { continue; }
-        let current = h.windows.iter_mut().rev().find(|r| r.kind == w.kind
+        // Usage began: the idle stretch before it ends here.
+        if let Some(r) = h.windows.iter_mut().find(|r| r.kind == w.kind && r.idle && r.resets_at > now) {
+            r.resets_at = now;
+        }
+        let current = h.windows.iter_mut().rev().find(|r| r.kind == w.kind && !r.idle
             && (r.resets_at - resets_at).num_seconds().abs() < SAME_WINDOW_SECONDS);
         match current {
             Some(r) => {
-                if now.format("%Y%m%d%H").to_string() != r.last_obs.format("%Y%m%d%H").to_string() { r.hours = r.hours.saturating_add(1); }
-                if now.date_naive() != r.last_obs.date_naive() { r.days = r.days.saturating_add(1); }
+                seen(r, now);
                 r.peak = r.peak.max(w.used_percent);
-                r.last_obs = r.last_obs.max(now);
             }
-            None => {
-                h.windows.push(WindowRecord { kind: w.kind.clone(), resets_at, peak: w.used_percent,
-                    first_obs: now, last_obs: now, hours: 1, days: 1 });
-                let kept: Vec<usize> = h.windows.iter().enumerate().filter(|(_, r)| r.kind == w.kind).map(|(i, _)| i).collect();
-                if kept.len() > KEEP { h.windows.remove(kept[0]); }
-            }
+            None => push(h, WindowRecord { kind: w.kind.clone(), resets_at, peak: w.used_percent,
+                first_obs: now, last_obs: now, hours: 1, days: 1, idle: false }, now),
         }
     }
 }
 
-/// Records every account of a snapshot and forgets accounts that no longer exist.
+fn observe_idle(h: &mut AccountHistory, kind: &str, now: DateTime<Utc>) {
+    match h.windows.iter_mut().find(|r| r.kind == kind && r.resets_at > now) {
+        // An open window already holds this week: a 0% reading leaves its peak alone.
+        Some(r) => seen(r, now),
+        None => push(h, WindowRecord { kind: kind.into(), resets_at: now + chrono::Duration::seconds(WEEK_SECONDS),
+            peak: 0.0, first_obs: now, last_obs: now, hours: 1, days: 1, idle: true }, now),
+    }
+}
+
+fn seen(r: &mut WindowRecord, now: DateTime<Utc>) {
+    if now.format("%Y%m%d%H").to_string() != r.last_obs.format("%Y%m%d%H").to_string() { r.hours = r.hours.saturating_add(1); }
+    if now.date_naive() != r.last_obs.date_naive() { r.days = r.days.saturating_add(1); }
+    r.last_obs = r.last_obs.max(now);
+}
+
+/// Adds a record, then drops the oldest completed ones of its kind beyond `KEEP`. A window still
+/// open is never dropped.
+fn push(h: &mut AccountHistory, record: WindowRecord, now: DateTime<Utc>) {
+    let kind = record.kind.clone();
+    h.windows.push(record);
+    loop {
+        let done: Vec<usize> = h.windows.iter().enumerate().filter(|(_, r)| r.kind == kind && r.resets_at <= now).map(|(i, _)| i).collect();
+        let total = h.windows.iter().filter(|r| r.kind == kind).count();
+        if total <= KEEP || done.is_empty() { break; }
+        let oldest = *done.iter().min_by_key(|i| h.windows[**i].resets_at).unwrap();
+        h.windows.remove(oldest);
+    }
+}
+
+/// Records every account of a snapshot. An account that is no longer saved is forgotten only
+/// after `FORGET_DAYS` unseen: one unreadable login file must not erase weeks of history.
 pub fn record(history: &mut History, snapshot: &Snapshot, valid: &std::collections::HashSet<String>, now: DateTime<Utc>) {
     history.version = VERSION;
     for acc in &snapshot.accounts {
-        observe(history.accounts.entry(history_key(acc.provider, &acc.id)).or_default(), acc, now);
+        let h = history.accounts.entry(history_key(acc.provider, &acc.id)).or_default();
+        h.last_seen = Some(now);
+        observe(h, acc, now);
     }
-    history.accounts.retain(|k, _| valid.contains(k));
+    let cutoff = now - chrono::Duration::days(FORGET_DAYS);
+    history.accounts.retain(|k, h| valid.contains(k) || h.last_seen.is_some_and(|t| t > cutoff));
 }
 
 /// Same as `monitoring::key`, from a reading rather than a slot.
@@ -313,7 +359,7 @@ fn next_day_of_month(day: u8, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         Some(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?))
     };
     let this = on(now.year(), now.month())?;
-    if this.date_naive() >= now.date_naive() { return Some(this); }
+    if this > now { return Some(this); }
     let next = now.date_naive().with_day(1)?.checked_add_months(Months::new(1))?;
     on(next.year(), next.month())
 }
@@ -574,6 +620,43 @@ mod tests {
         assert_eq!(h.windows[0].peak, 40.0);
     }
 
+    /// Polls an idle account hourly for `hours` hours, the way each provider reports it.
+    fn idle_polls(h: &mut AccountHistory, start: DateTime<Utc>, hours: i64, codex: bool) {
+        for i in 0..hours {
+            let now = start + Duration::hours(i);
+            let mut acc = reading("weekly", 0.0, now + days(7));
+            if codex { acc.windows[0].window_seconds = Some(WEEK_SECONDS); } else { acc.windows[0].resets_at = None; }
+            observe(h, &acc, now);
+        }
+    }
+
+    #[test]
+    fn idle_weeks_are_recorded_and_judged_unused() {
+        for codex in [true, false] {
+            let mut h = AccountHistory::default();
+            let start = at("2026-09-01T00:00:00Z");
+            idle_polls(&mut h, start, 24 * 28, codex);
+            let now = start + days(28) + Duration::hours(1);
+            assert_eq!(h.windows.iter().filter(|r| r.resets_at <= now).count(), 4, "four idle weeks, not a record per poll");
+            let a = assess(&h, now);
+            assert_eq!((a.verdict, a.renew_wasteful), (Verdict::Unused, true));
+        }
+    }
+
+    #[test]
+    fn idle_polls_never_evict_real_weeks_and_usage_ends_the_idle_stretch() {
+        let (mut h, now) = weeks(&[90.0; 12], 100);
+        idle_polls(&mut h, now, 12, true);
+        // Twelve polls make one idle record, which replaces only the single oldest week.
+        assert_eq!(h.windows.iter().filter(|r| r.idle).count(), 1);
+        assert_eq!(h.windows.iter().filter(|r| !r.idle).count(), KEEP - 1, "idle polls do not churn real weeks out");
+        let later = now + Duration::hours(13);
+        observe(&mut h, &reading("weekly", 3.0, later + days(7)), later);
+        let idle = h.windows.iter().find(|r| r.idle).unwrap();
+        assert_eq!(idle.resets_at, later);
+        assert!(h.windows.iter().any(|r| !r.idle && r.resets_at > later && r.peak == 3.0));
+    }
+
     #[test]
     fn only_the_latest_weeks_are_kept() {
         let (h, _) = weeks(&[10.0; 13], 2);
@@ -595,8 +678,10 @@ mod tests {
         assert_eq!(load_from(&path).accounts["Claude:a1"].windows[0].peak, 42.0);
         std::fs::write(&path, br#"{"version":9,"accounts":{"x":{}}}"#).unwrap();
         assert!(load_from(&path).accounts.is_empty());
-        record(&mut history, &snapshot, &Default::default(), Utc::now());
-        assert!(history.accounts.is_empty(), "removed accounts are forgotten");
+        record(&mut history, &Snapshot::default(), &Default::default(), at("2026-09-10T00:00:00Z"));
+        assert_eq!(history.accounts.len(), 1, "a login missing for a while keeps its history");
+        record(&mut history, &Snapshot::default(), &Default::default(), at("2026-09-17T00:00:01Z"));
+        assert!(history.accounts.is_empty(), "removed accounts are forgotten after two weeks");
     }
 
     #[test]
@@ -616,7 +701,7 @@ mod tests {
         let r = next_renewal(&acc, Some(31), now).unwrap();
         assert_eq!((r.at, r.source), (at("2026-10-31T00:00:00Z"), DateSource::Entered));
         assert_eq!(next_renewal(&acc, Some(5), now).unwrap().at, at("2026-11-05T00:00:00Z"));
-        assert_eq!(next_renewal(&acc, Some(20), now).unwrap().at, at("2026-10-20T00:00:00Z"));
+        assert_eq!(next_renewal(&acc, Some(20), now).unwrap().at, at("2026-11-20T00:00:00Z"), "today's billing has passed");
         assert_eq!(next_day_of_month(31, at("2027-02-10T00:00:00Z")).unwrap(), at("2027-02-28T00:00:00Z"));
     }
 
