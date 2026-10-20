@@ -132,48 +132,70 @@ mod win {
         }
     }
 
+    pub enum Widgets {
+        /// Turned off, or the taskbar isn't there to ask.
+        Off,
+        /// There, but the taskbar is slid away (auto-hide); it comes back where it was.
+        Hidden,
+        At(Rect),
+    }
+
     /// Where the taskbar's Widgets (weather) button is. It is drawn inside the taskbar and has
-    /// no window of its own, so only UI Automation can see it. `None` when it is turned off.
-    /// The caller's thread must have initialized COM.
-    pub fn widgets_button() -> Option<Rect> {
+    /// no window of its own, so only UI Automation can see it. The caller's thread must have
+    /// initialized COM.
+    pub fn widgets_button() -> Widgets {
         use std::mem::ManuallyDrop;
         use windows::core::BSTR;
         use windows::Win32::Foundation::HWND as Hwnd;
         use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
         use windows::Win32::System::Variant::{VariantClear, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BSTR};
         use windows::Win32::UI::Accessibility::{
-            CUIAutomation, IUIAutomation, TreeScope_Descendants, UIA_AutomationIdPropertyId,
+            CUIAutomation, IUIAutomation, IUIAutomationElement, TreeScope_Children, UIA_AutomationIdPropertyId,
+            UIA_ClassNamePropertyId, UIA_PROPERTY_ID,
         };
         thread_local! {
             static UIA: Option<IUIAutomation> =
                 unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok() };
         }
-        let bar = unsafe { FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null()) };
-        if bar.is_null() {
-            return None;
-        }
-        UIA.with(|uia| unsafe {
-            let uia = uia.as_ref()?;
-            let root = uia.ElementFromHandle(Hwnd(bar)).ok()?;
-            let mut id = VARIANT {
+        /// The child of `parent` whose `property` is `value`. Children only: a deeper search
+        /// from the taskbar would also walk our own widget, and a UI Automation client walking a
+        /// WebView2 makes it build its whole accessibility tree.
+        unsafe fn child(
+            uia: &IUIAutomation,
+            parent: &IUIAutomationElement,
+            property: UIA_PROPERTY_ID,
+            value: &str,
+        ) -> Option<IUIAutomationElement> {
+            let mut v = VARIANT {
                 Anonymous: VARIANT_0 {
                     Anonymous: ManuallyDrop::new(VARIANT_0_0 {
                         vt: VT_BSTR,
-                        Anonymous: VARIANT_0_0_0 { bstrVal: ManuallyDrop::new(BSTR::from("WidgetsButton")) },
+                        Anonymous: VARIANT_0_0_0 { bstrVal: ManuallyDrop::new(BSTR::from(value)) },
                         ..Default::default()
                     }),
                 },
             };
-            let cond = uia.CreatePropertyCondition(UIA_AutomationIdPropertyId, &id);
-            let _ = VariantClear(&mut id);
-            let cond = cond.ok()?;
-            let button = root.FindFirst(TreeScope_Descendants, &cond).ok()?;
+            let cond = uia.CreatePropertyCondition(property, &v);
+            let _ = VariantClear(&mut v);
+            parent.FindFirst(TreeScope_Children, &cond.ok()?).ok()
+        }
+        let bar = unsafe { FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null()) };
+        if bar.is_null() {
+            return Widgets::Off;
+        }
+        let found = UIA.with(|uia| unsafe {
+            let uia = uia.as_ref()?;
+            let root = uia.ElementFromHandle(Hwnd(bar)).ok()?;
+            let site = child(uia, &root, UIA_ClassNamePropertyId, "Windows.UI.Input.InputSite.WindowClass")?;
+            let frame = child(uia, &site, UIA_AutomationIdPropertyId, "TaskbarFrame")?;
+            let button = child(uia, &frame, UIA_AutomationIdPropertyId, "WidgetsButton")?;
             if button.CurrentIsOffscreen().is_ok_and(|off| off.as_bool()) {
-                return None;
+                return Some(Widgets::Hidden);
             }
             let r = button.CurrentBoundingRectangle().ok()?;
-            (r.right > r.left).then_some(Rect { left: r.left, top: r.top, right: r.right, bottom: r.bottom })
-        })
+            (r.right > r.left).then_some(Widgets::At(Rect { left: r.left, top: r.top, right: r.right, bottom: r.bottom }))
+        });
+        found.unwrap_or(Widgets::Off)
     }
 
     pub fn init_com() {
@@ -296,8 +318,15 @@ mod win {
     pub fn fullscreen_monitor() -> Option<Rect> {
         None
     }
-    pub fn widgets_button() -> Option<Rect> {
-        None
+    pub enum Widgets {
+        Off,
+        #[allow(dead_code)]
+        Hidden,
+        #[allow(dead_code)]
+        At(Rect),
+    }
+    pub fn widgets_button() -> Widgets {
+        Widgets::Off
     }
     pub fn init_com() {}
     pub fn own_by_taskbar(_: ()) -> bool {
@@ -335,14 +364,20 @@ fn window(app: &AppHandle) -> Option<WebviewWindow> {
 /// The taskbar's Widgets button, as last seen by `watch_widgets`.
 static WIDGETS: Mutex<Option<Rect>> = Mutex::new(None);
 
-/// Looks for the Widgets button every couple of seconds. It moves when the weather text
-/// changes length or the user switches the taskbar alignment. A thread of its own, because UI
-/// Automation asks Explorer, which can be slow to answer, and docking must never wait on it.
+/// Looks for the Widgets button every second. It moves when the weather text changes length
+/// or the user switches the taskbar alignment. A thread of its own, because UI Automation asks
+/// Explorer, which can be slow to answer, and docking must never wait on it.
 fn watch_widgets() {
     win::init_com();
     loop {
-        *WIDGETS.lock().unwrap() = win::widgets_button();
-        std::thread::sleep(Duration::from_secs(2));
+        match win::widgets_button() {
+            win::Widgets::Off => *WIDGETS.lock().unwrap() = None,
+            win::Widgets::At(rect) => *WIDGETS.lock().unwrap() = Some(rect),
+            // Keep the last place, so the widget doesn't land on the weather as the taskbar
+            // slides back in.
+            win::Widgets::Hidden => {}
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
 
@@ -464,6 +499,18 @@ mod tests {
     #[test]
     fn ignores_widgets_at_the_far_left_of_a_centered_taskbar() {
         let weather = Rect { left: 0, top: 2328, right: 228, bottom: 2400 };
+        assert_eq!(dock_left(BAR, TRAY, Some(weather), 98), 3279 - 98 - GAP);
+    }
+
+    #[test]
+    fn steps_left_of_widgets_that_only_reach_into_its_spot() {
+        let weather = Rect { left: 3000, top: 2328, right: 3180, bottom: 2400 };
+        assert_eq!(dock_left(BAR, TRAY, Some(weather), 98), 3000 - 98 - GAP);
+    }
+
+    #[test]
+    fn stays_by_the_tray_when_widgets_leave_room() {
+        let weather = Rect { left: 2900, top: 2328, right: 3177, bottom: 2400 };
         assert_eq!(dock_left(BAR, TRAY, Some(weather), 98), 3279 - 98 - GAP);
     }
 
