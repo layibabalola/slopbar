@@ -149,8 +149,10 @@ pub async fn fetch_all(
             acc.monitor_error = entry.monitor_error.clone();
             if let Some(b) = &entry.billing { acc.billing = acc.billing.clone().overlay(b); }
             if let Some(p) = &acc.billing.plan_type { acc.plan = Some(p.clone()); }
-            // The account record names Pro 100 too (chatgptprolite), for when usage has not said.
-            else if acc.billing.plan_code.as_deref() == Some("chatgptprolite") { acc.plan = Some("prolite".into()); }
+            // The account record names the Pro tiers too, for when usage has not said.
+            else if let Some(tier) = match acc.billing.plan_code.as_deref() { Some("chatgptprolite") => Some("prolite"), Some("chatgptpromax") => Some("promax"), _ => None } {
+                acc.plan = Some(tier.into());
+            }
             acc
         })
         .collect();
