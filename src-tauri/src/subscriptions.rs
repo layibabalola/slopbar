@@ -514,7 +514,10 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
         let activity = local.and_then(|l| l.activity(&acc.id, now));
         let idle_now = idle_now(acc, now);
         let mut assessment = assess(h, now);
-        if paid && assessment.verdict == Verdict::InsufficientData && idle_now
+        // This PC's history cannot see other machines: an account another SlopBar reports in use,
+        // or whose usage rose while not in use here, is not called unused on local evidence.
+        let seen_elsewhere = !acc.remote.is_empty() || acc.used_outside;
+        if paid && assessment.verdict == Verdict::InsufficientData && idle_now && !seen_elsewhere
             && activity.as_ref().is_some_and(|a| a.days_idle.is_some_and(|d| d >= LOCAL_IDLE_DAYS)) {
             assessment.verdict = Verdict::Unused;
             assessment.confidence = Confidence::Low;
@@ -898,6 +901,11 @@ mod tests {
         assert_eq!((l.never_seen, l.days_idle, l.threads_28d), (true, Some(26), 0));
         let a = &idle.assessment;
         assert_eq!((a.verdict, a.basis, a.confidence, a.renew_wasteful), (Verdict::Unused, Basis::LocalCodex, Confidence::Low, true));
+        // The same quiet account, but its usage rose while not in use here: local history is blind.
+        let mut elsewhere = snapshot.clone();
+        elsewhere.accounts[0].used_outside = true;
+        let seen = report(&elsewhere, &History::default(), &Settings::default(), Some(&local), now);
+        assert_eq!((seen.accounts[0].assessment.verdict, seen.accounts[0].assessment.renew_wasteful), (Verdict::InsufficientData, false));
         // Ran here yesterday: not idle locally, however quiet the live week looks.
         assert_eq!(r.accounts[1].assessment.verdict, Verdict::InsufficientData);
         assert_eq!(r.accounts[1].local.as_ref().unwrap().threads_7d, 5);
