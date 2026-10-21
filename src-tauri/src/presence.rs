@@ -127,6 +127,10 @@ pub trait PresenceStore: Send + Sync {
 
 /// The store the settings choose, if sharing is on.
 pub fn store(settings: &crate::settings::Settings) -> Option<Box<dyn PresenceStore>> {
+    if let Some(remote) = &settings.presence_remote {
+        // A chosen remote never falls back to a folder: rclone missing means no sharing.
+        return crate::rclone::Rclone::open(remote).map(|s| Box::new(s) as Box<dyn PresenceStore>);
+    }
     settings.presence_folder.as_ref().map(|f| Box::new(SyncedFolder(PathBuf::from(f))) as Box<dyn PresenceStore>)
 }
 

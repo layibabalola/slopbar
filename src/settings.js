@@ -480,26 +480,35 @@ $("export-diagnostics").addEventListener("click", async () => {
   } catch { status.textContent = t("diagnosticsFailed"); }
   finally { button.disabled = false; }
 });
-// Sharing in-use status: off, a detected sync folder (OneDrive, Dropbox, iCloud Drive) or a typed one.
+// Sharing in-use status: off, a detected sync folder (OneDrive, Dropbox, Google Drive…), an rclone
+// remote (any cloud, no sync app needed) or a typed folder.
 let syncFolders = [];
+let rclone = { installed: true, remotes: [] };
 let presenceOther = false;
+const REMOTE = "rclone:";
 function renderPresence() {
-  const current = settings.presence_folder ?? "";
-  const known = syncFolders.some((f) => f.path === current);
+  const remote = settings.presence_remote ?? "";
+  const current = remote ? REMOTE + remote : settings.presence_folder ?? "";
+  const remotes = rclone.remotes.some((r) => r.name === remote) || !remote ? rclone.remotes : [...rclone.remotes, { name: remote, provider: "rclone" }];
+  const known = remote !== "" || syncFolders.some((f) => f.path === current);
   const other = presenceOther || (current !== "" && !known);
   $("presence").innerHTML = `<option value="">${t("presenceOff")}</option>`
     + syncFolders.map((f) => `<option value="${esc(f.path)}">${esc(f.name)} · ${esc(f.path)}</option>`).join("")
+    + remotes.map((r) => `<option value="${esc(REMOTE + r.name)}">${esc(t("presenceViaRclone", { provider: r.provider }))} · ${esc(r.name)}:</option>`).join("")
     + `<option value="__other__">${t("presenceOther")}</option>`;
   $("presence").value = other ? "__other__" : current;
   $("presence-custom").hidden = !other;
   $("presence-path").placeholder = t("presenceFolderPlaceholder");
   if (other && !known && document.activeElement !== $("presence-path")) $("presence-path").value = current;
+  $("presence-rclone-hint").hidden = rclone.installed;
 }
 $("presence").addEventListener("change", (e) => {
   $("presence-status").hidden = true;
-  presenceOther = e.target.value === "__other__";
+  const value = e.target.value;
+  presenceOther = value === "__other__";
   if (presenceOther) { renderPresence(); $("presence-path").focus(); return; }
-  update({ presence_folder: e.target.value || null });
+  if (value.startsWith(REMOTE)) update({ presence_remote: value.slice(REMOTE.length), presence_folder: null });
+  else update({ presence_folder: value || null, presence_remote: null });
 });
 async function savePresencePath() {
   const folder = $("presence-path").value.trim();
@@ -510,11 +519,12 @@ async function savePresencePath() {
     return;
   }
   $("presence-status").hidden = true;
-  update({ presence_folder: folder });
+  update({ presence_folder: folder, presence_remote: null });
 }
 $("presence-save").addEventListener("click", savePresencePath);
 $("presence-path").addEventListener("keydown", (e) => { if (e.key === "Enter") savePresencePath(); });
 invoke("sync_folders").then((folders) => { syncFolders = folders ?? []; if (settings) renderPresence(); }, () => {});
+invoke("rclone_remotes").then((found) => { rclone = found ?? rclone; if (settings) renderPresence(); }, () => {});
 
 for (const kind of ["usage", "resets", "switches"]) {
   $(`notify-${kind}`).addEventListener("change", (e) => update({ notifications: { ...settings.notifications, [kind]: e.target.checked } }));

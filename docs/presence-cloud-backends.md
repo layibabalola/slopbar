@@ -11,15 +11,64 @@ rules and the UI only see that trait.
 | Backend | Status | Needs |
 | --- | --- | --- |
 | `SyncedFolder`: any folder a sync client mirrors | Shipped | Nothing. Settings > Data detects OneDrive, Dropbox, Google Drive for desktop, iCloud Drive and Box, or takes a custom folder. |
-| `CloudApi(Dropbox)` | Stub, reports `not_configured` | A Dropbox app registered by the owner |
-| `CloudApi(GoogleDrive)` | Stub, reports `not_configured` | A Google Cloud OAuth client registered by the owner |
-| `CloudApi(OneDrive)` | Stub, reports `not_configured` | A Microsoft Entra app registered by the owner |
+| `Rclone`: any remote the user set up with `rclone config` | Shipped | rclone installed. **No app registration.** |
+| `CloudApi(Dropbox)` | Optional stub, reports `not_configured` | A Dropbox app registered by the owner |
+| `CloudApi(GoogleDrive)` | Optional stub, reports `not_configured` | A Google Cloud OAuth client registered by the owner |
+| `CloudApi(OneDrive)` | Optional stub, reports `not_configured` | A Microsoft Entra app registered by the owner |
 
-The API backends are for machines that have no sync client installed. Every backend stores
-records in an **app-private folder only**, so SlopBar never asks for access to the user's own
-files.
+Machines without a sync client should use rclone. The direct API backends below are
+**optional**: build them only if a sign-in inside SlopBar itself becomes worth registering apps
+for. Every API backend would store records in an **app-private folder only**, so SlopBar never
+asks for access to the user's own files.
 
 Google Docs is not a target. Presence records are JSON files, and Google Drive covers Docs users.
+
+## rclone: any cloud, no app registration (`src-tauri/src/rclone.rs`)
+
+The user connects their cloud once, outside SlopBar, with `rclone config`. That covers Dropbox,
+Google Drive, OneDrive, Box, pCloud, MEGA, S3, WebDAV, SFTP and the other rclone backends.
+rclone keeps its own config and tokens.
+
+- **Choosing a remote.** Settings > Data lists the remotes from `rclone listremotes --long` as
+  "Dropbox (via rclone)" and so on, next to the detected sync folders. That command prints only
+  names and backend types. SlopBar never runs `rclone config dump` or `config show`, and never
+  reads `rclone.conf`, so it never sees a token.
+- **When rclone is missing.** Settings shows a one-line hint: "Install rclone and run
+  `rclone config` to connect any cloud without a sync app."
+- **Where rclone is found.** On `PATH`, or in `%LOCALAPPDATA%\Microsoft\WinGet\Links`.
+- **Calls.** SlopBar runs only these, and only on `<remote>:SlopBar/presence`:
+  - `lsjson --files-only --no-mimetype` to list records;
+  - `cat <file>` to read each one;
+  - `rcat <id>.tmp`, then `moveto <id>.tmp <id>.json`, to write this machine's record
+    atomically.
+
+  A clean quit rewrites this machine's record with no accounts.
+- **Each call.** rclone runs with no window, `--ask-password=false` (it never waits on an
+  encrypted config's prompt), `--contimeout 10s --timeout 15s`, and a hard 20-second kill. Calls
+  run off the async runtime. rclone's stderr is discarded and its output is never logged.
+- **The setting.** `settings.json` stores only the remote's name, `presence_remote`. A chosen
+  remote takes precedence over `presence_folder`. A missing rclone means no sharing; it never
+  falls back to a folder.
+- **Tests.** Unit tests use a fake rclone, an injected `Runner`. Run the live check, which uses
+  only `SlopBar/presence` and removes its synthetic record afterwards, with:
+  `SLOPBAR_RCLONE_LIVE=<remote> cargo test --lib rclone_live -- --ignored`
+
+## Rejected: reusing browser sign-ins
+
+Reading the user's browser cookies to reach their cloud storage, or borrowing another app's OAuth
+client id, is ruled out:
+
+- **It is credential extraction.** Decrypting another program's session cookies is what
+  infostealer malware does. SlopBar would hold full-account sessions it has no business holding,
+  far beyond one app folder.
+- **Chrome app-bound encryption.** Since Chrome 127, Chromium browsers on Windows bind cookie
+  encryption to the browser itself. Reading the cookies means defeating that protection.
+- **Provider terms.** Dropbox, Google and Microsoft require API access through the app's own
+  registered client. Session-cookie scraping and impersonating another client break their terms
+  and get accounts flagged.
+
+rclone avoids all three. The user signs in through rclone's own OAuth flow, rclone uses its own
+registered clients, and SlopBar never touches the credentials.
 
 ## Rules every API backend follows
 
@@ -42,7 +91,7 @@ Google Docs is not a target. Presence records are JSON files, and Google Drive c
    client type. Neither is confidential for installed apps.
 2. Implement `list` and `write` against the provider's API, as described below.
 3. Add `presence_cloud: Option<CloudProvider>` to `Settings`. Have `presence::store` return
-   `CloudApi` when it is set, and the synced folder otherwise.
+   `CloudApi` when it is set, next to the existing rclone and synced-folder choices.
 4. In Settings > Data, offer "Connect Dropbox…", "Connect Google Drive…" and "Connect OneDrive…"
    next to the detected folders. Run the OAuth flow, store the tokens as above, then refresh.
 

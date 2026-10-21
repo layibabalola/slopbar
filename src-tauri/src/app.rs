@@ -405,6 +405,18 @@ async fn sync_folders() -> Vec<presence::SyncFolder> {
     tauri::async_runtime::spawn_blocking(presence::sync_folders).await.unwrap_or_default()
 }
 
+#[derive(Serialize)]
+struct RcloneRemotes { installed: bool, remotes: Vec<crate::rclone::Remote> }
+
+/// The user's rclone remotes (names and types only), for sharing in-use status without a sync app.
+#[tauri::command]
+async fn rclone_remotes() -> RcloneRemotes {
+    tauri::async_runtime::spawn_blocking(|| match crate::rclone::find() {
+        Some(exe) => RcloneRemotes { installed: true, remotes: crate::rclone::remotes(&crate::rclone::Cli(exe)) },
+        None => RcloneRemotes { installed: false, remotes: vec![] },
+    }).await.unwrap_or(RcloneRemotes { installed: false, remotes: vec![] })
+}
+
 /// Whether a typed folder can hold presence files.
 #[tauri::command]
 fn check_presence_folder(folder: String) -> bool {
@@ -430,7 +442,7 @@ async fn store_settings(app: &AppHandle, settings: Settings) -> Result<(), Strin
     apply_settings(app);
     let providers_changed = previous.providers.claude != settings.providers.claude
         || previous.providers.codex != settings.providers.codex;
-    let presence_changed = previous.presence_folder != settings.presence_folder;
+    let presence_changed = previous.presence_folder != settings.presence_folder || previous.presence_remote != settings.presence_remote;
     if presence_changed {
         // The old folder's other machines should not keep seeing this one as signed in.
         if let Some(old) = presence::store(&previous) {
@@ -706,6 +718,7 @@ pub fn run() {
             get_settings,
             sync_folders,
             check_presence_folder,
+            rclone_remotes,
             system_locale,
             check_for_updates,
             install_update,
