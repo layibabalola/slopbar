@@ -65,6 +65,11 @@ pub(crate) fn billing(raw: &serde_json::Value, account_id: Option<&str>) -> Opti
         delinquent: e["is_delinquent"].as_bool(),
         billing_period: e["billing_period"].as_str().map(String::from),
         plan_code: e["subscription_plan"].as_str().filter(|s| !s.is_empty()).map(String::from),
+        features: {
+            let mut f: Vec<String> = a["features"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(String::from).collect();
+            f.sort();
+            f
+        },
         fetched_at: Some(Utc::now()),
         ..Default::default()
     })

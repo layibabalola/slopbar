@@ -92,6 +92,10 @@ pub struct BillingHints {
     pub billing_period: Option<String>,
     /// The provider's own name for the plan bought ("chatgptpro"), finer than the plan type.
     pub plan_code: Option<String>,
+    /// Codex: the account's feature flags. ChatGPT Pro comes in three tiers under one plan code,
+    /// and the flags are where a tier can show (Pro 500's Ultrafast, for one).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
     /// Claude's organization status ("active").
     pub status: Option<String>,
     /// When SlopBar last read the provider's account record (for the fields above).
@@ -103,6 +107,7 @@ impl BillingHints {
     pub fn overlay(mut self, provider: &BillingHints) -> BillingHints {
         macro_rules! take { ($($f:ident),*) => { $( if provider.$f.is_some() { self.$f = provider.$f.clone(); } )* } }
         take!(tier, billing_type, started_at, active_until, checked_at, renews_at, cancels_at, will_renew, delinquent, billing_period, plan_code, status, fetched_at);
+        if !provider.features.is_empty() { self.features = provider.features.clone(); }
         self
     }
 }
