@@ -7,6 +7,8 @@ use crate::model::{ResetGrant, UsageWindow};
 
 #[derive(Deserialize)]
 struct Usage {
+    /// "plus", "prolite" (Pro 100), "pro" (Pro 200), "promax" (Pro 500), "team", ...
+    plan_type: Option<String>,
     rate_limit: Option<RateLimit>,
     credits: Option<Credits>,
     rate_limit_reset_credits: Option<ResetCredits>,
@@ -65,11 +67,7 @@ pub(crate) fn billing(raw: &serde_json::Value, account_id: Option<&str>) -> Opti
         delinquent: e["is_delinquent"].as_bool(),
         billing_period: e["billing_period"].as_str().map(String::from),
         plan_code: e["subscription_plan"].as_str().filter(|s| !s.is_empty()).map(String::from),
-        features: {
-            let mut f: Vec<String> = a["features"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(String::from).collect();
-            f.sort();
-            f
-        },
+
         fetched_at: Some(Utc::now()),
         ..Default::default()
     })
@@ -121,6 +119,7 @@ pub async fn fetch(client: &reqwest::Client, token: &str, account_id: Option<&st
     };
     observe(super::evidence::capture(super::evidence::Endpoint::CodexUsage, status, &raw));
     let usage: Usage = serde_json::from_value(raw).map_err(|_| "bad_response".to_string())?;
+    let plan_type = usage.plan_type.clone().filter(|p| !p.is_empty());
     let windows = usage
         .rate_limit
         .map(|rl| {
@@ -164,10 +163,14 @@ pub async fn fetch(client: &reqwest::Client, token: &str, account_id: Option<&st
         vec![]
     };
     // Billing changes about once a month; read it a couple of times a day at most.
-    let billing = match account_id {
+    let mut billing = match account_id {
         Some(id) if super::billing_due(&format!("codex:{id}")) => account_record(client, token, account_id).await,
         _ => None,
     };
+    // The plan type comes with every usage reading, so it is always current.
+    if plan_type.is_some() {
+        billing.get_or_insert_with(Default::default).plan_type = plan_type;
+    }
     Ok(CodexUsage { windows, credits, resets, billing })
 }
 

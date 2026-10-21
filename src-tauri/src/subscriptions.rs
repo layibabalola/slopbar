@@ -318,7 +318,7 @@ pub fn plan_kind(plan: Option<&str>) -> PlanKind {
     match plan.map(str::to_ascii_lowercase).as_deref() {
         None | Some("") => PlanKind::Unknown,
         Some("free") => PlanKind::Free,
-        Some("pro" | "max" | "plus" | "go") => PlanKind::Personal,
+        Some("pro" | "prolite" | "promax" | "max" | "plus" | "go") => PlanKind::Personal,
         Some("team" | "enterprise" | "business" | "edu" | "education") => PlanKind::Organization,
         Some(_) => PlanKind::Unknown,
     }
@@ -331,18 +331,25 @@ pub fn plan_label(acc: &AccountUsage) -> Option<String> {
     Some(match (acc.provider, plan) {
         (Provider::Claude, "max") if tier.ends_with("_20x") => "Max 20x".into(),
         (Provider::Claude, "max") if tier.ends_with("_5x") => "Max 5x".into(),
+        // The Codex CLI's own names for the three ChatGPT Pro tiers.
+        (Provider::Codex, "prolite") => "Pro 100".into(),
+        (Provider::Codex, "pro") => "Pro 200".into(),
+        (Provider::Codex, "promax") => "Pro 500".into(),
         (_, p) => { let mut c = p.chars(); c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default() }
     })
 }
 
-/// US list price per month, when the plan name alone settles it. ChatGPT Pro comes in more than
-/// one size and the token does not say which, so it has none.
+/// US list price per month, when the plan name settles it. Codex reports ChatGPT Pro's tier as its
+/// plan type (prolite, pro, promax), so each Pro tier has its price.
 pub fn list_price(acc: &AccountUsage) -> Option<f64> {
     Some(match (acc.provider, plan_label(acc)?.as_str()) {
         (Provider::Claude, "Pro") => 20.0,
         (Provider::Claude, "Max 5x") => 100.0,
         (Provider::Claude, "Max 20x") => 200.0,
         (Provider::Codex, "Plus") => 20.0,
+        (Provider::Codex, "Pro 100") => 100.0,
+        (Provider::Codex, "Pro 200") => 200.0,
+        (Provider::Codex, "Pro 500") => 500.0,
         _ => return None,
     })
 }
@@ -851,7 +858,11 @@ mod tests {
         assert_eq!(list_price(&max), Some(200.0));
         let mut pro = reading("weekly", 0.0, now + days(2));
         pro.provider = Provider::Codex;
-        assert_eq!(list_price(&pro), None, "ChatGPT Pro's size is unknown");
+        assert_eq!((plan_label(&pro).as_deref(), list_price(&pro)), (Some("Pro 200"), Some(200.0)));
+        for (plan, label, price) in [("prolite", "Pro 100", 100.0), ("promax", "Pro 500", 500.0), ("plus", "Plus", 20.0)] {
+            pro.plan = Some(plan.into());
+            assert_eq!((plan_label(&pro).as_deref(), list_price(&pro), plan_kind(pro.plan.as_deref())), (Some(label), Some(price), PlanKind::Personal));
+        }
         let mut team = reading("weekly", 0.0, now + days(2));
         team.id = "t".into();
         team.plan = Some("team".into());

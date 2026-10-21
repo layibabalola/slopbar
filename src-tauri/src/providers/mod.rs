@@ -123,7 +123,10 @@ pub async fn fetch_all(
             match result {
                 Some(Ok(Fetched { windows, credits, resets, monitor_error, billing })) => {
                     // Billing is read less often than usage: keep the last record between reads.
-                    let billing = billing.or_else(|| entry.billing.take());
+                    let billing = match (billing, entry.billing.take()) {
+                        (Some(new), Some(old)) => Some(old.overlay(&new)),
+                        (new, old) => new.or(old),
+                    };
                     *entry = Cached { windows, credits, resets, at: Some(Utc::now()),
                         blocked_until: None, error: None, monitor_error, billing, verified: true };
                 }
@@ -145,6 +148,9 @@ pub async fn fetch_all(
             acc.error = entry.error.clone();
             acc.monitor_error = entry.monitor_error.clone();
             if let Some(b) = &entry.billing { acc.billing = acc.billing.clone().overlay(b); }
+            if let Some(p) = &acc.billing.plan_type { acc.plan = Some(p.clone()); }
+            // The account record names Pro 100 too (chatgptprolite), for when usage has not said.
+            else if acc.billing.plan_code.as_deref() == Some("chatgptprolite") { acc.plan = Some("prolite".into()); }
             acc
         })
         .collect();
