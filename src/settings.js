@@ -1,6 +1,6 @@
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
-import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetText, errorText, duration, shortDate, shortDay, windowLabel, windowResetText, visibleResetWindows } from "./i18n.js";
+import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetText, errorText, duration, shortDate, shortDay, windowLabel, windowResetText, visibleResetWindows, placesText } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -55,6 +55,8 @@ function accountRow(p, a) {
   const windowResets = timedWindows.length
     ? `<div class="window-resets">${timedWindows.map(w => `<small class="window-reset" title="${esc(w.resets_at)}">${esc(windowLabel(w))}: ${Math.round(w.used_percent)}% ${t("used")} · ${esc(windowResetText(w, a.stale, a.fetched_at))}</small>`).join("")}</div>`
     : "";
+  // In use here and on the user's other computers (shared through a synced folder).
+  const places = placesText(a);
   const held = a.resets ?? [];
   const total = held.reduce((n, r) => n + r.count, 0);
   const resets = total > 0
@@ -68,10 +70,12 @@ function accountRow(p, a) {
         <input data-alias="${esc(key)}" value="${esc(settings.aliases[key] ?? "")}"
           placeholder="${esc(a.email ?? t("unknownAccount"))}" aria-label="${t("alias")}" title="${t("alias")}" />
         <small>
-          ${a.active ? `<em class="chip live">${t("inUse")}</em>` : ""}
+          ${a.active ? `<em class="chip live" title="${esc(places.inUse)}">${t("inUse")}</em>`
+            : places.elsewhere ? `<em class="chip elsewhere" title="${esc(places.inUse)}">${esc(places.inUse)}</em>` : ""}
+          ${a.used_outside ? `<em class="chip outside" title="${esc(t("usedOutsideHint"))}">${t("usedOutside")}</em>` : ""}
           ${a.plan ? `<em class="chip">${esc(a.plan)}</em>` : ""}
           ${resets}
-          <span>${esc(settings.aliases[key] ? a.email ?? "" : a.org ?? "")}</span>
+          <span>${esc([a.active && places.elsewhere ? places.inUse : "", ...places.seen, settings.aliases[key] ? a.email ?? "" : a.org ?? ""].filter(Boolean).join(" · "))}</span>
         </small>
       </div>
       <div class="monitor-state">
@@ -442,6 +446,7 @@ async function render() {
   $("auto-update").checked = updatesEnabled && settings.auto_update;
   $("auto-update").disabled = !updatesEnabled;
   for (const kind of ["usage", "resets", "switches"]) $(`notify-${kind}`).checked = settings.notifications[kind];
+  renderPresence();
   const version = await invoke("app_version");
   $("version").textContent = /^\d/.test(version) ? `v${version}` : version;
   $("version-label").textContent = t("versionN", { v: version });
@@ -475,6 +480,42 @@ $("export-diagnostics").addEventListener("click", async () => {
   } catch { status.textContent = t("diagnosticsFailed"); }
   finally { button.disabled = false; }
 });
+// Sharing in-use status: off, a detected sync folder (OneDrive, Dropbox, iCloud Drive) or a typed one.
+let syncFolders = [];
+let presenceOther = false;
+function renderPresence() {
+  const current = settings.presence_folder ?? "";
+  const known = syncFolders.some((f) => f.path === current);
+  const other = presenceOther || (current !== "" && !known);
+  $("presence").innerHTML = `<option value="">${t("presenceOff")}</option>`
+    + syncFolders.map((f) => `<option value="${esc(f.path)}">${esc(f.name)} · ${esc(f.path)}</option>`).join("")
+    + `<option value="__other__">${t("presenceOther")}</option>`;
+  $("presence").value = other ? "__other__" : current;
+  $("presence-custom").hidden = !other;
+  $("presence-path").placeholder = t("presenceFolderPlaceholder");
+  if (other && !known && document.activeElement !== $("presence-path")) $("presence-path").value = current;
+}
+$("presence").addEventListener("change", (e) => {
+  $("presence-status").hidden = true;
+  presenceOther = e.target.value === "__other__";
+  if (presenceOther) { renderPresence(); $("presence-path").focus(); return; }
+  update({ presence_folder: e.target.value || null });
+});
+async function savePresencePath() {
+  const folder = $("presence-path").value.trim();
+  if (!folder) return;
+  if (!(await invoke("check_presence_folder", { folder }))) {
+    $("presence-status").textContent = t("presenceFolderInvalid");
+    $("presence-status").hidden = false;
+    return;
+  }
+  $("presence-status").hidden = true;
+  update({ presence_folder: folder });
+}
+$("presence-save").addEventListener("click", savePresencePath);
+$("presence-path").addEventListener("keydown", (e) => { if (e.key === "Enter") savePresencePath(); });
+invoke("sync_folders").then((folders) => { syncFolders = folders ?? []; if (settings) renderPresence(); }, () => {});
+
 for (const kind of ["usage", "resets", "switches"]) {
   $(`notify-${kind}`).addEventListener("change", (e) => update({ notifications: { ...settings.notifications, [kind]: e.target.checked } }));
 }

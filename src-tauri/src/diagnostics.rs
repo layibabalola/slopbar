@@ -861,6 +861,8 @@ mod tests {
             fetched_at: None,
             monitor_connected: true,
             billing: crate::model::BillingHints { tier: Some(canary.into()), billing_type: Some(canary.into()), ..Default::default() },
+            remote: vec![crate::model::RemoteSeat { machine: canary.into(), where_: vec![canary.into()], seen_at: chrono::Utc::now(), live: true }],
+            used_outside: true,
         };
         let snapshot = Snapshot {
             accounts: vec![a],

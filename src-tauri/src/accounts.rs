@@ -38,7 +38,7 @@ impl Provider {
         }
     }
 
-    fn key(self) -> &'static str {
+    pub(crate) fn key(self) -> &'static str {
         match self {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
