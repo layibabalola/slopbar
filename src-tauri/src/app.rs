@@ -1,4 +1,4 @@
-use crate::{accounts, balancer, diagnostics, dock, door, inspect, migrate, model, monitoring, notify, panel, providers, settings, sources, subscriptions, updates};
+use crate::{accounts, balancer, codex_local, diagnostics, dock, door, inspect, migrate, model, monitoring, notify, panel, providers, settings, sources, subscriptions, updates};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -37,6 +37,8 @@ pub struct AppState {
     pub(crate) usage_cache: Mutex<providers::Cache>,
     /// Every account's completed weekly windows, for the Subscriptions page.
     pub(crate) usage_history: Mutex<subscriptions::History>,
+    /// The Codex CLI's own history on this PC, read in the background after each refresh.
+    pub(crate) codex_local: Mutex<Option<std::sync::Arc<codex_local::Local>>>,
     /// When each provider was last switched automatically (the balancer's cooldown).
     pub(crate) last_switch: Mutex<HashMap<Provider, Instant>>,
     /// Sources found by the last refresh, where switches are written.
@@ -51,7 +53,8 @@ fn get_usage(state: tauri::State<AppState>) -> Snapshot {
 fn subscription_report(state: &AppState) -> subscriptions::Report {
     let snapshot = state.snapshot.lock().unwrap().clone();
     let settings = state.settings.lock().unwrap().clone();
-    subscriptions::report(&snapshot, &state.usage_history.lock().unwrap(), &settings, chrono::Utc::now())
+    let local = state.codex_local.lock().unwrap().clone();
+    subscriptions::report(&snapshot, &state.usage_history.lock().unwrap(), &settings, local.as_deref(), chrono::Utc::now())
 }
 
 #[tauri::command]
@@ -584,7 +587,25 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
         native_sources: found.iter().filter(|s| s.distro.is_none()).count(), wsl_sources: found.iter().filter(|s| s.distro.is_some()).count() });
     *state.snapshot.lock().unwrap() = snapshot.clone();
     let _ = app.emit("usage-updated", &snapshot);
+    if settings.providers.codex { scan_codex_local(app); }
     snapshot
+}
+
+/// Re-reads the Codex CLI's local history off the async runtime, one scan at a time, then has
+/// open windows reload their report. Its first run reads weeks of rollouts and can take a while.
+fn scan_codex_local(app: &AppHandle) {
+    static SCANNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SCANNING.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let local = tauri::async_runtime::spawn_blocking(|| codex_local::scan(chrono::Utc::now())).await;
+        SCANNING.store(false, std::sync::atomic::Ordering::Release);
+        let Ok(local) = local else { return };
+        let state = app.state::<AppState>();
+        *state.codex_local.lock().unwrap() = Some(std::sync::Arc::new(local));
+        let snapshot = state.snapshot.lock().unwrap().clone();
+        let _ = app.emit("usage-updated", &snapshot);
+    });
 }
 
 /// Refreshes on the interval from settings, re-reading it so changes apply without a restart.
@@ -617,6 +638,7 @@ pub fn run() {
         dock_width: Mutex::new(160.0),
         usage_cache: Mutex::new(providers::load_cache()),
         usage_history: Mutex::new(subscriptions::load()),
+        codex_local: Mutex::default(),
         monitor: monitoring::Monitor::new(settings::app_dir().expect("config directory").join("monitoring")).with_diagnostics(diagnostics.clone()),
         diagnostics: diagnostics.clone(),
         refresh_lock: tokio::sync::Mutex::new(()),
