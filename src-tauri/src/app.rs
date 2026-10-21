@@ -430,9 +430,9 @@ async fn store_settings(app: &AppHandle, settings: Settings) -> Result<(), Strin
     let presence_changed = previous.presence_folder != settings.presence_folder;
     if presence_changed {
         // The old folder's other machines should not keep seeing this one as signed in.
-        if let Some(old) = previous.presence_folder.map(std::path::PathBuf::from) {
+        if let Some(old) = presence::store(&previous) {
             let interval = settings.refresh_minutes.max(1) as u64 * 60;
-            let _ = tauri::async_runtime::spawn_blocking(move || presence::withdraw(&old, interval)).await;
+            let _ = tauri::async_runtime::spawn_blocking(move || presence::withdraw(old.as_ref(), interval)).await;
         }
     }
     if providers_changed || presence_changed {
@@ -597,12 +597,12 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     // Other machines: what they share through the presence folder, then what rising usage implies.
     let now = chrono::Utc::now();
     let interval = settings.refresh_minutes.max(1) as u64 * 60;
-    if let Some(folder) = settings.presence_folder.clone().map(std::path::PathBuf::from) {
+    if let Some(store) = presence::store(&settings) {
         let mine = list.clone();
         let peers = tauri::async_runtime::spawn_blocking(move || {
             let Some((id, name)) = presence::identity() else { return vec![] };
-            let _ = presence::write(&folder, &presence::own(id, name, interval, &mine, now));
-            presence::read(&folder, id, now)
+            let _ = store.write(&presence::own(id, name, interval, &mine, now));
+            presence::read(store.as_ref(), id, now)
         }).await.unwrap_or_default();
         presence::attach(&mut list, &peers, now);
     }
@@ -805,8 +805,8 @@ pub fn run() {
             if matches!(event, tauri::RunEvent::Exit) {
                 // Other machines stop showing this one's accounts as in use.
                 let settings = app.state::<AppState>().settings.lock().unwrap().clone();
-                if let Some(folder) = settings.presence_folder {
-                    presence::withdraw(std::path::Path::new(&folder), settings.refresh_minutes.max(1) as u64 * 60);
+                if let Some(store) = presence::store(&settings) {
+                    presence::withdraw(store.as_ref(), settings.refresh_minutes.max(1) as u64 * 60);
                 }
                 app.state::<AppState>().diagnostics.record(None, None, diagnostics::Event::Shutdown);
             }

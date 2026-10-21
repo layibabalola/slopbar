@@ -3,9 +3,10 @@
 //! Neither Anthropic nor OpenAI tells a token where else its account is signed in, so SlopBar
 //! learns it two ways:
 //!
-//! - **Presence files** (opt-in). Every SlopBar writes `<folder>/SlopBar/presence/<machine id>.json`
-//!   into a folder the user already syncs (OneDrive, Dropbox, iCloud Drive), listing which accounts
-//!   it has signed in. Accounts appear there only as a unsalted SHA-256 prefix of
+//! - **Presence records** (opt-in). Every SlopBar keeps one record in a `PresenceStore`: today a
+//!   folder the user already syncs (OneDrive, Dropbox, Google Drive, iCloud Drive, Box), as
+//!   `<folder>/SlopBar/presence/<machine id>.json`; later, possibly a cloud API (`CloudApi`). The
+//!   record lists which accounts the machine has signed in. Accounts appear there only as a unsalted SHA-256 prefix of
 //!   `provider|slot id`, which every machine computes the same way; no emails, tokens or
 //!   organization names are written.
 //! - **Inference**, for monitored accounts nobody claims: usage that keeps rising while the
@@ -90,9 +91,9 @@ pub fn identity() -> Option<&'static (String, String)> {
 }
 
 /// Says this machine has nothing signed in any more: on quit, or when sharing moves elsewhere.
-pub fn withdraw(folder: &Path, interval_s: u64) {
+pub fn withdraw(store: &dyn PresenceStore, interval_s: u64) {
     if let Some((id, name)) = identity() {
-        let _ = write(folder, &own(id, name, interval_s, &[], Utc::now()));
+        let _ = store.clear(id, name, interval_s);
     }
 }
 
@@ -107,34 +108,181 @@ fn clean_name(name: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Storage
+
+/// Where presence records are kept. The reader, staleness rules and UI only see this trait, so a
+/// cloud API backend (see `CloudApi` and docs/presence-cloud-backends.md) plugs in beside the
+/// synced folder without touching them.
+pub trait PresenceStore: Send + Sync {
+    /// Every record there, with when the storage last modified it (when it knows).
+    fn list(&self) -> std::io::Result<Vec<(Presence, Option<DateTime<Utc>>)>>;
+    /// Replaces this machine's record.
+    fn write(&self, own: &Presence) -> std::io::Result<()>;
+    /// Says this machine has nothing signed in.
+    fn clear(&self, machine_id: &str, machine: &str, interval_s: u64) -> std::io::Result<()> {
+        self.write(&own(machine_id, machine, interval_s, &[], Utc::now()))
+    }
+}
+
+/// The store the settings choose, if sharing is on.
+pub fn store(settings: &crate::settings::Settings) -> Option<Box<dyn PresenceStore>> {
+    settings.presence_folder.as_ref().map(|f| Box::new(SyncedFolder(PathBuf::from(f))) as Box<dyn PresenceStore>)
+}
+
+/// A folder a sync client (OneDrive, Dropbox, Google Drive…) mirrors between machines: records are
+/// plain files in `<folder>/SlopBar/presence/`, one per machine.
+pub struct SyncedFolder(pub PathBuf);
+
+impl PresenceStore for SyncedFolder {
+    fn list(&self) -> std::io::Result<Vec<(Presence, Option<DateTime<Utc>>)>> {
+        let entries = match std::fs::read_dir(dir(&self.0)) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(e),
+        };
+        Ok(entries
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                    return None;
+                }
+                let meta = e.metadata().ok()?;
+                // Presence files are small; anything large is not one.
+                if meta.len() > 256 * 1024 {
+                    return None;
+                }
+                let presence: Presence = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+                Some((presence, meta.modified().ok().map(DateTime::<Utc>::from)))
+            })
+            .collect())
+    }
+
+    /// Atomic (temp file and rename), so a sync client never uploads half a file.
+    fn write(&self, presence: &Presence) -> std::io::Result<()> {
+        if !self.0.is_dir() {
+            return Err(std::io::Error::other("presence folder missing"));
+        }
+        let safe: String = presence.machine_id.chars().filter(|c| c.is_ascii_hexdigit() || *c == '-').collect();
+        let bytes = serde_json::to_vec_pretty(presence)?;
+        crate::private_store::write(&dir(&self.0).join(format!("{safe}.json")), &bytes)
+    }
+}
+
+/// A cloud provider's own API, for machines without its sync client. Each would keep the records
+/// in an app-private folder only (Dropbox App folder, Google Drive `appDataFolder`, OneDrive
+/// `approot`), with its OAuth tokens in DPAPI storage (`private_store::save_secret`), never in
+/// settings.json. None is configured yet: each needs an app registered by the owner (see
+/// docs/presence-cloud-backends.md), so for now every call reports `not_configured`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum CloudProvider {
+    Dropbox,
+    GoogleDrive,
+    OneDrive,
+}
+
+#[allow(dead_code)] // Selectable once an app is registered for the provider.
+pub struct CloudApi(pub CloudProvider);
+
+impl CloudApi {
+    /// The OAuth client id registered for this provider; none is, yet.
+    fn client_id(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn not_configured(&self) -> std::io::Error {
+        std::io::Error::other("not_configured")
+    }
+}
+
+impl PresenceStore for CloudApi {
+    fn list(&self) -> std::io::Result<Vec<(Presence, Option<DateTime<Utc>>)>> {
+        self.client_id().map(|_| vec![]).ok_or_else(|| self.not_configured())
+    }
+
+    fn write(&self, _own: &Presence) -> std::io::Result<()> {
+        self.client_id().map(|_| ()).ok_or_else(|| self.not_configured())
+    }
+}
+
 /// A folder a sync client keeps the same on every machine.
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncFolder {
+    /// The provider, as Settings shows it.
     pub name: &'static str,
     pub path: String,
 }
 
-/// The sync folders on this machine that SlopBar can offer.
+/// Every sync-client folder on this machine that SlopBar can offer.
 pub fn sync_folders() -> Vec<SyncFolder> {
     let home = dirs::home_dir();
     let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
-    // Dropbox records where its folder is; ~/Dropbox is only the default.
-    let dropbox = dirs::data_local_dir()
-        .and_then(|d| std::fs::read_to_string(d.join("Dropbox").join("info.json")).ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| ["personal", "business"].iter().find_map(|k| v[k]["path"].as_str().map(PathBuf::from)));
-    let candidates = [
-        ("OneDrive", env("OneDriveConsumer").or_else(|| env("OneDrive"))),
-        ("OneDrive", env("OneDriveCommercial")),
-        ("Dropbox", dropbox.or_else(|| home.as_ref().map(|h| h.join("Dropbox")))),
-        ("iCloud Drive", home.as_ref().map(|h| h.join("iCloudDrive"))),
-    ];
+    let mut candidates: Vec<(&'static str, PathBuf)> = vec![];
+    // OneDrive: personal and work accounts each have their own folder.
+    for var in ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"] {
+        candidates.extend(env(var).map(|p| ("OneDrive", p)));
+    }
+    // Dropbox records where its folders are; ~/Dropbox is only the default.
+    for base in [dirs::config_dir(), dirs::data_local_dir()].into_iter().flatten() {
+        let info = std::fs::read_to_string(base.join("Dropbox").join("info.json")).unwrap_or_default();
+        candidates.extend(dropbox_paths(&info).into_iter().map(|p| ("Dropbox", p)));
+    }
+    candidates.extend(home.as_ref().map(|h| ("Dropbox", h.join("Dropbox"))));
+    // Google Drive for desktop: "My Drive" on its virtual drive (often G:), and folders it mirrors.
+    for letter in 'D'..='Z' {
+        candidates.push(("Google Drive", PathBuf::from(format!("{letter}:\\My Drive"))));
+    }
+    candidates.extend(home.as_ref().map(|h| ("Google Drive", h.join("My Drive"))));
+    if let Some(local) = dirs::data_local_dir() {
+        let config = std::fs::read(local.join("Google").join("DriveFS").join("root_preference_sqlite.db")).unwrap_or_default();
+        candidates.extend(paths_in(&config).into_iter().map(|p| ("Google Drive", p)));
+    }
+    candidates.extend(home.as_ref().map(|h| ("iCloud Drive", h.join("iCloudDrive"))));
+    candidates.extend(home.as_ref().map(|h| ("Box", h.join("Box"))));
+
     let mut out: Vec<SyncFolder> = vec![];
     for (name, path) in candidates {
-        let Some(path) = path.filter(|p| p.is_dir()) else { continue };
-        let path = path.to_string_lossy().into_owned();
+        if !path.is_dir() {
+            continue;
+        }
+        let path = path.to_string_lossy().trim_end_matches('\\').to_string();
         if !out.iter().any(|f| f.path.eq_ignore_ascii_case(&path)) {
             out.push(SyncFolder { name, path });
+        }
+    }
+    out
+}
+
+/// The folders Dropbox's info.json names (`{"personal": {"path": …}, "business": {…}}`).
+fn dropbox_paths(info: &str) -> Vec<PathBuf> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(info) else { return vec![] };
+    v.as_object()
+        .into_iter()
+        .flat_map(|o| o.values())
+        .filter_map(|account| account["path"].as_str().map(PathBuf::from))
+        .collect()
+}
+
+/// Absolute Windows folder paths spelled out in a binary config file (Google Drive keeps its
+/// mirrored folders in SQLite); only ones that exist are offered later.
+fn paths_in(bytes: &[u8]) -> Vec<PathBuf> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = vec![];
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i + 3 < chars.len() {
+        if chars[i].is_ascii_alphabetic() && chars[i + 1] == ':' && chars[i + 2] == '\\' && (i == 0 || !chars[i - 1].is_ascii_alphanumeric()) {
+            let end = (i..chars.len()).find(|&j| chars[j].is_control() || chars[j] == '\u{fffd}' || chars[j] == '"').unwrap_or(chars.len());
+            let path: String = chars[i..end].iter().collect();
+            if path.len() > 3 && path.len() < 260 {
+                out.push(PathBuf::from(path.trim_end()));
+            }
+            i = end;
+        } else {
+            i += 1;
         }
     }
     out
@@ -152,16 +300,6 @@ pub fn own(machine_id: &str, machine: &str, interval_s: u64, accounts: &[Account
     Presence { v: 1, machine_id: machine_id.into(), machine: machine.into(), written_at: now, interval_s, seats }
 }
 
-/// Writes this machine's file atomically (sync clients never upload half a file).
-pub fn write(folder: &Path, presence: &Presence) -> std::io::Result<()> {
-    if !folder.is_dir() {
-        return Err(std::io::Error::other("presence folder missing"));
-    }
-    let safe: String = presence.machine_id.chars().filter(|c| c.is_ascii_hexdigit() || *c == '-').collect();
-    let bytes = serde_json::to_vec_pretty(presence)?;
-    crate::private_store::write(&dir(folder).join(format!("{safe}.json")), &bytes)
-}
-
 /// Another machine, as of its newest file.
 #[derive(Debug, Clone)]
 pub struct Peer {
@@ -171,27 +309,13 @@ pub struct Peer {
     pub seats: Vec<Seat>,
 }
 
-/// Every other machine that wrote within the last week. Sync clients leave conflict copies
-/// ("<id> (1).json", "<id>-LAPTOP.json"), so files are grouped by the machine id inside them
-/// and the newest wins.
-pub fn read(folder: &Path, own_id: &str, now: DateTime<Utc>) -> Vec<Peer> {
-    let Ok(entries) = std::fs::read_dir(dir(folder)) else { return vec![] };
-    let files = entries.flatten().filter_map(|e| {
-        let path = e.path();
-        if path.extension().and_then(|x| x.to_str()) != Some("json") {
-            return None;
-        }
-        let modified = e.metadata().ok()?.modified().ok().map(DateTime::<Utc>::from);
-        // Presence files are small; anything large is not one.
-        if e.metadata().ok()?.len() > 256 * 1024 {
-            return None;
-        }
-        let presence: Presence = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
-        Some((presence, modified))
-    });
-    peers(files, own_id, now)
+/// Every other machine in `store` that wrote within the last week.
+pub fn read(store: &dyn PresenceStore, own_id: &str, now: DateTime<Utc>) -> Vec<Peer> {
+    peers(store.list().unwrap_or_default(), own_id, now)
 }
 
+/// Sync clients leave conflict copies ("<id> (1).json", "<id>-LAPTOP.json"), so records are
+/// grouped by the machine id inside them and the newest wins.
 pub fn peers(files: impl IntoIterator<Item = (Presence, Option<DateTime<Utc>>)>, own_id: &str, now: DateTime<Utc>) -> Vec<Peer> {
     let mut newest: HashMap<String, (Presence, DateTime<Utc>)> = HashMap::new();
     for (presence, modified) in files {
@@ -312,7 +436,9 @@ mod tests {
     use crate::test_support::TempDir;
 
     fn at(minutes: i64) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-10-21T12:00:00Z").unwrap().with_timezone(&Utc) + Duration::minutes(minutes)
+        // Real time: `PresenceStore::clear` stamps records with the clock.
+        static BASE: std::sync::OnceLock<DateTime<Utc>> = std::sync::OnceLock::new();
+        *BASE.get_or_init(Utc::now) + Duration::minutes(minutes)
     }
 
     fn account(id: &str, active: bool) -> AccountUsage {
@@ -422,14 +548,15 @@ mod tests {
     #[test]
     fn writes_only_hashes_and_round_trips_through_the_folder() {
         let dir_ = TempDir::new();
+        let store = SyncedFolder(dir_.0.clone());
         let now = at(0);
         let mut accounts = vec![account("synthetic-user:synthetic-org", true), account("token:abcdef", true), account("idle", false)];
         accounts[0].email = Some("someone@example.invalid".into());
         let mine = own("11111111-1111-4111-8111-111111111111", "BACHELOR", 300, &accounts, now);
         assert_eq!(mine.seats.len(), 1, "token: logins and idle accounts are left out");
-        write(&dir_.0, &mine).unwrap();
+        store.write(&mine).unwrap();
         let other = own("22222222-2222-4222-8222-222222222222", "LAPTOP-2", 300, &accounts, now);
-        write(&dir_.0, &other).unwrap();
+        store.write(&other).unwrap();
         // A sync client's conflict copy of the other machine, older.
         let stale = Presence { written_at: at(-60), seats: vec![], ..other.clone() };
         std::fs::write(dir(&dir_.0).join("22222222-2222-4222-8222-222222222222 (1).json"), serde_json::to_vec(&stale).unwrap()).unwrap();
@@ -440,7 +567,7 @@ mod tests {
             assert!(!text.contains("synthetic-user") && !text.contains("Synthetic Org") && !text.contains("abcdef"), "{text}");
         }
 
-        let peers = read(&dir_.0, &mine.machine_id, now);
+        let peers = read(&store, &mine.machine_id, now);
         assert_eq!(peers.len(), 1);
         let mut idle = vec![account("synthetic-user:synthetic-org", false)];
         attach(&mut idle, &peers, now);
@@ -451,10 +578,57 @@ mod tests {
         assert!(!idle[0].active, "another machine never makes an account active here");
 
         // A clean quit empties the seats.
-        write(&dir_.0, &own(&other.machine_id, "LAPTOP-2", 300, &[], now + Duration::minutes(1))).unwrap();
-        let peers = read(&dir_.0, &mine.machine_id, now + Duration::minutes(1));
+        store.clear(&other.machine_id, "LAPTOP-2", 300).unwrap();
+        let peers = read(&store, &mine.machine_id, now + Duration::minutes(1));
         attach(&mut idle, &peers, now);
         assert!(idle[0].remote.is_empty());
+    }
+
+    /// A backend other than a folder, as a cloud API store would be.
+    struct Memory(std::sync::Mutex<HashMap<String, Presence>>);
+    impl PresenceStore for Memory {
+        fn list(&self) -> std::io::Result<Vec<(Presence, Option<DateTime<Utc>>)>> {
+            Ok(self.0.lock().unwrap().values().map(|p| (p.clone(), None)).collect())
+        }
+        fn write(&self, own: &Presence) -> std::io::Result<()> {
+            self.0.lock().unwrap().insert(own.machine_id.clone(), own.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn any_store_backs_the_same_reader() {
+        let store = Memory(Default::default());
+        let now = at(0);
+        store.write(&file("peer", "LAPTOP-2", now, vec![seat("x")])).unwrap();
+        store.write(&file("me", "BACHELOR", now, vec![seat("x")])).unwrap();
+        let mut list = vec![account("x", false)];
+        attach(&mut list, &read(&store, "me", now), now);
+        assert_eq!(list[0].remote.iter().map(|r| r.machine.as_str()).collect::<Vec<_>>(), ["LAPTOP-2"]);
+        store.clear("peer", "LAPTOP-2", 300).unwrap();
+        attach(&mut list, &read(&store, "me", now), now);
+        assert!(list[0].remote.is_empty());
+    }
+
+    #[test]
+    fn cloud_backends_report_not_configured() {
+        for provider in [CloudProvider::Dropbox, CloudProvider::GoogleDrive, CloudProvider::OneDrive] {
+            let store = CloudApi(provider);
+            assert_eq!(store.list().unwrap_err().to_string(), "not_configured");
+            assert_eq!(store.write(&file("me", "BACHELOR", at(0), vec![])).unwrap_err().to_string(), "not_configured");
+            assert!(read(&store, "me", at(0)).is_empty(), "an unconfigured backend shows nothing");
+        }
+    }
+
+    #[test]
+    fn sync_client_configs_name_their_folders() {
+        let info = r#"{"personal":{"path":"C:\\Users\\Someone\\Dropbox","host":1},"business":{"path":"D:\\Dropbox (Synthetic Co)"}}"#;
+        assert_eq!(dropbox_paths(info), [PathBuf::from("C:\\Users\\Someone\\Dropbox"), PathBuf::from("D:\\Dropbox (Synthetic Co)")]);
+        assert!(dropbox_paths("not json").is_empty());
+        // As Google Drive's SQLite config holds them: text among binary bytes.
+        let mut db = b"SQLite format 3\x00\x01\x02mirror_root\x05E:\\Synced\\Work\x00\x07".to_vec();
+        db.extend_from_slice(b"\x03x C:\\Users\\Someone\\My Drive\x01tail");
+        assert_eq!(paths_in(&db), [PathBuf::from("E:\\Synced\\Work"), PathBuf::from("C:\\Users\\Someone\\My Drive")]);
     }
 
     fn reading(a: &mut AccountUsage, minute: i64, percent: f64, resets: i64) {
