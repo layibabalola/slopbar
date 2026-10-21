@@ -297,3 +297,14 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
   .account.sub { grid-template-columns: 32px minmax(0, 1fr) 160px auto 0; }
   .account.sub .meter { width: 160px; }
 }
+
+/* Sharing in-use status with the user's other computers (Data page). */
+.row[hidden] { display: none; }
+.presence-path { flex: 1; display: flex; gap: 8px; }
+.presence-path input {
+  flex: 1; min-width: 0; height: 32px; padding: 0 10px; font: inherit; color: var(--text);
+  background: var(--control); border: 1px solid var(--control-stroke); border-bottom-color: var(--control-stroke-bottom); border-radius: 4px;
+}
+.presence-path input:focus { outline: none; border-bottom: 2px solid var(--accent); }
+.chip.elsewhere { background: transparent; border-color: var(--ok); color: var(--ok); }
+.chip.outside { background: transparent; border-color: var(--warn); color: var(--warn); }

@@ -93,6 +93,20 @@
           <input type="checkbox" class="switch" id="codex" />
         </div>
       </div>
+      <h2 data-i18n="sPresence"></h2>
+      <div class="group">
+        <div class="row">
+          <div class="title"><label for="presence" data-i18n="sharePresence"></label><small data-i18n="sharePresenceHint"></small></div>
+          <div class="select"><select id="presence"></select></div>
+        </div>
+        <div class="row" id="presence-custom" hidden>
+          <div class="presence-path">
+            <input type="text" id="presence-path" spellcheck="false" />
+            <button class="btn" id="presence-save" data-i18n="presenceSave"></button>
+          </div>
+        </div>
+      </div>
+      <p class="hint" id="presence-status" role="status" hidden></p>
     </section>
 
     <!-- General -->

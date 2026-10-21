@@ -116,6 +116,8 @@ pub async fn fetch_all(
                 fetched_at: None,
                 monitor_connected: monitor.connected(slot),
                 billing: slot.billing(),
+                remote: vec![],
+                used_outside: false,
             };
             let entry = cache.entry(monitoring::key(slot)).or_default();
             match result {

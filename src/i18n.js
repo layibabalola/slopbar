@@ -38,7 +38,7 @@ const MESSAGES = {
     bad_response: "Unexpected response", http: "HTTP error {code}",
     quit: "Quit", close: "Close",
     settings: "Settings", sData: "Data", sRefresh: "Refresh every", minutes: "{n} min", sProviders: "Providers", sGeneral: "General", sLanguage: "Language", langAuto: "System default", sStartup: "Launch at login",
-    unknownAccount: "Unknown account", inUse: "In use", use: "Use", switching: "Switching…", idle: "Not used recently — switch to it to see its usage", staleAgo: "updated {t} ago", switched: "{provider}: now using {to}", switchedAuto: "{provider} limit reached — switched to {to}", sAccounts: "Accounts", addAccount: "Add account", addHint: "Sign in in the terminal window that opened. The account shows up here when you're done.", alias: "Nickname", remove: "Remove", activeCantRemove: "Switch to another account before removing this one.", cliMissing: "Couldn't find the Claude Code or Codex CLI on Windows or WSL.", autoSwitch: "Switch automatically", switchAt: "Switch at",
+    unknownAccount: "Unknown account", inUse: "In use", inUseOn: "In use on {list}", seenOn: "{machine}: seen {t} ago", usedOutside: "Used outside this PC", usedOutsideHint: "Its usage is rising while it isn't signed in here or on any computer sharing its status: another computer, the web or the desktop app.", sPresence: "Other computers", sharePresence: "Share in-use status via folder", sharePresenceHint: "Shows which accounts are in use on your other computers. Each SlopBar writes a small file to a folder you sync (OneDrive, Dropbox, iCloud Drive) with its computer name and anonymous account codes only, never emails or sign-ins.", presenceOff: "Off", presenceOther: "Other folder…", presenceFolderPlaceholder: "Folder path, e.g. D:\\Sync", presenceFolderInvalid: "That folder doesn't exist.", presenceSave: "Use folder", use: "Use", switching: "Switching…", idle: "Not used recently — switch to it to see its usage", staleAgo: "updated {t} ago", switched: "{provider}: now using {to}", switchedAuto: "{provider} limit reached — switched to {to}", sAccounts: "Accounts", addAccount: "Add account", addHint: "Sign in in the terminal window that opened. The account shows up here when you're done.", alias: "Nickname", remove: "Remove", activeCantRemove: "Switch to another account before removing this one.", cliMissing: "Couldn't find the Claude Code or Codex CLI on Windows or WSL.", autoSwitch: "Switch automatically", switchAt: "Switch at",
     descAccounts: "Your Claude and Codex accounts, and when to switch between them.", descData: "How often usage is checked, and for which tools.", descGeneral: "Language and startup.",
     rateLimited: "The usage service is busy — trying again in a few minutes",
     sUpdates: "Updates", autoUpdate: "Update automatically", checkUpdates: "Check for updates", checking: "Checking…", upToDate: "You're up to date", updateAvailable: "Version {v} is available", installUpdate: "Install and restart", updating: "Updating to {v}…", versionN: "Version {v}",
@@ -558,6 +558,28 @@ export function duration(totalMinutes) {
   if (d) return [DAY.format(d), h && HOUR.format(h)].filter(Boolean).join(" ");
   if (h) return [HOUR.format(h), m && MIN.format(m)].filter(Boolean).join(" ");
   return MIN.format(Math.max(1, m));
+}
+
+/** A machine and where on it, e.g. "LAPTOP-2" or "LAPTOP-2 (WSL: Ubuntu)". */
+const machineText = (r) => {
+  const where = r.where ?? [];
+  return where.length && !(where.length === 1 && where[0] === "Windows") ? `${r.machine} (${where.join(", ")})` : r.machine;
+};
+
+/**
+ * Where an account is in use: `inUse` lists this machine's places and live other machines
+ * ("Windows, LAPTOP-2 (WSL: Ubuntu)"), or says "In use on LAPTOP-2" when only other machines
+ * have it; `seen` are machines that went quiet within the last day.
+ */
+export function placesText(a) {
+  const remote = a.remote ?? [];
+  const live = remote.filter((r) => r.live).map(machineText);
+  const here = a.active ? a.sources : [];
+  const inUse = here.length ? [...here, ...live].join(", ") : live.length ? t("inUseOn", { list: live.join(", ") }) : "";
+  const seen = remote.filter((r) => !r.live).map((r) => t("seenOn", {
+    machine: machineText(r), t: duration(Math.max(1, Math.round((Date.now() - new Date(r.seen_at)) / 60000))),
+  }));
+  return { inUse, elsewhere: live.length > 0, seen };
 }
 
 /** Short localized date, e.g. "Oct 22". */

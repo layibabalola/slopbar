@@ -43,6 +43,28 @@ pub struct AccountUsage {
     /// What the saved login says about the plan's billing (see `Slot::billing`).
     #[serde(default)]
     pub billing: BillingHints,
+    /// Other machines that say (through the shared presence folder) this account is signed in
+    /// there. `active` and `sources` stay about this machine only.
+    #[serde(default)]
+    pub remote: Vec<RemoteSeat>,
+    /// Usage kept rising while the account was signed in nowhere SlopBar can see: another
+    /// machine, the web or the desktop app.
+    #[serde(default)]
+    pub used_outside: bool,
+}
+
+/// Where another machine has an account signed in.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RemoteSeat {
+    /// That machine's name.
+    pub machine: String,
+    /// Where on it, e.g. "Windows" or "WSL: Ubuntu".
+    #[serde(rename = "where")]
+    pub where_: Vec<String>,
+    /// When it last said so.
+    pub seen_at: DateTime<Utc>,
+    /// It is still writing; otherwise it went quiet within the last day.
+    pub live: bool,
 }
 
 /// Plan and billing facts from the saved login and, when SlopBar asked the provider, its own

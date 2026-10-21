@@ -1,4 +1,4 @@
-use crate::{accounts, balancer, diagnostics, dock, door, inspect, migrate, model, monitoring, notify, panel, providers, settings, sources, subscriptions, updates};
+use crate::{accounts, balancer, diagnostics, dock, door, inspect, migrate, model, monitoring, notify, panel, presence, providers, settings, sources, subscriptions, updates};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -41,6 +41,8 @@ pub struct AppState {
     pub(crate) last_switch: Mutex<HashMap<Provider, Instant>>,
     /// Sources found by the last refresh, where switches are written.
     pub(crate) sources: Mutex<Vec<sources::Source>>,
+    /// Recent readings of unclaimed accounts, to notice use outside this PC.
+    presence_tracks: Mutex<presence::Tracks>,
 }
 
 #[tauri::command]
@@ -394,6 +396,18 @@ fn system_locale() -> Option<String> {
     sys_locale::get_locale()
 }
 
+/// Sync folders (OneDrive, Dropbox, iCloud Drive) Settings can offer for sharing in-use status.
+#[tauri::command]
+async fn sync_folders() -> Vec<presence::SyncFolder> {
+    tauri::async_runtime::spawn_blocking(presence::sync_folders).await.unwrap_or_default()
+}
+
+/// Whether a typed folder can hold presence files.
+#[tauri::command]
+fn check_presence_folder(folder: String) -> bool {
+    settings::valid_presence_folder(folder.trim())
+}
+
 #[tauri::command]
 fn get_settings(state: tauri::State<AppState>) -> Settings {
     state.settings.lock().unwrap().clone()
@@ -413,7 +427,15 @@ async fn store_settings(app: &AppHandle, settings: Settings) -> Result<(), Strin
     apply_settings(app);
     let providers_changed = previous.providers.claude != settings.providers.claude
         || previous.providers.codex != settings.providers.codex;
-    if providers_changed {
+    let presence_changed = previous.presence_folder != settings.presence_folder;
+    if presence_changed {
+        // The old folder's other machines should not keep seeing this one as signed in.
+        if let Some(old) = previous.presence_folder.map(std::path::PathBuf::from) {
+            let interval = settings.refresh_minutes.max(1) as u64 * 60;
+            let _ = tauri::async_runtime::spawn_blocking(move || presence::withdraw(&old, interval)).await;
+        }
+    }
+    if providers_changed || presence_changed {
         do_refresh(app).await;
     }
     Ok(())
@@ -572,6 +594,22 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
         }
     }
 
+    // Other machines: what they share through the presence folder, then what rising usage implies.
+    let now = chrono::Utc::now();
+    let interval = settings.refresh_minutes.max(1) as u64 * 60;
+    if let Some(folder) = settings.presence_folder.clone().map(std::path::PathBuf::from) {
+        let mine = list.clone();
+        let peers = tauri::async_runtime::spawn_blocking(move || {
+            let Some((id, name)) = presence::identity() else { return vec![] };
+            let _ = presence::write(&folder, &presence::own(id, name, interval, &mine, now));
+            presence::read(&folder, id, now)
+        }).await.unwrap_or_default();
+        presence::attach(&mut list, &peers, now);
+    }
+    // Two refresh intervals without a rise (readings are at least a minute apart), plus slack.
+    let hold = chrono::Duration::seconds(2 * interval.max(60) as i64 + 30);
+    presence::infer(&mut state.presence_tracks.lock().unwrap(), &mut list, hold, now);
+
     let snapshot = Snapshot { accounts: list, updated_at: Some(chrono::Utc::now()) };
     state.diagnostics.samples(&snapshot);
     let history = {
@@ -624,6 +662,7 @@ pub fn run() {
         account_operations: monitoring::Operations::default(),
         last_switch: Mutex::default(),
         sources: Mutex::default(),
+        presence_tracks: Mutex::default(),
     };
     tauri::Builder::default()
         // Must come first: a second launch hands over to the running instance and exits.
@@ -643,6 +682,8 @@ pub fn run() {
             record_frontend_error,
             refresh,
             get_settings,
+            sync_folders,
+            check_presence_folder,
             system_locale,
             check_for_updates,
             install_update,
@@ -762,6 +803,11 @@ pub fn run() {
         .run(|app, event| {
             // App::run exits the process directly: code after it cannot flush a journal.
             if matches!(event, tauri::RunEvent::Exit) {
+                // Other machines stop showing this one's accounts as in use.
+                let settings = app.state::<AppState>().settings.lock().unwrap().clone();
+                if let Some(folder) = settings.presence_folder {
+                    presence::withdraw(std::path::Path::new(&folder), settings.refresh_minutes.max(1) as u64 * 60);
+                }
                 app.state::<AppState>().diagnostics.record(None, None, diagnostics::Event::Shutdown);
             }
         });
