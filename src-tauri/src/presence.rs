@@ -187,6 +187,7 @@ pub enum CloudProvider {
 #[allow(dead_code)] // Selectable once an app is registered for the provider.
 pub struct CloudApi(pub CloudProvider);
 
+#[allow(dead_code)]
 impl CloudApi {
     /// The OAuth client id registered for this provider; none is, yet.
     fn client_id(&self) -> Option<&'static str> {
