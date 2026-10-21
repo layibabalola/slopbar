@@ -71,6 +71,9 @@ pub struct WindowRecord {
     /// when SlopBar started watching it, and ends early when usage begins.
     #[serde(default)]
     pub idle: bool,
+    /// Read from the Codex CLI's rollouts on this PC rather than polled by SlopBar. Never stored.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
 }
 
 impl WindowRecord {
@@ -128,7 +131,7 @@ pub fn observe(h: &mut AccountHistory, acc: &AccountUsage, now: DateTime<Utc>) {
                 r.peak = r.peak.max(w.used_percent);
             }
             None => push(h, WindowRecord { kind: w.kind.clone(), resets_at, peak: w.used_percent,
-                first_obs: now, last_obs: now, hours: 1, days: 1, idle: false }, now),
+                first_obs: now, last_obs: now, hours: 1, days: 1, idle: false, local: false }, now),
         }
     }
 }
@@ -138,7 +141,7 @@ fn observe_idle(h: &mut AccountHistory, kind: &str, now: DateTime<Utc>) {
         // An open window already holds this week: a 0% reading leaves its peak alone.
         Some(r) => seen(r, now),
         None => push(h, WindowRecord { kind: kind.into(), resets_at: now + chrono::Duration::seconds(WEEK_SECONDS),
-            peak: 0.0, first_obs: now, last_obs: now, hours: 1, days: 1, idle: true }, now),
+            peak: 0.0, first_obs: now, last_obs: now, hours: 1, days: 1, idle: true, local: false }, now),
     }
 }
 
@@ -203,6 +206,16 @@ pub enum Verdict {
 #[serde(rename_all = "snake_case")]
 pub enum Confidence { Low, High }
 
+/// What the verdict rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Basis {
+    /// Weeks SlopBar polled itself.
+    Observed,
+    /// Partly or wholly the Codex CLI's history on this PC, which misses use anywhere else.
+    LocalCodex,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Assessment {
     pub verdict: Verdict,
@@ -219,6 +232,7 @@ pub struct Assessment {
     pub sub_window_limited: Option<String>,
     /// Paying for another period looks unneeded on this evidence.
     pub renew_wasteful: bool,
+    pub basis: Basis,
 }
 
 pub fn assess(h: &AccountHistory, now: DateTime<Utc>) -> Assessment {
@@ -254,8 +268,9 @@ pub fn assess(h: &AccountHistory, now: DateTime<Utc>) -> Assessment {
         Verdict::Healthy
     };
     let renew_wasteful = verdict == Verdict::Unused || verdict == Verdict::Underused && confidence == Confidence::High;
+    let basis = if weeks.iter().any(|r| r.local) { Basis::LocalCodex } else { Basis::Observed };
     Assessment { verdict, confidence, weeks_counted: counted, weeks_needed: 2, average_peak, median_peak,
-        limit_weeks, sub_window_limited, renew_wasteful }
+        limit_weeks, sub_window_limited, renew_wasteful, basis }
 }
 
 fn median(values: &[f64]) -> Option<f64> {
@@ -430,6 +445,10 @@ pub struct Entry {
     pub ends_at: Option<DateTime<Utc>>,
     /// A payment failed and the provider is waiting for it.
     pub delinquent: bool,
+    /// The live weekly reading shows no use in the past seven days: 0% with its reset a full week out.
+    pub idle_now: bool,
+    /// Codex only: what the Codex CLI on this PC shows for this account.
+    pub local: Option<crate::codex_local::LocalActivity>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -453,7 +472,35 @@ pub struct Report {
     pub generated_at: DateTime<Utc>,
 }
 
-pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, now: DateTime<Utc>) -> Report {
+/// A Codex plan with no use in the live week and none on this PC for this long reads as unused
+/// while SlopBar's own history is still too short, labelled as resting on local history.
+const LOCAL_IDLE_DAYS: i64 = 14;
+
+/// Whether the live weekly window shows nothing used in the past week.
+fn idle_now(acc: &AccountUsage, now: DateTime<Utc>) -> bool {
+    if acc.stale || acc.error.is_some() { return false; }
+    let read_at = acc.fetched_at.unwrap_or(now);
+    acc.windows.iter().any(|w| w.kind == "weekly" && w.used_percent <= 0.0 && w.window_seconds.map_or(true, |s| s == WEEK_SECONDS)
+        && w.resets_at.is_some_and(|r| ((r - read_at).num_seconds() - WEEK_SECONDS).abs() <= IDLE_SLACK_SECONDS))
+}
+
+/// Adds the weeks read from local rollouts that SlopBar did not watch itself. A week it watched
+/// wins: its own readings span the whole week, the rollouts only the hours Codex ran here.
+fn with_local(h: &AccountHistory, extra: &[WindowRecord]) -> AccountHistory {
+    let span = |r: &WindowRecord| (if r.idle { r.first_obs } else { r.resets_at - chrono::Duration::seconds(WEEK_SECONDS) }, r.resets_at);
+    let mut merged = h.clone();
+    for w in extra {
+        let (s, e) = span(w);
+        let watched = h.windows.iter().filter(|r| r.kind == w.kind).any(|r| {
+            let (rs, re) = span(r);
+            (e.min(re) - s.max(rs)).num_hours() >= 24
+        });
+        if !watched { merged.windows.push(w.clone()); }
+    }
+    merged
+}
+
+pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local: Option<&crate::codex_local::Local>, now: DateTime<Utc>) -> Report {
     let empty = AccountHistory::default();
     let accounts: Vec<Entry> = snapshot.accounts.iter().map(|acc| {
         let prefs = settings.subscriptions.get(&pref_key(acc.provider, &acc.id)).cloned().unwrap_or_default();
@@ -461,6 +508,19 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, now: 
         let kind = plan_kind(acc.plan.as_deref());
         let paid = kind == PlanKind::Personal;
         let monthly_cost = prefs.monthly_cost.or_else(|| list_price(acc).filter(|_| paid));
+        let local = local.filter(|_| acc.provider == Provider::Codex);
+        let merged = local.map(|l| with_local(h, l.weeks_for(&acc.id)));
+        let h = merged.as_ref().unwrap_or(h);
+        let activity = local.and_then(|l| l.activity(&acc.id, now));
+        let idle_now = idle_now(acc, now);
+        let mut assessment = assess(h, now);
+        if paid && assessment.verdict == Verdict::InsufficientData && idle_now
+            && activity.as_ref().is_some_and(|a| a.days_idle.is_some_and(|d| d >= LOCAL_IDLE_DAYS)) {
+            assessment.verdict = Verdict::Unused;
+            assessment.confidence = Confidence::Low;
+            assessment.renew_wasteful = true;
+            assessment.basis = Basis::LocalCodex;
+        }
         Entry {
             provider: acc.provider,
             id: acc.id.clone(),
@@ -471,7 +531,7 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, now: 
             active: acc.active,
             stale: acc.stale,
             this_week: this_week(acc, now),
-            assessment: assess(h, now),
+            assessment,
             days_tracked: h.first_seen.map_or(0, |t| (now - t).num_days().max(0)),
             renewal: if paid { next_renewal(acc, &prefs, now) } else { None },
             provider_until: acc.billing.active_until,
@@ -482,6 +542,8 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, now: 
             cancel_after: prefs.cancel_after,
             ends_at: if paid { ends_at(acc, now) } else { None },
             delinquent: acc.billing.delinquent == Some(true),
+            idle_now,
+            local: activity,
         }
     }).collect();
     let providers = Provider::ALL.into_iter().filter(|p| accounts.iter().any(|a| a.provider == *p)).map(|provider| {
@@ -795,12 +857,73 @@ mod tests {
         let mut history = History::default();
         history.accounts.insert("Claude:a1".into(), h);
         // The verdict uses completed weeks only; the report runs after them.
-        let report = report(&Snapshot { accounts: vec![max, team], updated_at: None }, &history, &settings, at("2026-10-02T00:00:00Z"));
+        let report = report(&Snapshot { accounts: vec![max, team], updated_at: None }, &history, &settings, None, at("2026-10-02T00:00:00Z"));
         let a = &report.accounts[0];
         assert_eq!((a.monthly_cost, a.cost_entered, a.assessment.verdict), (Some(180.0), true, Verdict::Unused));
         assert!(report.accounts[1].renewal.is_none() && report.accounts[1].monthly_cost.is_none());
         let s = &report.providers[0];
         assert_eq!((s.paid, s.unused, s.monthly_total, s.possible_savings), (1, 1, 180.0, 180.0));
+    }
+
+    fn codex_pro(id: &str, used: f64, resets_in: Duration, now: DateTime<Utc>) -> AccountUsage {
+        let mut acc = reading("weekly", used, now + resets_in);
+        acc.id = id.into();
+        acc.provider = Provider::Codex;
+        acc.windows[0].window_seconds = Some(WEEK_SECONDS);
+        acc.fetched_at = Some(now);
+        acc
+    }
+
+    fn local_codex(now: DateTime<Utc>) -> crate::codex_local::Local {
+        let mut local = crate::codex_local::Local { attributed_since: Some(now - days(26)), ..Default::default() };
+        let busy = crate::codex_local::Activity { threads: 5, tokens: 9000, last: Some(now - days(1)),
+            days: [((now - days(1)).date_naive(), (5, 9000))].into_iter().collect() };
+        local.accounts.insert("acct-busy".into(), busy);
+        local
+    }
+
+    #[test]
+    fn a_long_idle_codex_plan_reads_unused_from_local_history_and_says_so() {
+        let now = at("2026-10-21T12:00:00Z");
+        let local = local_codex(now);
+        let snapshot = Snapshot { accounts: vec![
+            codex_pro("u1:acct-idle", 0.0, days(7), now),
+            codex_pro("u2:acct-busy", 0.0, days(7), now),
+            codex_pro("u3:acct-elsewhere", 12.0, days(3), now),
+        ], updated_at: None };
+        let r = report(&snapshot, &History::default(), &Settings::default(), Some(&local), now);
+        let idle = &r.accounts[0];
+        assert!(idle.idle_now);
+        let l = idle.local.as_ref().unwrap();
+        assert_eq!((l.never_seen, l.days_idle, l.threads_28d), (true, Some(26), 0));
+        let a = &idle.assessment;
+        assert_eq!((a.verdict, a.basis, a.confidence, a.renew_wasteful), (Verdict::Unused, Basis::LocalCodex, Confidence::Low, true));
+        // Ran here yesterday: not idle locally, however quiet the live week looks.
+        assert_eq!(r.accounts[1].assessment.verdict, Verdict::InsufficientData);
+        assert_eq!(r.accounts[1].local.as_ref().unwrap().threads_7d, 5);
+        // Used this week somewhere this PC cannot see: never called unused.
+        assert!(!r.accounts[2].idle_now);
+        assert_eq!(r.accounts[2].assessment.verdict, Verdict::InsufficientData);
+        // Without local history there is no such verdict at all.
+        let r = report(&snapshot, &History::default(), &Settings::default(), None, now);
+        assert!(r.accounts[0].local.is_none());
+        assert_eq!(r.accounts[0].assessment.verdict, Verdict::InsufficientData);
+    }
+
+    #[test]
+    fn rollout_weeks_fill_gaps_but_never_replace_watched_weeks() {
+        let now = at("2026-10-21T12:00:00Z");
+        let rec = |end: &str, peak: f64, local: bool| WindowRecord { kind: "weekly".into(), resets_at: at(end), peak,
+            first_obs: at(end) - days(6), last_obs: at(end) - days(1), hours: 40, days: 5, idle: false, local };
+        let mut local = local_codex(now);
+        local.weeks.insert("acct-busy".into(), vec![rec("2026-10-03T00:00:00Z", 100.0, true), rec("2026-10-10T00:00:00Z", 100.0, true), rec("2026-10-17T00:00:00Z", 100.0, true)]);
+        let mut history = History::default();
+        history.accounts.insert("Codex:u2:acct-busy".into(), AccountHistory { windows: vec![rec("2026-10-17T00:20:00Z", 30.0, false)], ..Default::default() });
+        let snapshot = Snapshot { accounts: vec![codex_pro("u2:acct-busy", 50.0, days(3), now)], updated_at: None };
+        let a = &report(&snapshot, &history, &Settings::default(), Some(&local), now).accounts[0].assessment;
+        assert_eq!((a.weeks_counted, a.limit_weeks, a.verdict, a.basis), (3, 2, Verdict::ExhaustedWeekly, Basis::LocalCodex));
+        let text = serde_json::to_string(&history).unwrap();
+        assert!(!text.contains("local"), "local weeks are never written to the history file");
     }
 
     #[test]

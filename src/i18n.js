@@ -75,6 +75,14 @@ const MESSAGES = {
     subUnusedCount: "{n} unused", subSavings: "could save {v}/mo",
     subClaudeFree: "After a Claude plan ends the account falls back to Claude Free, which does not include Claude Code. Remove the account from SlopBar once its paid period is over.",
     subCodexFree: "After a ChatGPT plan ends the account falls back to ChatGPT Free, which still includes Codex with lower limits.",
+
+    subLocalLast: "Last used here: {d}", subLocalToday: "Last used here: today", subLocalNever: "Not used on this PC since {d}",
+    subLocalIdle: "{n} days idle", subLocalThreads: "{n} threads in 28 days", subLocalTokens: "{v} tokens",
+    subIdleNow: "Weekly limit untouched: no use anywhere in the past 7 days.",
+    subLocalBasis: "Based on local Codex history on this PC and the untouched weekly limit, not on weeks of SlopBar readings.",
+    subLocalWeeks: "Includes weeks read from this PC's Codex history.",
+    subLocalCaveat: "Use in WSL, on other machines or in the cloud is not seen locally.",
+    subCodexLocal: "Codex rows also show this PC's own Codex history, which names the account behind each thread since {d}. Use in WSL, on other machines or in the cloud is not seen locally.",
   },
   pt: {
     sDiagnostics: "Diagnóstico",

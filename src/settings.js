@@ -251,8 +251,23 @@ function verdictLines(e) {
   }
   lines.push(t("subRecent", { hit: a.limit_weeks, n: a.weeks_counted, avg: pct(a.average_peak ?? 0) }));
   if (a.sub_window_limited) lines.push(t("subModelCap", { window: windowLabel({ kind: a.sub_window_limited }) }));
-  if (a.confidence === "low") lines.push(t("subLowConfidence"));
+  if (a.basis === "local_codex") lines.push(t(a.weeks_counted ? "subLocalWeeks" : "subLocalBasis"));
+  else if (a.confidence === "low") lines.push(t("subLowConfidence"));
   return lines;
+}
+
+const compact = (v) => new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(v);
+
+// What the Codex CLI on this PC remembers: "Last used here: Oct 8 · 12 days idle · 0 threads in 28 days".
+function localText(e) {
+  const l = e.local;
+  if (!l) return "";
+  const parts = [l.never_seen ? t("subLocalNever", { d: shortDate(l.attributed_since) })
+    : l.days_idle === 0 ? t("subLocalToday") : t("subLocalLast", { d: shortDate(l.last_local_activity) })];
+  if (!l.never_seen && l.days_idle > 0) parts.push(t("subLocalIdle", { n: l.days_idle }));
+  parts.push(t("subLocalThreads", { n: l.threads_28d }));
+  if (l.tokens_28d) parts.push(t("subLocalTokens", { v: compact(l.tokens_28d) }));
+  return parts.join(" · ");
 }
 
 function renewalText(e) {
@@ -291,6 +306,9 @@ function subscriptionRow(e) {
   const providerDate = e.provider_until && e.renewal?.source !== "provider" && new Date(e.provider_until) < Date.now()
     ? t("subProviderStale", { d: shortDate(e.provider_until) }) : "";
   const advice = adviceText(e);
+  const local = localText(e);
+  // Anything resting on this PC's history says what it cannot see.
+  const caveat = e.local && (a.basis === "local_codex" || a.verdict === "insufficient_data") ? t("subLocalCaveat") : "";
   return `
     <div class="account sub" data-key="${esc(key)}">
       <div class="avatar" style="background:hsl(${hue(e.id)} 55% 48%)">${esc((e.alias || e.email || "?").trim()[0].toUpperCase())}</div>
@@ -309,12 +327,15 @@ function subscriptionRow(e) {
       <span></span>
       <div class="monitor-state">
         <small>${esc(weekText)}${e.stale ? ` · ${t("lastReading")}` : ""}</small>
+        ${local ? `<small>${esc(local)}</small>` : ""}
+        ${e.idle_now ? `<small>${t("subIdleNow")}</small>` : ""}
         ${verdictLines(e).map((l) => `<small>${esc(l)}</small>`).join("")}
         ${providerDate ? `<small>${esc(providerDate)}</small>` : ""}
         ${kindNote ? `<small>${esc(kindNote)}</small>` : ""}
         ${e.store_billed ? `<small>${t("subStoreBilled")}</small>` : ""}
         ${e.delinquent ? `<small class="advice">${t("subDelinquent")}</small>` : ""}
         ${advice ? `<small class="advice">${esc(advice)}</small>` : ""}
+        ${caveat ? `<small>${esc(caveat)}</small>` : ""}
         ${paid ? `<div class="plan-fields">
           <label>${t("subNextBilling")} <input type="date" data-sub-date="${esc(key)}" value="${e.renewal ? e.renewal.at.slice(0, 10) : ""}" title="${t("subCorrectHint")}" /></label>
           ${prefs.next_billing || prefs.billing_day ? `<button class="link" data-sub-reset="${esc(key)}">${t("subResetDate")}</button>` : ""}
@@ -340,6 +361,7 @@ function renderSubscriptions() {
   patch($("subscriptions"), PROVIDERS.filter(([p]) => settings.providers[p]).map(([p, name]) => {
     const list = report.accounts.filter((e) => e.provider === p);
     const summary = providerSummary(p, report.providers.find((s) => s.provider === p));
+    const since = list.find((e) => e.local)?.local.attributed_since;
     return `
       <div class="provider">
         <div class="provider-head">
@@ -350,6 +372,7 @@ function renderSubscriptions() {
           ${list.length ? list.map(subscriptionRow).join("") : `<div class="empty">${t("noAccounts")}</div>`}
         </div>
         <p class="hint">${t(p === "claude" ? "subClaudeFree" : "subCodexFree")}</p>
+        ${p === "codex" && since ? `<p class="hint">${esc(t("subCodexLocal", { d: shortDate(since) }))}</p>` : ""}
       </div>`;
   }).join(""));
 }
