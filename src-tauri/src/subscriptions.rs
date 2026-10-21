@@ -445,6 +445,8 @@ pub struct Entry {
     pub ends_at: Option<DateTime<Utc>>,
     /// A payment failed and the provider is waiting for it.
     pub delinquent: bool,
+    /// The provider's own plan name ("chatgptpro"), when it reported one.
+    pub plan_code: Option<String>,
     /// The live weekly reading shows no use in the past seven days: 0% with its reset a full week out.
     pub idle_now: bool,
     /// Codex only: what the Codex CLI on this PC shows for this account.
@@ -545,6 +547,7 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
             cancel_after: prefs.cancel_after,
             ends_at: if paid { ends_at(acc, now) } else { None },
             delinquent: acc.billing.delinquent == Some(true),
+            plan_code: acc.billing.plan_code.clone(),
             idle_now,
             local: activity,
         }

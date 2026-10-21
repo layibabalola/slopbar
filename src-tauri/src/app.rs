@@ -168,6 +168,22 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             let target = match window { door::InspectTarget::Settings => inspect::Target::Settings, door::InspectTarget::Flyout => inspect::Target::Flyout };
             value(inspect::inspect(&app, target, page, screenshot).await?)
         }
+        R::ListSharingLocations => {
+            let (folder, remote) = {
+                let s = app.state::<AppState>().settings.lock().unwrap().clone();
+                (s.presence_folder, s.presence_remote)
+            };
+            Ok(serde_json::json!({
+                "folders": sync_folders().await,
+                "rclone": rclone_remotes().await,
+                "current": { "presence_folder": folder, "presence_remote": remote },
+                "next": "Set presence_remote (an rclone remote name, no colon) or presence_folder (a folder path) with update_settings.",
+            }))
+        }
+        R::OpenBillingPage { provider } => {
+            open_billing_page(provider).await?;
+            Ok(serde_json::json!({ "opened": subscriptions::billing_page(provider) }))
+        }
         R::OpenSettings => {
             show_settings(&app);
             Ok(serde_json::json!({ "opened": true }))

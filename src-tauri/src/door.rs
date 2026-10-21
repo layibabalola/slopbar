@@ -56,6 +56,10 @@ pub enum Request {
         #[serde(default = "yes")]
         screenshot: bool,
     },
+    /// Where in-use status can be shared: detected sync folders and rclone remotes.
+    ListSharingLocations,
+    /// Open the provider's billing page in the user's browser (fixed URL per provider).
+    OpenBillingPage { provider: Provider },
     /// Quit as the tray's Quit does.
     QuitApp,
     /// Quit, then start the installed executable again (picking up a new build).

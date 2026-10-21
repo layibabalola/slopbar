@@ -64,6 +64,7 @@ pub(crate) fn billing(raw: &serde_json::Value, account_id: Option<&str>) -> Opti
         will_renew: last["will_renew"].as_bool().map(|w| w && !cancelling),
         delinquent: e["is_delinquent"].as_bool(),
         billing_period: e["billing_period"].as_str().map(String::from),
+        plan_code: e["subscription_plan"].as_str().filter(|s| !s.is_empty()).map(String::from),
         fetched_at: Some(Utc::now()),
         ..Default::default()
     })

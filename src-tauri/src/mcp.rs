@@ -17,7 +17,7 @@ const MAX_TEXT: usize = 512;
 
 const INSTRUCTIONS: &str = "SlopBar shows Claude and Codex account usage and switches accounts. These tools \
 act on the running SlopBar app exactly like its Settings window. Read-only tools (get_usage, get_settings, \
-get_subscription_report, inspect_window, get_app_info, list_diagnostic_exports) are always fine. To see SlopBar's \
+get_subscription_report, inspect_window, list_sharing_locations, get_app_info, list_diagnostic_exports) are always fine. To see SlopBar's \
 windows use inspect_window, never screenshots or control of the user's desktop. Call any tool that changes something (update_settings, \
 switch_account, add_account, connect_monitoring, disconnect_monitoring, remove_account, refresh_usage, \
 install_update, export_diagnostics, open_settings, quit_app, restart_app) only when the user asked for that action in this \
@@ -109,6 +109,9 @@ fn catalog() -> Vec<Tool> {
                 "page": { "type": "string", "enum": crate::door::SETTINGS_PAGES, "description": "Settings only: the page to show." },
                 "screenshot": { "type": "boolean", "description": "Also write a PNG (default true)." },
             }), &["window"]), true, false, true, false),
+        tool("list_sharing_locations", "List sharing locations", "Where SlopBar can share which accounts are in use with the user's other computers: sync folders it detected (OneDrive, Dropbox, Google Drive, iCloud Drive, Box) and the user's rclone remotes (name and type), plus the current choice. Turn sharing on with update_settings: presence_remote for an rclone remote, or presence_folder for a folder.", none(), true, false, true, false),
+        tool("open_billing_page", "Open billing page", "Open the provider's own billing page (where a plan is managed or cancelled) in the user's browser. SlopBar cannot cancel a plan; the user does it on that page. Use only when the user asks.",
+            schema(json!({ "provider": { "type": "string", "enum": ["claude", "codex"] } }), &["provider"]), false, false, true, true),
         tool("open_settings", "Open Settings window", "Show SlopBar's Settings window on the user's screen.", none(), false, false, true, false),
         tool("quit_app", "Quit SlopBar", "Quit SlopBar as its tray menu's Quit does. Monitoring stops until SlopBar is started again; these tools cannot start it.", none(), false, true, false, false),
         tool("restart_app", "Restart SlopBar", "Quit SlopBar cleanly and start the installed executable again, e.g. to pick up a newly installed build. The tools are unavailable for a few seconds.", none(), false, false, false, false),
@@ -151,6 +154,8 @@ fn request(name: &str, args: &Value) -> Option<Result<Request, String>> {
         "install_update" => simple("install_update"),
         "get_app_info" => simple("get_app_info"),
         "inspect_window" => with("inspect_window"),
+        "list_sharing_locations" => simple("list_sharing_locations"),
+        "open_billing_page" => with("open_billing_page"),
         "open_settings" => simple("open_settings"),
         "quit_app" => simple("quit_app"),
         "restart_app" => simple("restart_app"),
@@ -401,7 +406,7 @@ mod tests {
     fn every_listed_tool_maps_to_a_door_operation() {
         let listed = rpc(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).unwrap();
         let tools = listed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 21);
         let account = json!({ "provider": "claude", "id": "a1" });
         for t in tools {
             let name = t["name"].as_str().unwrap();
@@ -411,6 +416,7 @@ mod tests {
                 "update_settings" => json!({ "patch": { "refresh_minutes": 15 } }),
                 "add_account" => json!({ "provider": "codex" }),
                 "inspect_window" => json!({ "window": "settings", "page": "subscriptions" }),
+                "open_billing_page" => json!({ "provider": "codex" }),
                 "switch_account" | "connect_monitoring" | "disconnect_monitoring" | "remove_account" => account.clone(),
                 _ => json!({}),
             };
@@ -420,7 +426,7 @@ mod tests {
         assert_eq!(switched["result"]["structuredContent"], json!({ "op": "switch_account", "provider": "claude", "id": "a1" }));
         let marked = |hint: &str| -> Vec<&str> { tools.iter().filter(|t| t["annotations"][hint] == true).map(|t| t["name"].as_str().unwrap()).collect() };
         assert_eq!(marked("destructiveHint"), ["refresh_usage", "update_settings", "switch_account", "disconnect_monitoring", "remove_account", "install_update", "quit_app"]);
-        assert_eq!(marked("readOnlyHint"), ["get_usage", "get_settings", "get_subscription_report", "check_for_updates", "get_app_info", "inspect_window", "list_diagnostic_exports"]);
+        assert_eq!(marked("readOnlyHint"), ["get_usage", "get_settings", "get_subscription_report", "check_for_updates", "get_app_info", "inspect_window", "list_sharing_locations", "list_diagnostic_exports"]);
     }
 
     #[test]
