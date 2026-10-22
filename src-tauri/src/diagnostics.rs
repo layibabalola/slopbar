@@ -198,6 +198,13 @@ pub enum Event {
         native_sources: usize,
         wsl_sources: usize,
     },
+    /// How long each step of a usage refresh took (see `Phases`); `published_ms` is when the
+    /// widget had the new numbers.
+    RefreshPhases {
+        phases: Vec<PhaseTime>,
+        published_ms: u64,
+        total_ms: u64,
+    },
     Action {
         action: Action,
         code: Code,
@@ -262,6 +269,67 @@ pub enum Event {
         monitor_code: Code,
         windows: Vec<Window>,
     },
+}
+/// A step of a usage refresh, in the order a refresh runs them. The widget waits only for the
+/// steps up to `Publish`; the others follow the published snapshot.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshPhase {
+    /// Finding the CLIs' homes (Windows and WSL).
+    Discover,
+    /// Asking the provider who each new CLI login belongs to.
+    Identities,
+    /// Saving live CLI logins into the vault.
+    Capture,
+    /// Syncing project profiles' renewals into the vault.
+    Pins,
+    Vault,
+    /// Every account's usage, in parallel.
+    Fetch,
+    /// Automatic switching.
+    Balance,
+    /// The snapshot is published and the widget redrawn.
+    Publish,
+    /// In-use sharing with other computers, and inferred use elsewhere.
+    Presence,
+    /// History, forecasts, spend, the journal's samples.
+    Bookkeeping,
+    /// The completed snapshot is published.
+    Final,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PhaseTime {
+    pub phase: RefreshPhase,
+    pub elapsed_ms: u64,
+}
+/// Times a refresh's steps as they end; steps must end in `RefreshPhase` order.
+pub struct Phases {
+    started: std::time::Instant,
+    last: std::time::Instant,
+    done: Vec<PhaseTime>,
+    published_ms: u64,
+}
+impl Phases {
+    pub fn start() -> Self {
+        let now = std::time::Instant::now();
+        Self { started: now, last: now, done: vec![], published_ms: 0 }
+    }
+    /// Ends `phase`: the time since the previous one ended.
+    pub fn end(&mut self, phase: RefreshPhase) {
+        debug_assert!(self.done.last().map_or(true, |p| p.phase < phase), "{phase:?} out of order");
+        self.done.push(PhaseTime { phase, elapsed_ms: millis(self.last) });
+        self.last = std::time::Instant::now();
+        if phase == RefreshPhase::Publish {
+            self.published_ms = millis(self.started);
+        }
+    }
+    #[cfg(test)]
+    pub fn order(&self) -> Vec<RefreshPhase> {
+        self.done.iter().map(|p| p.phase).collect()
+    }
+    pub fn event(&self) -> Event {
+        Event::RefreshPhases { phases: self.done.clone(), published_ms: self.published_ms, total_ms: millis(self.started) }
+    }
 }
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Window {
@@ -366,6 +434,7 @@ enum Family {
     Sample,
     PollStarted,
     PollFinished,
+    RefreshPhases,
     Action(Action),
 }
 // Ignore measurement timestamps/timing jitter when deciding whether state changed.
@@ -397,6 +466,14 @@ fn observation(event: &Event) -> Option<(Family, Event)> {
         Event::PollFinished { elapsed_ms, .. } => {
             *elapsed_ms = if *elapsed_ms >= 60_000 { 60_000 } else { 0 };
             Family::PollFinished
+        }
+        // A slow step (5 s or more) is news; ordinary timings are kept with the hourly heartbeat.
+        Event::RefreshPhases { phases, published_ms, total_ms } => {
+            let slow = |ms: &mut u64| *ms = if *ms >= 5_000 { 5_000 } else { 0 };
+            phases.iter_mut().for_each(|p| slow(&mut p.elapsed_ms));
+            slow(published_ms);
+            slow(total_ms);
+            Family::RefreshPhases
         }
         Event::Action {
             action, elapsed_ms, ..
@@ -670,7 +747,8 @@ impl Recorder {
             | Event::Sample { .. }
             | Event::Frontend { .. }
             | Event::Http { .. }
-            | Event::PollFinished { .. } => false,
+            | Event::PollFinished { .. }
+            | Event::RefreshPhases { .. } => false,
             _ => true,
         };
         let previous = s.generation;
@@ -1040,6 +1118,41 @@ mod crash_tests {
 mod tests {
     use super::*;
     use crate::test_support::TempDir;
+    #[test]
+    fn a_refresh_publishes_usage_before_sharing_and_bookkeeping() {
+        use RefreshPhase as P;
+        let mut phases = Phases::start();
+        for phase in [P::Discover, P::Identities, P::Capture, P::Pins, P::Vault, P::Fetch, P::Balance, P::Publish] {
+            phases.end(phase);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        for phase in [P::Presence, P::Bookkeeping, P::Final] {
+            phases.end(phase);
+        }
+        let order = phases.order();
+        let at = |p| order.iter().position(|o| *o == p).unwrap();
+        assert!(at(P::Fetch) < at(P::Publish) && at(P::Balance) < at(P::Publish));
+        // Nothing that can be slow (rclone, disk) stands between the usage and the widget.
+        for after in [P::Presence, P::Bookkeeping, P::Final] {
+            assert!(at(P::Publish) < at(after), "{after:?}");
+        }
+        let Event::RefreshPhases { phases: times, published_ms, total_ms } = phases.event() else { panic!() };
+        assert_eq!(times.len(), 11);
+        assert!(published_ms < total_ms && total_ms >= 30, "{published_ms} {total_ms}");
+        assert!(times.iter().map(|t| t.elapsed_ms).sum::<u64>() <= total_ms);
+        // Ordinary timings are one observation; a slow step is a new one.
+        let quiet = |ms| Event::RefreshPhases { phases: vec![PhaseTime { phase: P::Fetch, elapsed_ms: ms }], published_ms: ms, total_ms: ms };
+        assert!(observation(&quiet(120)).map(|o| o.1) == observation(&quiet(900)).map(|o| o.1));
+        assert!(observation(&quiet(120)).map(|o| o.1) != observation(&quiet(25_000)).map(|o| o.1));
+    }
+    #[test]
+    #[should_panic(expected = "out of order")]
+    #[cfg(debug_assertions)]
+    fn phases_must_end_in_order() {
+        let mut phases = Phases::start();
+        phases.end(RefreshPhase::Publish);
+        phases.end(RefreshPhase::Fetch);
+    }
     #[test]
     fn export_allowlist_excludes_identities_credentials_paths_and_raw_errors() {
         let dir = TempDir::new();

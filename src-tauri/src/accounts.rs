@@ -156,16 +156,17 @@ fn claude_token(source: &Source) -> Option<String> {
 
 /// Resolves (once per token) who each live Claude login belongs to.
 pub async fn resolve_identities(client: &reqwest::Client, sources: &[Source]) {
-    for token in sources.iter().filter_map(claude_token) {
-        let key = stable_hash(&token);
-        let known = CLAUDE_IDENTITY.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&key));
-        if known {
-            continue;
-        }
-        if let Some(account) = claude_profile(client, &token).await {
-            CLAUDE_IDENTITY.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, account);
-        }
-    }
+    let mut unknown: Vec<_> = sources.iter().filter_map(claude_token).map(|token| (stable_hash(&token), token))
+        .filter(|(key, _)| !CLAUDE_IDENTITY.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(key)))
+        .collect();
+    unknown.sort_by(|a, b| a.0.cmp(&b.0));
+    unknown.dedup_by(|a, b| a.0 == b.0);
+    // Read-only profile lookups: all at once, so one slow login does not hold up the others.
+    let found = futures::future::join_all(unknown.into_iter().map(|(key, token)| async move {
+        claude_profile(client, &token).await.map(|account| (key, account))
+    })).await;
+    let mut known = CLAUDE_IDENTITY.lock().unwrap();
+    known.get_or_insert_with(HashMap::new).extend(found.into_iter().flatten());
 }
 
 /// The login currently signed in at `source`, if any. `known` are the vault's slots.
