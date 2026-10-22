@@ -1090,7 +1090,7 @@ const SWITCHER_LINGER: Duration = Duration::from_secs(30);
 /// built when first opened and destroyed when closed, so neither keeps a WebView2 renderer
 /// while unused. Whatever must outlive them is kept here or in settings, not in the page. The
 /// web taskbar widget is built only while the setting `native_widget` is off (`dock::apply_mode`),
-/// and the flyout on its first open, released a minute after it closes (see `panel`).
+/// and the flyout hidden shortly after startup, kept for instant opening (see `panel::prepare`).
 pub(crate) const ON_DEMAND: [&str; 4] = [SETTINGS_LABEL, SWITCHER_LABEL, dock::LABEL, panel::LABEL];
 
 /// The window `label` (one of `ON_DEMAND`), created from its configuration if it is not open.
@@ -2185,6 +2185,8 @@ pub fn run() {
             apply_settings(handle);
             apply_hotkey(handle);
             dock::show_docked(handle);
+            // Built hidden now, so the first click on the widget opens the flyout at once.
+            panel::prepare(handle);
 
             // Updates install silently; after one, say so once in the widget.
             let current = app.package_info().version.to_string();

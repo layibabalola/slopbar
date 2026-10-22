@@ -561,16 +561,31 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             0
         }
         cc::WM_MOUSELEAVE => {
-            LOCAL.with(|l| {
+            let tip = LOCAL.with(|l| {
                 let mut l = l.borrow_mut();
                 l.hot = false;
                 l.pressed = false;
+                l.tooltip
             });
+            // A click turned the tooltips off; the next hover may show them again.
+            if !tip.is_null() {
+                wm::SendMessageW(tip, cc::TTM_ACTIVATE, 1, 0);
+            }
             redraw(hwnd);
             0
         }
         wm::WM_LBUTTONDOWN => {
-            LOCAL.with(|l| l.borrow_mut().pressed = true);
+            let tip = LOCAL.with(|l| {
+                let mut l = l.borrow_mut();
+                l.pressed = true;
+                l.tooltip
+            });
+            // Clicking opens the flyout: the tooltip goes at once and stays away until the
+            // pointer leaves the widget, so it never sits over the flyout.
+            if !tip.is_null() {
+                wm::SendMessageW(tip, cc::TTM_POP, 0, 0);
+                wm::SendMessageW(tip, cc::TTM_ACTIVATE, 0, 0);
+            }
             km::SetCapture(hwnd);
             redraw(hwnd);
             0
