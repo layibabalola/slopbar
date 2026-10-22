@@ -184,7 +184,7 @@ fn history_key(provider: Provider, id: &str) -> String {
 }
 
 /// Settings keys per account, as aliases use (`providers::alias_key`).
-fn pref_key(provider: Provider, id: &str) -> String {
+pub(crate) fn pref_key(provider: Provider, id: &str) -> String {
     crate::providers::alias_key(provider, id)
 }
 

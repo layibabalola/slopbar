@@ -16,7 +16,7 @@ const LIST_LIMIT: usize = 20;
 const MAX_TEXT: usize = 512;
 
 const INSTRUCTIONS: &str = "SlopBar shows Claude and Codex account usage and switches accounts. These tools \
-act on the running SlopBar app exactly like its Settings window. Read-only tools (get_usage, get_settings, \
+act on the running SlopBar app exactly like its Settings window. Read-only tools (get_usage, get_headroom, get_settings, \
 get_subscription_report, inspect_window, list_sharing_locations, get_app_info, list_diagnostic_exports) are always fine. To see SlopBar's \
 windows use inspect_window, never screenshots or control of the user's desktop. Call any tool that changes something (update_settings, \
 switch_account, add_account, connect_monitoring, disconnect_monitoring, remove_account, refresh_usage, \
@@ -29,7 +29,12 @@ which affects running agent sessions, including possibly your own. remove_accoun
 revoke saved sign-ins. Diagnostics exports exclude emails, tokens and raw provider bodies; they are for local \
 analysis and manual sharing only, never upload them on your own. SlopBar cannot cancel or change a paid plan \
 and no tool does: get_subscription_report only says which plans look unneeded, and the user cancels on the \
-provider's own billing page.";
+provider's own billing page. Before a long or heavy job, call get_headroom to see whether the account in use lasts \
+until its limits reset at the current pace, and recommend_account (with expected_percent, the share of a week the job \
+needs, and hours) to see which account suits it; both read the last snapshot and are always fine. recommend_account \
+only reports unless switch is true, and switch: true changes the account the CLI uses exactly as switch_account does: \
+pass it, or call switch_account, only when the user allowed switching accounts in this conversation. Otherwise tell \
+the user what it recommends.";
 
 fn schema(properties: Value, required: &[&str]) -> Value {
     let mut schema = json!({ "type": "object", "properties": properties, "additionalProperties": false });
@@ -90,6 +95,18 @@ fn catalog() -> Vec<Tool> {
     let tool = |name, title, description, input, read_only, destructive, idempotent, open_world| Tool { name, title, description, input, read_only, destructive, idempotent, open_world };
     vec![
         tool("get_usage", "Get account usage", "Every Claude and Codex account SlopBar knows: provider, id, email, plan, which one is in use on this machine (active, sources), on the user's other machines (remote: machine, where, seen_at, live — shared through presence_folder or presence_remote) and whether usage is rising outside this PC (used_outside), usage windows (percent used, reset time), banked resets, monitoring state and errors, as last refreshed.", none(), true, false, true, false),
+        tool("get_headroom", "Get headroom", "For one account (provider and id), or the account in use of one provider or of each: per usage window the percent used and left, time to reset, the recent pace (percentage points per hour, from the past few hours of readings or else the window's average) and when the limit is reached at that pace; plus advice: plenty, will_run_out_before_reset, at_limit, or unknown for a stale or failed reading. Served from the last snapshot, no network.",
+            schema(json!({
+                "provider": { "type": "string", "enum": ["claude", "codex"] },
+                "id": { "type": "string", "description": "An account id from get_usage; default: the account in use." },
+            }), &[]), true, false, true, false),
+        tool("recommend_account", "Recommend account", "Rank one provider's accounts for a job: fresh, error-free accounts with room for it, preferring the one whose weekly reset or plan renewal comes soonest (its unused capacity is lost then). Accounts in use on another machine, lapsed or ending plans, failed or stale readings and accounts at a limit are listed as excluded with the reason. Returns the ranking with reasons, action (stay, switch or none) and the recommended account. Read-only unless switch is true, which then switches to it as switch_account does (with the automatic-switching cooldown); use switch only when the user allowed switching.",
+            schema(json!({
+                "provider": { "type": "string", "enum": ["claude", "codex"] },
+                "expected_percent": { "type": "number", "minimum": 0, "maximum": 100, "description": "How much of a week's limit the job needs, in percent." },
+                "hours": { "type": "number", "minimum": 0, "maximum": 168, "description": "How long the job runs; a weekly reset inside it refills the limit." },
+                "switch": { "type": "boolean", "description": "Switch to the recommended account (default false). Only when the user allowed switching." },
+            }), &["provider"]), false, true, true, true),
         tool("refresh_usage", "Refresh usage", "Poll every account's usage now (as the tray's Refresh does) and return the new snapshot. If automatic switching is on and a threshold is reached, this can switch accounts.", none(), false, true, false, true),
         tool("get_settings", "Get settings", "SlopBar's settings: refresh interval, providers, language, launch at login, updates, account aliases, automatic switching rules and notifications.", none(), true, false, true, false),
         tool("get_subscription_report", "Get subscription report", "Per account: plan, this week's usage and pace, the last four completed weeks (how many reached the limit, average and median peak), a verdict (insufficient_data, exhausted_weekly, healthy, underused or unused), whether renewing looks unneeded, the next renewal with its source (entered, provider or estimated) and the monthly cost; plus totals per provider. A verdict needs at least two well-observed weeks. Codex accounts also carry idle_now (no use anywhere in the past seven days) and local: what the Codex CLI on this PC shows (last_local_activity, days_idle, never_seen, attributed_since, threads and tokens over 7 and 28 days and per ISO week, backfilled_weeks). A long-idle Codex plan can be judged unused from that local history; such verdicts have basis local_codex, and use in WSL, on other machines or in the cloud is not seen locally.", none(), true, false, true, false),
@@ -145,6 +162,8 @@ fn request(name: &str, args: &Value) -> Option<Result<Request, String>> {
     };
     Some(match name {
         "get_usage" => simple("get_usage"),
+        "get_headroom" => with("get_headroom"),
+        "recommend_account" => with("recommend_account"),
         "refresh_usage" => simple("refresh"),
         "get_settings" => simple("get_settings"),
         "get_subscription_report" => simple("get_subscriptions"),
@@ -219,6 +238,7 @@ fn explain(error: &str) -> String {
         "active" => "That account is in use; switch to another account before removing it.".into(),
         "monitor_busy" => "Another operation on that account (or a sign-in for that provider) is in progress. Try again when it finishes.".into(),
         "monitor_wrong_account" => "No saved account matches that provider and id. Use the ids from get_usage.".into(),
+        "no_active_account" => "No account is in use for that provider on this machine. Pass an id from get_usage.".into(),
         "monitor_login_failed" => "The monitoring sign-in could not be started.".into(),
         "CLI not found" => "That provider's CLI is not installed or not found on PATH.".into(),
         other => other.chars().filter(|c| !c.is_control()).take(MAX_TEXT).collect(),
@@ -406,7 +426,7 @@ mod tests {
     fn every_listed_tool_maps_to_a_door_operation() {
         let listed = rpc(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).unwrap();
         let tools = listed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 21);
+        assert_eq!(tools.len(), 23);
         let account = json!({ "provider": "claude", "id": "a1" });
         for t in tools {
             let name = t["name"].as_str().unwrap();
@@ -417,6 +437,7 @@ mod tests {
                 "add_account" => json!({ "provider": "codex" }),
                 "inspect_window" => json!({ "window": "settings", "page": "subscriptions" }),
                 "open_billing_page" => json!({ "provider": "codex" }),
+                "recommend_account" => json!({ "provider": "claude", "expected_percent": 30, "hours": 6 }),
                 "switch_account" | "connect_monitoring" | "disconnect_monitoring" | "remove_account" => account.clone(),
                 _ => json!({}),
             };
@@ -424,9 +445,12 @@ mod tests {
         }
         let switched = tool("switch_account", account, None);
         assert_eq!(switched["result"]["structuredContent"], json!({ "op": "switch_account", "provider": "claude", "id": "a1" }));
+        assert_eq!(tool("get_headroom", json!({}), None)["result"]["structuredContent"], json!({ "op": "get_headroom", "provider": null, "id": null }));
+        let rec = tool("recommend_account", json!({ "provider": "codex" }), None);
+        assert_eq!(rec["result"]["structuredContent"]["switch"], false, "recommend_account only reports by default");
         let marked = |hint: &str| -> Vec<&str> { tools.iter().filter(|t| t["annotations"][hint] == true).map(|t| t["name"].as_str().unwrap()).collect() };
-        assert_eq!(marked("destructiveHint"), ["refresh_usage", "update_settings", "switch_account", "disconnect_monitoring", "remove_account", "install_update", "quit_app"]);
-        assert_eq!(marked("readOnlyHint"), ["get_usage", "get_settings", "get_subscription_report", "check_for_updates", "get_app_info", "inspect_window", "list_sharing_locations", "list_diagnostic_exports"]);
+        assert_eq!(marked("destructiveHint"), ["recommend_account", "refresh_usage", "update_settings", "switch_account", "disconnect_monitoring", "remove_account", "install_update", "quit_app"]);
+        assert_eq!(marked("readOnlyHint"), ["get_usage", "get_headroom", "get_settings", "get_subscription_report", "check_for_updates", "get_app_info", "inspect_window", "list_sharing_locations", "list_diagnostic_exports"]);
     }
 
     #[test]
@@ -438,6 +462,9 @@ mod tests {
             ("get_app_info", json!({ "bogus": 1 })),
             ("get_usage", json!("str")),
             ("list_diagnostic_exports", json!({ "bogus": 1 })),
+            ("recommend_account", json!({})),
+            ("recommend_account", json!({ "provider": "claude", "expected_percent": "lots" })),
+            ("get_headroom", json!({ "provider": "claude", "window": "weekly" })),
         ] {
             assert_eq!(tool(name, args.clone(), None)["result"]["isError"], true, "{name} {args}");
         }
