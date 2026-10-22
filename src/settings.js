@@ -405,6 +405,7 @@ function poolText(s) {
   else {
     parts.push(t("subPool", { n: p.plans_needed, unit: p.unit, spare: pct(p.spare_percent ?? 0), held: amount(p.plans_held) }));
     parts.push(t("subPoolBasis", { n: p.weeks_used }) + (p.confidence === "low" ? ` (${t("subPoolEstimate")})` : ""));
+    if (p.basis === "local_codex") parts.push(t("subPoolLocal"));
   }
   if (p.unweighted) parts.push(t("subPoolUnweighted", { n: p.unweighted }));
   const c = s.cost_per_use;

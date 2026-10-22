@@ -572,6 +572,10 @@ pub struct Entry {
     /// Inputs for the provider's pool sizing; not part of the report.
     #[serde(skip)]
     pool_weeks: BTreeMap<NaiveDate, f64>,
+    /// Weeks of `pool_weeks` read from this PC's Codex rollouts.
+    #[serde(skip)]
+    pool_local: BTreeSet<NaiveDate>,
+    /// The week SlopBar started watching the account.
     #[serde(skip)]
     pool_since: Option<NaiveDate>,
 }
@@ -658,8 +662,10 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
         let renewal = if paid { next_renewal(acc, &prefs, now) } else { None };
         let ends_at = if paid { ends_at(acc, now) } else { None };
         let cost_per_use = monthly_cost.map(|c| cost_per_use(c, &assessment, activity.as_ref()));
-        let pool_weeks = week_peaks(h, now);
-        let pool_since = h.first_seen.map(|t| monday(t.date_naive())).into_iter().chain(pool_weeks.keys().next().copied()).min();
+        let (pool_weeks, pool_local) = week_peaks(h, now);
+        // Only from when SlopBar watched it: before then, rollout weeks exist only for the accounts
+        // used on this PC, and leaving the rest out would make the fleet look less busy.
+        let pool_since = h.first_seen.map(|t| monday(t.date_naive()));
         let credits = (acc.provider == Provider::Codex).then(|| credit_info(acc.credits.as_deref(), h.credits.as_ref())).flatten();
         Entry {
             renewal_warning: if paid { renewal_warning(renewal.as_ref(), ends_at, &assessment, now) } else { None },
@@ -690,6 +696,7 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
             cost_per_use,
             credits,
             pool_weeks,
+            pool_local,
             pool_since,
         }
     }).collect();
@@ -773,14 +780,16 @@ fn monday(d: NaiveDate) -> NaiveDate {
 /// Each completed weekly window watched closely enough to count, by the Monday of the UTC week
 /// it reset in: accounts reset on different days, but each has one window ending per week. When
 /// an idle stretch and a real window end in the same week, the higher peak.
-fn week_peaks(h: &AccountHistory, now: DateTime<Utc>) -> BTreeMap<NaiveDate, f64> {
+fn week_peaks(h: &AccountHistory, now: DateTime<Utc>) -> (BTreeMap<NaiveDate, f64>, BTreeSet<NaiveDate>) {
     let mut out = BTreeMap::new();
+    let mut local = BTreeSet::new();
     for r in h.windows.iter().filter(|r| r.kind == "weekly" && r.resets_at <= now && r.counts()) {
         let week = monday((r.resets_at - chrono::Duration::seconds(1)).date_naive());
         let peak = out.entry(week).or_insert(0.0);
         *peak = f64::max(*peak, r.peak);
+        if r.local { local.insert(week); }
     }
-    out
+    (out, local)
 }
 
 /// How many plans a provider's usage needs: "your usage fits in N plans; you hold M".
@@ -807,6 +816,8 @@ pub struct Pool {
     /// How far `plans_needed` exceeds `demand_p90`, in percent.
     pub spare_percent: Option<f64>,
     pub confidence: Confidence,
+    /// `LocalCodex` when a counted week includes one read from this PC's Codex rollouts.
+    pub basis: Basis,
 }
 
 /// Sums each recent week's peak across the paid plans, weighted by `plan_weight`, and sizes the
@@ -820,6 +831,7 @@ fn pool(provider: Provider, paid: &[&Entry], now: DateTime<Utc>) -> Pool {
     let all: BTreeSet<NaiveDate> = weighted.iter().flat_map(|(e, _)| e.pool_weeks.keys().copied()).collect();
     let mut demands = Vec::new();
     let mut estimated = 0u8;
+    let mut local = false;
     for week in all.iter().rev().take(POOL_WEEKS) {
         let known: Vec<usize> = (0..weighted.len()).filter(|&i| weighted[i].0.pool_since.is_some_and(|s| s <= *week)).collect();
         let held: f64 = known.iter().map(|&i| weighted[i].1).sum();
@@ -834,6 +846,7 @@ fn pool(provider: Provider, paid: &[&Entry], now: DateTime<Utc>) -> Pool {
             }
         }).sum();
         estimated += filled as u8;
+        local |= known.iter().any(|&i| weighted[i].0.pool_local.contains(week));
         demands.push(demand);
     }
     let weeks_used = demands.len() as u8;
@@ -848,7 +861,8 @@ fn pool(provider: Provider, paid: &[&Entry], now: DateTime<Utc>) -> Pool {
     let spare_percent = demand_p90.zip(plans_needed).filter(|(d, _)| *d > 0.0).map(|(d, n)| (n as f64 / d - 1.0) * 100.0);
     let confidence = if weeks_used >= RECENT as u8 && estimated == 0 { Confidence::High } else { Confidence::Low };
     Pool { unit: reference_plan(provider), plans_held, unweighted: paid.len() - weighted.len(), weeks_used,
-        weeks_needed: POOL_MIN_WEEKS, weeks_estimated: estimated, demand_p90, live_demand, plans_needed, spare_percent, confidence }
+        weeks_needed: POOL_MIN_WEEKS, weeks_estimated: estimated, demand_p90, live_demand, plans_needed, spare_percent, confidence,
+        basis: if local { Basis::LocalCodex } else { Basis::Observed } }
 }
 
 /// Nearest-rank percentile: with fewer than ten weeks the 90th is the busiest week.
@@ -1500,6 +1514,23 @@ mod tests {
         history.accounts.get_mut("Claude:c").unwrap().windows.retain(|r| r.resets_at != second);
         let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
         assert_eq!((p.weeks_used, p.weeks_estimated), (3, 0));
+    }
+
+    #[test]
+    fn weeks_before_slopbar_watched_the_fleet_do_not_count_and_local_weeks_say_so() {
+        let (snapshot, mut history, now) = fleet(&[("a", "20x", &[80.0, 80.0, 80.0]), ("b", "20x", &[10.0, 10.0, 10.0])]);
+        // b was only first seen in the last week: the two before it cannot size the pool.
+        history.accounts.get_mut("Claude:b").unwrap().first_seen = Some(at("2026-09-15T00:00:00Z"));
+        let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
+        assert_eq!((p.weeks_used, p.basis), (3, Basis::Observed));
+        for h in history.accounts.values_mut() { h.first_seen = Some(at("2026-09-15T00:00:00Z")); }
+        let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
+        assert_eq!((p.weeks_used, p.plans_needed), (1, None));
+        // A week read from this PC's rollouts counts, and the pool says it rests on them.
+        for h in history.accounts.values_mut() { h.first_seen = Some(at("2026-08-31T00:00:00Z")); }
+        history.accounts.get_mut("Claude:a").unwrap().windows[0].local = true;
+        let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
+        assert_eq!((p.weeks_used, p.basis), (3, Basis::LocalCodex));
     }
 
     #[test]

@@ -78,7 +78,7 @@ const MESSAGES = {
     subPaidCount: "{n} paid", subMonthlyTotal: "{v}/mo", subUnpriced: "{n} unpriced", subExhaustedCount: "{n} run out weekly",
     subUnusedCount: "{n} unused", subSavings: "could save {v}/mo",
     subPool: "Your usage fits in {n} × {unit} (+{spare} spare); you hold {held}", subPoolBasis: "busiest of {n} weeks + 20%",
-    subPoolEstimate: "estimate", subPoolInsufficient: "Pool size: not enough history yet ({n} of {needed} weeks)",
+    subPoolEstimate: "estimate", subPoolLocal: "includes weeks read from this PC's Codex history", subPoolInsufficient: "Pool size: not enough history yet ({n} of {needed} weeks)",
     subPoolUnweighted: "{n} plans of unknown size left out",
     subBlendedPercent: "{v} per 1% of a {unit} week used", subPerPercent: "{v} per 1% of the weekly limit used",
     subPerThread: "{v} per thread (this PC only)",
