@@ -12,6 +12,7 @@
       {
         "label": "dock",
         "title": "SlopBar",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --process-per-site --disable-gpu",
         "url": "index.html",
         "width": 160,
         "height": 48,
@@ -27,6 +28,7 @@
       {
         "label": "panel",
         "title": "SlopBar",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --process-per-site --disable-gpu",
         "url": "index.html",
         "width": 380,
         "height": 320,
@@ -45,7 +47,9 @@
       },
       {
         "label": "switcher",
+        "create": false,
         "title": "SlopBar",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --process-per-site --disable-gpu",
         "url": "switcher.html",
         "width": 440,
         "height": 360,
@@ -65,7 +69,9 @@
       },
       {
         "label": "settings",
+        "create": false,
         "title": "SlopBar",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --process-per-site --disable-gpu",
         "url": "settings.html",
         "width": 1000,
         "height": 700,

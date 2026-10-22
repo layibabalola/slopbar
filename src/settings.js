@@ -1430,5 +1430,7 @@ await loadSubscriptions();
 await loadHealth();
 let page = "accounts";
 try { page = localStorage.getItem("settings-page") || page; } catch {}
+// Asked for a page while this window was being created (it is destroyed when closed).
+page = (await invoke("take_settings_page").catch(() => null)) || page;
 showPage(page);
 if (page === "usage") loadUsage();
