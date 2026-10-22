@@ -1,4 +1,4 @@
-use crate::{accounts, auto_monitor, balancer, calendar, codex_local, diagnostics, digest, dock, door, headroom, health, inspect, migrate, model, monitoring, notify, panel, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates};
+use crate::{accounts, active_log, auto_monitor, balancer, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, migrate, model, monitoring, notify, panel, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates, usage_index};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -39,6 +39,11 @@ pub struct AppState {
     pub(crate) usage_history: Mutex<subscriptions::History>,
     /// The Codex CLI's own history on this PC, read in the background after each refresh.
     pub(crate) codex_local: Mutex<Option<std::sync::Arc<codex_local::Local>>>,
+    /// Which account each CLI had signed in when (see `active_log`), and when it was last saved.
+    pub(crate) active_log: Mutex<active_log::Log>,
+    active_saved: Mutex<Option<Instant>>,
+    /// Tokens by account, repository and model from the CLIs' files here, read after each refresh.
+    pub(crate) usage_index: Mutex<Option<std::sync::Arc<usage_index::Index>>>,
     /// When each provider was last switched automatically (the balancer's cooldown).
     pub(crate) last_switch: Mutex<HashMap<Provider, Instant>>,
     /// The past few hours of readings, for the agents' pace forecasts.
@@ -252,6 +257,13 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::Refresh => value(do_refresh(&app).await),
         R::GetSettings => value(app.state::<AppState>().settings.lock().unwrap().clone()),
         R::GetSubscriptions => value(subscription_report(&app.state::<AppState>())),
+        R::GetUsageBreakdown { provider, account, days, group_by } => {
+            if days.is_some_and(|d| !(1..=usage_index::LOOKBACK_DAYS as u32).contains(&d)) {
+                return Err(format!("days must be 1-{}", usage_index::LOOKBACK_DAYS));
+            }
+            value(usage_breakdown(&app, usage_index::Filter { provider, account, days: days.unwrap_or(7), group_by: group_by.unwrap_or_default() }).await)
+        }
+        R::ExportCsv { folder } => value(write_csv(&app, folder).await?),
         R::UpdateSettings { patch } => {
             let state = app.state::<AppState>();
             let _held = state.settings_lock.lock().await;
@@ -857,6 +869,7 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
 
     let mut snapshot = Snapshot { accounts: list, updated_at: Some(chrono::Utc::now()) };
     state.diagnostics.samples(&snapshot);
+    note_active(&state, &snapshot, settings.refresh_minutes);
     let history = {
         let mut history = state.usage_history.lock().unwrap();
         subscriptions::record(&mut history, &snapshot, &valid, chrono::Utc::now());
@@ -885,7 +898,105 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
         let app = app.clone();
         tauri::async_runtime::spawn(async move { let _ = write_calendar(&app).await; });
     }
+    scan_usage_index(app);
     snapshot
+}
+
+/// Records which account each CLI has signed in, seeding the log once from the diagnostics
+/// journal's past week. Saved when an interval starts, else every ten minutes.
+fn note_active(state: &AppState, snapshot: &Snapshot, refresh_minutes: u32) {
+    let now = chrono::Utc::now();
+    let gap = active_log::max_gap(refresh_minutes);
+    let marks = (!state.active_log.lock().unwrap().backfilled).then(|| state.diagnostics.active_marks());
+    let mut log = state.active_log.lock().unwrap();
+    let mut started = false;
+    if let Some(marks) = marks {
+        // The journal keeps a steady reading only hourly.
+        log.backfill(marks, chrono::Duration::minutes(75));
+        started = true;
+    }
+    for (provider, id) in active_log::active_ids(&snapshot.accounts) {
+        started |= log.note(provider, id, now, gap);
+    }
+    let mut saved = state.active_saved.lock().unwrap();
+    if started || saved.map_or(true, |t| t.elapsed() >= Duration::from_secs(600)) {
+        log.prune(now);
+        let _ = active_log::save(&log);
+        *saved = Some(Instant::now());
+    }
+}
+
+/// Re-reads the CLIs' transcripts and rollouts off the async runtime, one scan at a time. The
+/// first run reads weeks of files; later ones only what changed.
+fn scan_usage_index(app: &AppHandle) {
+    static SCANNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SCANNING.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let index = tauri::async_runtime::spawn_blocking(|| usage_index::scan(chrono::Utc::now())).await;
+        SCANNING.store(false, std::sync::atomic::Ordering::Release);
+        let Ok(index) = index else { return };
+        *app.state::<AppState>().usage_index.lock().unwrap() = Some(index);
+    });
+}
+
+/// The last index, or a scan now when there is none yet.
+async fn usage_index_now(app: &AppHandle) -> std::sync::Arc<usage_index::Index> {
+    if let Some(index) = app.state::<AppState>().usage_index.lock().unwrap().clone() { return index; }
+    let index = tauri::async_runtime::spawn_blocking(|| usage_index::scan(chrono::Utc::now())).await
+        .unwrap_or_else(|_| std::sync::Arc::new(usage_index::Index::default()));
+    *app.state::<AppState>().usage_index.lock().unwrap() = Some(index.clone());
+    index
+}
+
+async fn usage_breakdown(app: &AppHandle, filter: usage_index::Filter) -> usage_index::Breakdown {
+    let index = usage_index_now(app).await;
+    let state = app.state::<AppState>();
+    let known = usage_index::Known::from_snapshot(&state.snapshot.lock().unwrap());
+    let log = state.active_log.lock().unwrap().clone();
+    usage_index::breakdown(&index, &log, &known, &filter, chrono::Utc::now(), &chrono::Local)
+}
+
+#[tauri::command]
+async fn get_usage_breakdown(app: AppHandle, provider: Option<Provider>, account: Option<String>, days: Option<u32>, group_by: Option<usage_index::GroupBy>) -> usage_index::Breakdown {
+    usage_breakdown(&app, usage_index::Filter { provider, account, days: days.unwrap_or(7), group_by: group_by.unwrap_or_default() }).await
+}
+
+/// Writes the CSV exports into `folder` (default Documents\SlopBar Exports).
+async fn write_csv(app: &AppHandle, folder: Option<String>) -> Result<csv_export::Written, String> {
+    let folder = match folder.map(|f| f.trim().to_string()).filter(|f| !f.is_empty()) {
+        Some(f) => std::path::PathBuf::from(f),
+        None => csv_export::default_folder().ok_or("no_documents_folder")?,
+    };
+    let index = usage_index_now(app).await;
+    let state = app.state::<AppState>();
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    let known = usage_index::Known::from_snapshot(&snapshot);
+    let log = state.active_log.lock().unwrap().clone();
+    let history = state.usage_history.lock().unwrap().clone();
+    let report = subscription_report(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let now = chrono::Utc::now();
+        let rows = usage_index::daily(&index, &log, &known, now, &chrono::Local);
+        let stamp = now.with_timezone(&chrono::Local).format("%Y-%m-%d-%H%M%S").to_string();
+        csv_export::write(&folder, &csv_export::history_csv(&history, &known), &csv_export::breakdown_csv(&rows), &csv_export::subscriptions_csv(&report), &stamp)
+    }).await.map_err(|_| "export_folder_unwritable".to_string())?
+}
+
+#[tauri::command]
+async fn export_csv(app: AppHandle, folder: Option<String>) -> Result<csv_export::Written, String> {
+    let written = write_csv(&app, folder).await?;
+    #[cfg(windows)]
+    {
+        let folder = written.folder.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || std::process::Command::new("explorer.exe").arg(folder).spawn()).await;
+    }
+    Ok(written)
+}
+
+#[tauri::command]
+fn csv_default_folder() -> Option<String> {
+    csv_export::default_folder().map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Re-reads the Codex CLI's local history off the async runtime, one scan at a time, then has
@@ -979,6 +1090,9 @@ pub fn run() {
         usage_cache: Mutex::new(providers::load_cache()),
         usage_history: Mutex::new(subscriptions::load()),
         codex_local: Mutex::default(),
+        active_log: Mutex::new(active_log::load()),
+        active_saved: Mutex::default(),
+        usage_index: Mutex::default(),
         monitor: monitoring::Monitor::new(settings::app_dir().expect("config directory").join("monitoring")).with_diagnostics(diagnostics.clone()),
         diagnostics: diagnostics.clone(),
         refresh_lock: tokio::sync::Mutex::new(()),
@@ -1008,6 +1122,9 @@ pub fn run() {
             get_health,
             restart_app,
             get_subscriptions,
+            get_usage_breakdown,
+            export_csv,
+            csv_default_folder,
             take_plan_alerts,
             take_digest,
             export_calendar,
