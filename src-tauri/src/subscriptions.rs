@@ -90,7 +90,7 @@ pub struct WindowRecord {
 }
 
 impl WindowRecord {
-    fn hit_limit(&self) -> bool { self.peak >= LIMIT_PERCENT }
+    pub(crate) fn hit_limit(&self) -> bool { self.peak >= LIMIT_PERCENT }
     fn counts(&self) -> bool { self.hours >= MIN_HOURS && self.days >= MIN_DAYS }
 }
 

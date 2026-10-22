@@ -1,4 +1,4 @@
-use crate::{accounts, balancer, codex_local, diagnostics, dock, door, headroom, health, inspect, migrate, model, monitoring, notify, panel, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates};
+use crate::{accounts, balancer, calendar, codex_local, diagnostics, digest, dock, door, headroom, health, inspect, migrate, model, monitoring, notify, panel, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -147,6 +147,50 @@ fn take_plan_alerts(state: tauri::State<AppState>) -> Vec<plan_alerts::Alert> {
     // Unsaved, they are still remembered until the app restarts.
     if !due.is_empty() { let _ = plan_alerts::save(&sent); }
     due
+}
+
+/// The Monday digest (see `digest`), once per week. The taskbar widget asks after every refresh
+/// and words it in the user's language.
+#[tauri::command]
+fn take_digest(state: tauri::State<AppState>) -> Option<digest::Digest> {
+    if state.snapshot.lock().unwrap().updated_at.is_none() { return None; }
+    let enabled = state.settings.lock().unwrap().notifications.digest;
+    let local = chrono::Local::now().naive_local();
+    digest::week_due(local)?;
+    let report = subscription_report(&state);
+    let history = state.usage_history.lock().unwrap().clone();
+    let mut sent = state.plan_alerts.lock().unwrap();
+    let digest = digest::take(&report, &history, enabled, &mut sent, local, chrono::Utc::now());
+    if digest.is_some() { let _ = plan_alerts::save(&sent); }
+    digest
+}
+
+/// Writes the plan-renewal calendar now (see `calendar`); shared by Settings, the agents' door and
+/// each refresh while it is turned on.
+async fn write_calendar(app: &AppHandle) -> Result<serde_json::Value, String> {
+    let state = app.state::<AppState>();
+    let report = subscription_report(&state);
+    let settings = state.settings.lock().unwrap().clone();
+    let (path, events) = tauri::async_runtime::spawn_blocking(move || calendar::export(&report, &settings, chrono::Utc::now()))
+        .await.map_err(|e| e.to_string())??;
+    Ok(serde_json::json!({ "path": path, "events": events }))
+}
+
+#[tauri::command]
+async fn export_calendar(app: AppHandle) -> Result<serde_json::Value, String> {
+    write_calendar(&app).await
+}
+
+/// Whether Settings may store `path` as the calendar's path.
+#[tauri::command]
+fn check_calendar_path(path: String) -> bool {
+    calendar::valid_path(path.trim())
+}
+
+/// Where the calendar goes when no path is set.
+#[tauri::command]
+fn default_calendar_path() -> Option<String> {
+    calendar::default_path().map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Opens the provider's billing page in the browser. The address is fixed per provider, so the
@@ -310,6 +354,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             open_billing_page(provider).await?;
             Ok(serde_json::json!({ "opened": subscriptions::billing_page(provider) }))
         }
+        R::ExportCalendar => write_calendar(&app).await,
         R::OpenSettings => {
             show_settings(&app);
             Ok(serde_json::json!({ "opened": true }))
@@ -816,6 +861,10 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     *state.snapshot.lock().unwrap() = snapshot.clone();
     let _ = app.emit("usage-updated", &snapshot);
     if settings.providers.codex { scan_codex_local(app); }
+    if settings.calendar.enabled {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move { let _ = write_calendar(&app).await; });
+    }
     snapshot
 }
 
@@ -900,6 +949,10 @@ pub fn run() {
             restart_app,
             get_subscriptions,
             take_plan_alerts,
+            take_digest,
+            export_calendar,
+            check_calendar_path,
+            default_calendar_path,
             open_billing_page,
             export_diagnostics,
             record_frontend_error,

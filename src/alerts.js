@@ -2,7 +2,7 @@
 // switches, and use none of the user's computers accounts for. Runs in the taskbar widget, which is always alive; what was already said is
 // remembered across restarts so nothing is repeated, and the first look at an account only
 // records where it stands.
-import { t, resetsIn, windowLabel, resetText, groupResets, duration, dayTime, shortDate } from "./i18n.js";
+import { t, resetsIn, windowLabel, resetText, groupResets, duration, dayTime, shortDate, LOCALE } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
 
@@ -100,6 +100,31 @@ export async function checkPlans() {
       a.monthly_cost != null ? t("perMonth", { v: money(a.monthly_cost) }) : ""].filter(Boolean).join(" · ");
     notify(t("nRenewTitle", { provider, t: until(a.at) }), a.kind === "renewal_wasteful" ? `${body}\n${t("nRenewWasteHint")}` : body, "subscriptions");
   }
+}
+
+// The weekday of a renewal: an entered date is a calendar day (midnight UTC), the rest are moments.
+const renewDay = (r) => new Date(r.at).toLocaleDateString(LOCALE, { weekday: "short", ...(r.source === "entered" ? { timeZone: "UTC" } : {}) });
+
+/**
+ * The Monday digest: spend, possible savings, renewals this week, accounts that ran out and how
+ * many plans the usage needs. The app decides when it is due (Monday mornings, once a week, when
+ * turned on); this only words it. Clicking it opens Settings > Subscriptions.
+ */
+export async function checkDigest() {
+  let d;
+  try { d = await invoke("take_digest"); } catch { return; }
+  if (!d) return;
+  const spend = [t("nDigestSpend", { v: money(d.monthly_total) })];
+  if (d.unpriced) spend.push(t("nDigestUnpriced", { n: d.unpriced }));
+  if (d.possible_savings > 0) spend.push(t("nDigestSave", { v: money(d.possible_savings) }));
+  const lines = [spend.join(" · ")];
+  if (d.renewing.length) lines.push(t("nDigestRenewing", { list: d.renewing.map((r) => `${r.name} (${renewDay(r)})`).join(", ") }));
+  if (d.ran_out.length) lines.push(t("nDigestRanOut", { list: d.ran_out.join(", ") }));
+  for (const p of d.pools) {
+    lines.push(t("nDigestPool", { provider: PROVIDER_NAME[p.provider], n: p.plans_needed, unit: p.unit, held: Math.round(p.plans_held * 10) / 10 }));
+  }
+  notify(t("nDigestTitle"), lines.join("
+"), "subscriptions");
 }
 
 /** An automatic switch (see the balancer) is worth a notification; a manual one isn't. */

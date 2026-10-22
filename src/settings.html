@@ -54,6 +54,21 @@
     <section class="page" id="page-subscriptions">
       <header><h1 data-i18n="sSubscriptions"></h1><p data-i18n="descSubscriptions"></p></header>
       <div id="subscriptions"></div>
+      <h2 data-i18n="sCalendar"></h2>
+      <div class="group">
+        <div class="row">
+          <div class="title"><label for="calendar-enabled" data-i18n="calendarKeep"></label><small data-i18n="calendarKeepHint"></small></div>
+          <input type="checkbox" class="switch" id="calendar-enabled" />
+        </div>
+        <div class="row">
+          <div class="presence-path">
+            <input type="text" id="calendar-path" spellcheck="false" />
+            <button class="btn" id="calendar-save" data-i18n="presenceSave"></button>
+            <button class="btn" id="calendar-export" data-i18n="calendarExport"></button>
+          </div>
+        </div>
+      </div>
+      <p class="hint" id="calendar-status" role="status" hidden></p>
       <p class="hint" data-i18n="subDatesHow"></p>
       <p class="hint" data-i18n="subHowJudged"></p>
       <p class="hint" data-i18n="subNoCancel"></p>
@@ -82,6 +97,10 @@
         <div class="row">
           <div class="title"><label for="notify-renewals" data-i18n="notifyRenewals"></label><small data-i18n="notifyRenewalsHint"></small></div>
           <input type="checkbox" class="switch" id="notify-renewals" />
+        </div>
+        <div class="row">
+          <div class="title"><label for="notify-digest" data-i18n="notifyDigest"></label><small data-i18n="notifyDigestHint"></small></div>
+          <input type="checkbox" class="switch" id="notify-digest" />
         </div>
       </div>
     </section>

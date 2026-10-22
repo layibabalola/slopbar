@@ -1,7 +1,7 @@
 import { t, windowResetText, windowLabel, errorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, duration, resetText, groupResets, visibleResetWindows, placesText } from "./i18n.js";
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
-import { checkUsage, checkSwitch, checkPlans } from "./alerts.js";
+import { checkUsage, checkSwitch, checkPlans, checkDigest } from "./alerts.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -209,7 +209,7 @@ function layout() {
 
 function render(snap) {
   lastSnap = snap;
-  if (IS_DOCK && notifications && snap.updated_at) { checkUsage(snap, notifications); checkPlans(); }
+  if (IS_DOCK && notifications && snap.updated_at) { checkUsage(snap, notifications); checkPlans(); checkDigest(); }
   if (IS_DOCK) renderCompact(snap);
   else renderDetails(snap);
   layout();
