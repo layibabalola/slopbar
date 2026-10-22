@@ -27,17 +27,17 @@ upstream PR.
 | 17 | **`recommend_account` door.** An agent asks which account has headroom for its job; SlopBar ranks them and can switch. | done (5ebc677) |
 | 18 | **`get_headroom` door.** A long-running agent slows down or pauses before a limit instead of failing mid-task. | done (5ebc677) |
 
-## Wave 2: running
+## Wave 2: done (merged at ed8d1f6 on claude/subscription-value)
 
-| # | Item |
-|---|---|
-| 4 | **Pro 200 allowance change on 2026-10-29.** Flag which Pro 200 accounts will start running out once the grandfathered allowance ends. Time-sensitive: first in this wave. |
-| 5 | **Smarter auto-switch.** Prefer the account whose weekly reset or renewal comes soonest and still has headroom; skip accounts in use on another machine and plans being cancelled. |
-| 10 | **Pool sizing.** Weekly peaks per provider against the capacity owned: "your Codex usage fits in 3 Pro 200 plans with 30% spare; you hold 7". |
-| 11 | **Cost per use.** Dollars per thread and per percent used, per account and blended per provider. |
-| 20 | **Credit balance.** Show Codex purchased credits, what they are worth, and when they get spent. |
-| 15 | **Self-check panel.** Monitoring sign-ins about to expire, reconnects needed, stale accounts, door and rclone health, each with its one-click fix. |
-| 16 | **Telemetry policy.** Local only by default; at most an opt-in crash report inside the existing diagnostics export. Recorded in SECURITY.md and built with item 15. |
+| # | Item | Status |
+|---|---|---|
+| 4 | **Pro 200 allowance change on 2026-10-29.** Flag which Pro 200 accounts will start running out once the grandfathered allowance ends. Time-sensitive: first in this wave. | done (d271ebd) |
+| 5 | **Smarter auto-switch.** Prefer the account whose weekly reset or renewal comes soonest and still has headroom; skip accounts in use on another machine and plans being cancelled. | done (d271ebd) |
+| 10 | **Pool sizing.** Weekly peaks per provider against the capacity owned: "your Codex usage fits in 3 Pro 200 plans with 30% spare; you hold 7". | done (d3565b6) |
+| 11 | **Cost per use.** Dollars per thread and per percent used, per account and blended per provider. | done (d3565b6) |
+| 20 | **Credit balance.** Show Codex purchased credits, what they are worth, and when they get spent. | done (d3565b6) |
+| 15 | **Self-check panel.** Monitoring sign-ins about to expire, reconnects needed, stale accounts, door and rclone health, each with its one-click fix. | done (ed8d1f6) |
+| 16 | **Telemetry policy.** Local only by default; at most an opt-in crash report inside the existing diagnostics export. Recorded in SECURITY.md and built with item 15. | done (ed8d1f6) |
 
 ## Wave 3: queued
 
@@ -50,6 +50,7 @@ upstream PR.
 | 12 | **When you work.** A heatmap of usage by hour and weekday from local Codex and Claude logs, to size accounts for peak hours. |
 | 13 | **Monday digest.** One notification with spend, waste, renewals this week, and accounts that ran out. |
 | 14 | **CSV export** of weekly history. |
+| 21 | **Usage by project and model, per account.** Which repos each account worked in, which models it used and how many tokens each, from local Claude Code and Codex logs; attributed to accounts by the thread record (Codex) or by which account was active at the time (Claude). Added by the owner on 2026-10-21. |
 | 19 | **Claude Code status line.** The active account's headroom and time-to-limit in the status line. |
 
 ## Done before this roadmap (branch `claude/subscription-value`; upstream thelioo/slopbar#8–#11, stacked on #6)
