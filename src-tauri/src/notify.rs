@@ -1,7 +1,7 @@
 //! Windows notifications (toasts). What to say and when is decided by the frontend, which owns
 //! the translations (see src/alerts.js); this only shows them under SlopBar's own name and icon.
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 /// The same news for the phone (see `phone`), worded without account names; sent instead of the
@@ -57,8 +57,7 @@ pub fn notify_unexpected(app: AppHandle, provider: crate::accounts::Provider, ti
                 if action.as_deref() == Some("security") {
                     let _ = std::process::Command::new("explorer.exe").arg(url).spawn();
                 } else {
-                    let _ = app.emit_to(crate::app::SETTINGS_LABEL, "show-page", "accounts");
-                    crate::app::show_settings(&app);
+                    crate::app::show_settings_page(&app, Some("accounts".into()));
                 }
                 Ok(())
             })
@@ -82,8 +81,7 @@ fn clickable(app: AppHandle, title: &str, body: &str, page: String) -> Result<()
         .title(title)
         .text1(body)
         .on_activated(move |_| {
-            let _ = handle.emit_to(crate::app::SETTINGS_LABEL, "show-page", &page);
-            crate::app::show_settings(&handle);
+            crate::app::show_settings_page(&handle, Some(page.clone()));
             Ok(())
         })
         .show()

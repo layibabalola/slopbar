@@ -167,6 +167,9 @@ pub struct Settings {
     pub compact_suggested: bool,
     /// The first-run guide in Settings was closed; General opens it again.
     pub onboarding_dismissed: bool,
+    /// The taskbar widget is drawn natively (Direct2D) instead of in a WebView2, which saves most
+    /// of the app's idle memory. Off brings back the web widget, kept for one release.
+    pub native_widget: bool,
 }
 
 /// Phone alerts through a push service (ntfy). The access token is not here: it is kept with
@@ -269,6 +272,7 @@ impl Default for Settings {
             compact_flyout: false,
             compact_suggested: false,
             onboarding_dismissed: false,
+            native_widget: true,
         }
     }
 }
@@ -277,11 +281,26 @@ impl Default for Settings {
 /// config dir, but usable before the app is built, so settings are ready before any window
 /// can ask for them.
 pub fn app_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join(IDENTIFIER))
+    isolated_dir().or_else(|| dirs::config_dir().map(|d| d.join(IDENTIFIER)))
 }
 
 pub fn legacy_app_dir() -> Option<PathBuf> {
+    if isolated() {
+        return None;
+    }
     dirs::config_dir().map(|d| d.join(LEGACY_IDENTIFIER))
+}
+
+/// Where `SLOPBAR_DATA_DIR` points, for running a build beside the installed app (to measure
+/// it, say): app data of its own, and so its own door, instance lock and WebView2 folder.
+fn isolated_dir() -> Option<PathBuf> {
+    std::env::var_os("SLOPBAR_DATA_DIR").filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// Whether this process runs on `SLOPBAR_DATA_DIR`. It then leaves what belongs to the
+/// installed app alone: launch at login and updates.
+pub fn isolated() -> bool {
+    isolated_dir().is_some()
 }
 
 fn path() -> Option<PathBuf> {
@@ -310,7 +329,7 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
 /// `project_pins` has its own operations (see `pins`).
-const PATCHABLE: [&str; 23] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed"];
+const PATCHABLE: [&str; 24] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed", "native_widget"];
 
 /// Modifier names a shortcut may use, as the Settings window writes them.
 const HOTKEY_MODIFIERS: [&str; 4] = ["Ctrl", "Alt", "Shift", "Win"];
