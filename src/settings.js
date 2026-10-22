@@ -307,6 +307,28 @@ function adviceText(e) {
   return "";
 }
 
+const amount = (v) => Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+// What the plan costs for the use it gets: "$0.92 per 1% of the weekly limit used · $12.50 per thread (this PC only)".
+function costPerUseText(e) {
+  const c = e.cost_per_use;
+  if (!c) return "";
+  const parts = [];
+  if (c.per_percent != null) parts.push(t("subPerPercent", { v: money(c.per_percent) }));
+  if (c.per_local_thread != null) parts.push(t("subPerThread", { v: money(c.per_local_thread) }));
+  return parts.join(" · ");
+}
+
+// Purchased Codex credits, never priced: OpenAI does not publish one credit price.
+function creditsLine(c) {
+  if (!c) return "";
+  if (c.unlimited) return t("subCreditsUnlimited");
+  const parts = [];
+  if (c.balance != null) parts.push(t("subCredits", { v: amount(c.balance) }));
+  if (c.spent && c.since) parts.push(t("subCreditsSpent", { n: amount(c.spent), d: shortDate(c.since) }));
+  return parts.join(" · ");
+}
+
 function subscriptionRow(e) {
   const key = `${e.provider}:${e.id}`;
   const prefs = settings.subscriptions?.[key] ?? {};
@@ -321,6 +343,8 @@ function subscriptionRow(e) {
     ? t("subProviderStale", { d: shortDate(e.provider_until) }) : "";
   const advice = adviceText(e);
   const local = localText(e);
+  const perUse = costPerUseText(e);
+  const credits = creditsLine(e.credits);
   // Anything resting on this PC's history says what it cannot see.
   const caveat = e.local && (a.basis === "local_codex" || a.verdict === "insufficient_data") ? t("subLocalCaveat") : "";
   return `
@@ -342,6 +366,8 @@ function subscriptionRow(e) {
       <div class="monitor-state">
         <small>${esc(weekText)}${e.stale ? ` · ${t("lastReading")}` : ""}${week?.runs_out_at ? ` · <b class="runs-out">${esc(t("runsOut", { at: dayTime(week.runs_out_at) }))}</b>` : ""}</small>
         ${local ? `<small>${esc(local)}</small>` : ""}
+        ${perUse ? `<small>${esc(perUse)}</small>` : ""}
+        ${credits ? `<small>${esc(credits)}</small>` : ""}
         ${e.idle_now ? `<small>${t("subIdleNow")}</small>` : ""}
         ${e.allowance_change?.would_hit_limit ? `<small class="advice">${esc(t("subProCut", { d: shortDate(`${e.allowance_change.last_day}T12:00:00`), p: Math.round(e.allowance_change.peak_percent), q: Math.round(e.allowance_change.projected_percent) }))}</small>` : ""}
         ${verdictLines(e).map((l) => `<small>${esc(l)}</small>`).join("")}
@@ -371,11 +397,31 @@ function providerSummary(p, s) {
   return parts.join(" · ");
 }
 
+// Pool sizing: how many plans the provider's usage needs, against how many are held.
+function poolText(s) {
+  const p = s?.pool;
+  if (!s?.paid || !p || !p.plans_held) return "";
+  const parts = [];
+  if (p.plans_needed == null) parts.push(t("subPoolInsufficient", { n: p.weeks_used, needed: p.weeks_needed }));
+  else {
+    parts.push(t("subPool", { n: p.plans_needed, unit: p.unit, spare: pct(p.spare_percent ?? 0), held: amount(p.plans_held) }));
+    parts.push(t("subPoolBasis", { n: p.weeks_used }) + (p.confidence === "low" ? ` (${t("subPoolEstimate")})` : ""));
+  }
+  if (p.unweighted) parts.push(t("subPoolUnweighted", { n: p.unweighted }));
+  const c = s.cost_per_use;
+  if (c?.per_plan_percent != null) parts.push(t("subBlendedPercent", { v: money(c.per_plan_percent), unit: p.unit }));
+  if (c?.per_local_thread != null) parts.push(t("subPerThread", { v: money(c.per_local_thread) }));
+  if (s.credit_balance != null) parts.push(t("subCredits", { v: amount(s.credit_balance) }));
+  return parts.join(" · ");
+}
+
 function renderSubscriptions() {
   if (!report || !settings) return;
   patch($("subscriptions"), PROVIDERS.filter(([p]) => settings.providers[p]).map(([p, name]) => {
     const list = report.accounts.filter((e) => e.provider === p);
-    const summary = providerSummary(p, report.providers.find((s) => s.provider === p));
+    const totals = report.providers.find((s) => s.provider === p);
+    const summary = providerSummary(p, totals);
+    const pool = poolText(totals);
     const since = list.find((e) => e.local)?.local.attributed_since;
     return `
       <div class="provider">
@@ -383,6 +429,7 @@ function renderSubscriptions() {
           <span class="logo ${p}">${MARK[p]}</span><h3>${name}</h3>
           ${summary ? `<small class="sub-summary">${esc(summary)}</small>` : ""}
         </div>
+        ${pool ? `<p class="hint sub-pool">${esc(pool)}</p>` : ""}
         <div class="group">
           ${list.length ? list.map(subscriptionRow).join("") : `<div class="empty">${t("noAccounts")}</div>`}
         </div>

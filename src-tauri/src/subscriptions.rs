@@ -6,7 +6,7 @@
 //! called unused after several weeks of real readings near zero. SlopBar cannot cancel a plan;
 //! the report only says which ones look unneeded and links to the provider's own billing page.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Datelike, Months, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,19 @@ pub struct AccountHistory {
     /// The last poll that listed this account, readable or not.
     pub last_seen: Option<DateTime<Utc>>,
     pub windows: Vec<WindowRecord>,
+    /// Codex: the purchased credit balance last read, and what has been spent since SlopBar first
+    /// read one (see `note_credits`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<CreditMark>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreditMark {
+    pub balance: f64,
+    pub at: DateTime<Utc>,
+    /// Every drop in the balance since `since`. A top-up raises the balance without resetting it.
+    pub spent: f64,
+    pub since: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -107,6 +120,7 @@ fn save_to(path: &std::path::Path, history: &History) -> Result<(), String> {
 pub fn observe(h: &mut AccountHistory, acc: &AccountUsage, now: DateTime<Utc>) {
     if acc.stale || acc.error.is_some() { return; }
     h.first_seen.get_or_insert(now);
+    if let Some(balance) = acc.credits.as_deref().and_then(parse_balance) { note_credits(h, balance, now); }
     for w in &acc.windows {
         if !KINDS.contains(&w.kind.as_str()) { continue; }
         // Codex says how long a window is; only a true week is a weekly record.
@@ -526,6 +540,17 @@ pub struct Entry {
     pub local: Option<crate::codex_local::LocalActivity>,
     /// Codex Pro 200 only, until its allowance is cut (see `allowance_change`).
     pub allowance_change: Option<AllowanceChange>,
+    /// This plan's weekly allowance in plans of the provider's reference tier (`plan_weight`).
+    pub plan_weight: Option<f64>,
+    /// What the plan costs per use, when its cost is known (`cost_per_use`).
+    pub cost_per_use: Option<CostPerUse>,
+    /// Codex only: purchased credits and their trend.
+    pub credits: Option<CreditInfo>,
+    /// Inputs for the provider's pool sizing; not part of the report.
+    #[serde(skip)]
+    pool_weeks: BTreeMap<NaiveDate, f64>,
+    #[serde(skip)]
+    pool_since: Option<NaiveDate>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -540,6 +565,12 @@ pub struct ProviderSummary {
     pub unpriced: usize,
     /// Monthly cost of the plans whose renewal looks unneeded.
     pub possible_savings: f64,
+    /// How many plans the provider's usage needs (`pool`).
+    pub pool: Pool,
+    /// Blended cost per use across its paid plans (`blended_cost`).
+    pub cost_per_use: BlendedCost,
+    /// Codex: purchased credits across its accounts, when any reported a balance.
+    pub credit_balance: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -603,6 +634,10 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
         }
         let renewal = if paid { next_renewal(acc, &prefs, now) } else { None };
         let ends_at = if paid { ends_at(acc, now) } else { None };
+        let cost_per_use = monthly_cost.map(|c| cost_per_use(c, &assessment, activity.as_ref()));
+        let pool_weeks = week_peaks(h, now);
+        let pool_since = h.first_seen.map(|t| monday(t.date_naive())).into_iter().chain(pool_weeks.keys().next().copied()).min();
+        let credits = (acc.provider == Provider::Codex).then(|| credit_info(acc.credits.as_deref(), h.credits.as_ref())).flatten();
         Entry {
             renewal_warning: if paid { renewal_warning(renewal.as_ref(), ends_at, &assessment, now) } else { None },
             provider: acc.provider,
@@ -629,6 +664,11 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
             idle_now,
             local: activity,
             allowance_change: allowance_change(acc, h, now),
+            plan_weight: plan_weight(acc),
+            cost_per_use,
+            credits,
+            pool_weeks,
+            pool_since,
         }
     }).collect();
     let providers = Provider::ALL.into_iter().filter(|p| accounts.iter().any(|a| a.provider == *p)).map(|provider| {
@@ -642,6 +682,10 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
             unpriced: paid.iter().filter(|a| a.monthly_cost.is_none()).count(),
             // A plan already cancelled saves nothing more.
             possible_savings: paid.iter().filter(|a| a.assessment.renew_wasteful && a.ends_at.is_none()).filter_map(|a| a.monthly_cost).sum(),
+            pool: pool(provider, &paid, now),
+            cost_per_use: blended_cost(&paid),
+            credit_balance: accounts.iter().filter(|a| a.provider == provider).filter_map(|a| a.credits.as_ref()?.balance)
+                .fold(None, |t, b| Some(t.unwrap_or(0.0) + b)),
         }
     }).collect();
     Report { accounts, providers, generated_at: now }
@@ -660,6 +704,227 @@ pub fn billing_page(provider: Provider) -> &'static str {
 /// must not move onto them.
 pub fn lapsed(settings: &Settings, provider: Provider, id: &str, now: DateTime<Utc>) -> bool {
     settings.subscriptions.get(&pref_key(provider, id)).and_then(|p| p.cancel_after).is_some_and(|d| d < now.date_naive())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pool sizing, cost per use and purchased credits
+
+/// The plan pool sizing counts in for each provider: its largest common tier.
+pub fn reference_plan(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "Max 20x",
+        Provider::Codex => "Pro 200",
+    }
+}
+
+/// One week of this plan's allowance in weeks of the reference plan ("plan-weeks"), so usage on
+/// different tiers adds up. Assumptions, since neither provider publishes absolute allowances:
+/// where the provider states the multiple, that multiple (Claude sells Max as 5x and 20x Pro's
+/// usage, so Pro = 1/20 and Max 5x = 1/4 of Max 20x); otherwise the list price ratio (ChatGPT
+/// Plus = 0.1, Pro 100 = 0.5 and Pro 500 = 2.5 of Pro 200).
+pub fn plan_weight(acc: &AccountUsage) -> Option<f64> {
+    Some(match (acc.provider, plan_label(acc)?.as_str()) {
+        (Provider::Claude, "Pro") => 0.05,
+        (Provider::Claude, "Max 5x") => 0.25,
+        (Provider::Claude, "Max 20x") => 1.0,
+        (Provider::Codex, "Plus") => 0.1,
+        (Provider::Codex, "Pro 100") => 0.5,
+        (Provider::Codex, "Pro 200") => 1.0,
+        (Provider::Codex, "Pro 500") => 2.5,
+        _ => return None,
+    })
+}
+
+/// Pool sizing looks at this many of the latest weeks, needs `POOL_MIN_WEEKS` of them, takes the
+/// `POOL_PERCENTILE` busiest and adds `POOL_BUFFER` on top.
+pub const POOL_WEEKS: usize = 8;
+pub const POOL_MIN_WEEKS: u8 = 2;
+pub const POOL_PERCENTILE: f64 = 0.9;
+pub const POOL_BUFFER: f64 = 0.2;
+/// A week counts only when accounts holding at least this share of the plans were watched in it.
+const POOL_COVERAGE: f64 = 0.5;
+
+fn monday(d: NaiveDate) -> NaiveDate {
+    d - chrono::Duration::days(d.weekday().num_days_from_monday() as i64)
+}
+
+/// Each completed weekly window watched closely enough to count, by the Monday of the UTC week
+/// it reset in: accounts reset on different days, but each has one window ending per week. When
+/// an idle stretch and a real window end in the same week, the higher peak.
+fn week_peaks(h: &AccountHistory, now: DateTime<Utc>) -> BTreeMap<NaiveDate, f64> {
+    let mut out = BTreeMap::new();
+    for r in h.windows.iter().filter(|r| r.kind == "weekly" && r.resets_at <= now && r.counts()) {
+        let week = monday((r.resets_at - chrono::Duration::seconds(1)).date_naive());
+        let peak = out.entry(week).or_insert(0.0);
+        *peak = f64::max(*peak, r.peak);
+    }
+    out
+}
+
+/// How many plans a provider's usage needs: "your usage fits in N plans; you hold M".
+#[derive(Debug, Clone, Serialize)]
+pub struct Pool {
+    /// The plan the numbers count in (`reference_plan`).
+    pub unit: &'static str,
+    /// Paid plans held, in that unit.
+    pub plans_held: f64,
+    /// Paid plans whose tier has no known weight, left out of every number.
+    pub unweighted: usize,
+    /// Recent completed weeks the demand rests on, out of `POOL_WEEKS`.
+    pub weeks_used: u8,
+    pub weeks_needed: u8,
+    /// Of those, weeks where an account not watched was filled in from its own typical week.
+    pub weeks_estimated: u8,
+    /// The busiest weeks' total use (90th percentile), in plan-weeks, or this week's so far when
+    /// that is already higher. None with fewer than `POOL_MIN_WEEKS` weeks: not enough history.
+    pub demand_p90: Option<f64>,
+    /// This week's use so far across the plans, in plan-weeks.
+    pub live_demand: Option<f64>,
+    /// Plans that cover `demand_p90` with `POOL_BUFFER` to spare.
+    pub plans_needed: Option<u32>,
+    /// How far `plans_needed` exceeds `demand_p90`, in percent.
+    pub spare_percent: Option<f64>,
+    pub confidence: Confidence,
+}
+
+/// Sums each recent week's peak across the paid plans, weighted by `plan_weight`, and sizes the
+/// pool from its 90th percentile. A week counts when accounts holding at least half the plans
+/// (of those SlopBar knew by then) were watched in it; an account missing from a counted week is
+/// filled in with the median of its own counted weeks, and the confidence says so.
+fn pool(provider: Provider, paid: &[&Entry], now: DateTime<Utc>) -> Pool {
+    let weighted: Vec<(&Entry, f64)> = paid.iter().filter_map(|e| Some((*e, e.plan_weight?))).collect();
+    let plans_held = weighted.iter().map(|(_, w)| w).sum::<f64>();
+    let medians: Vec<Option<f64>> = weighted.iter().map(|(e, _)| median(&e.pool_weeks.values().copied().collect::<Vec<_>>())).collect();
+    let all: BTreeSet<NaiveDate> = weighted.iter().flat_map(|(e, _)| e.pool_weeks.keys().copied()).collect();
+    let mut demands = Vec::new();
+    let mut estimated = 0u8;
+    for week in all.iter().rev().take(POOL_WEEKS) {
+        let known: Vec<usize> = (0..weighted.len()).filter(|&i| weighted[i].0.pool_since.is_some_and(|s| s <= *week)).collect();
+        let held: f64 = known.iter().map(|&i| weighted[i].1).sum();
+        let watched: f64 = known.iter().filter(|&&i| weighted[i].0.pool_weeks.contains_key(week)).map(|&i| weighted[i].1).sum();
+        if held <= 0.0 || watched < held * POOL_COVERAGE { continue; }
+        let mut filled = false;
+        let demand: f64 = known.iter().map(|&i| {
+            let (e, w) = weighted[i];
+            match e.pool_weeks.get(week) {
+                Some(p) => p / 100.0 * w,
+                None => { filled = true; medians[i].unwrap_or(0.0) / 100.0 * w }
+            }
+        }).sum();
+        estimated += filled as u8;
+        demands.push(demand);
+    }
+    let weeks_used = demands.len() as u8;
+    let live: Vec<f64> = weighted.iter().filter(|(e, _)| !e.stale)
+        .filter_map(|(e, w)| e.this_week.as_ref().filter(|t| t.resets_at.map_or(true, |r| r > now)).map(|t| t.used_percent / 100.0 * w)).collect();
+    let live_demand = (!live.is_empty()).then(|| live.iter().sum::<f64>());
+    let demand_p90 = (weeks_used >= POOL_MIN_WEEKS).then(|| {
+        let p = percentile(&demands, POOL_PERCENTILE);
+        live_demand.map_or(p, |l| p.max(l))
+    });
+    let plans_needed = demand_p90.map(|d| ((d * (1.0 + POOL_BUFFER) - 1e-9).ceil() as u32).max(1));
+    let spare_percent = demand_p90.zip(plans_needed).filter(|(d, _)| *d > 0.0).map(|(d, n)| (n as f64 / d - 1.0) * 100.0);
+    let confidence = if weeks_used >= RECENT as u8 && estimated == 0 { Confidence::High } else { Confidence::Low };
+    Pool { unit: reference_plan(provider), plans_held, unweighted: paid.len() - weighted.len(), weeks_used,
+        weeks_needed: POOL_MIN_WEEKS, weeks_estimated: estimated, demand_p90, live_demand, plans_needed, spare_percent, confidence }
+}
+
+/// Nearest-rank percentile: with fewer than ten weeks the 90th is the busiest week.
+fn percentile(values: &[f64], p: f64) -> f64 {
+    let mut v = values.to_vec();
+    v.sort_by(f64::total_cmp);
+    let rank = ((p * v.len() as f64).ceil() as usize).clamp(1, v.len().max(1));
+    v.get(rank - 1).copied().unwrap_or(0.0)
+}
+
+/// A month in weeks and days, for spreading a monthly price over use.
+const WEEKS_PER_MONTH: f64 = 4.35;
+const DAYS_PER_MONTH: f64 = 30.44;
+
+/// What a plan costs for the use it gets.
+#[derive(Debug, Clone, Serialize)]
+pub struct CostPerUse {
+    /// Dollars per 1% of this plan's weekly allowance used: the monthly cost over a month
+    /// (`WEEKS_PER_MONTH`) of its average weekly peak. None until the verdict has its weeks, or
+    /// when nothing was used.
+    pub per_percent: Option<f64>,
+    /// Codex: dollars per thread the Codex CLI on this PC ran for it in the last 28 days, the
+    /// monthly cost scaled to 28 days. This PC only: threads elsewhere are not counted.
+    pub per_local_thread: Option<f64>,
+}
+
+fn cost_per_use(monthly: f64, a: &Assessment, local: Option<&crate::codex_local::LocalActivity>) -> CostPerUse {
+    let used = a.average_peak.filter(|p| *p > 0.0 && a.verdict != Verdict::InsufficientData);
+    CostPerUse {
+        per_percent: used.map(|p| monthly / (WEEKS_PER_MONTH * p)),
+        per_local_thread: local.filter(|l| l.threads_28d > 0).map(|l| monthly * 28.0 / DAYS_PER_MONTH / l.threads_28d as f64),
+    }
+}
+
+/// Cost per use across a provider's paid plans.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BlendedCost {
+    /// Dollars per 1% of one reference plan's week used (`Pool::unit`): the cost of every plan
+    /// with a verdict over their weighted use, so idle plans raise it.
+    pub per_plan_percent: Option<f64>,
+    /// Codex: dollars per thread on this PC over the plans it has threads for. This PC only.
+    pub per_local_thread: Option<f64>,
+}
+
+fn blended_cost(paid: &[&Entry]) -> BlendedCost {
+    let judged: Vec<(f64, f64)> = paid.iter().filter(|e| e.assessment.verdict != Verdict::InsufficientData)
+        .filter_map(|e| Some((e.monthly_cost?, e.assessment.average_peak? * e.plan_weight?))).collect();
+    let used: f64 = judged.iter().map(|(_, u)| u).sum();
+    let local: Vec<(f64, u32)> = paid.iter().filter_map(|e| Some((e.monthly_cost?, e.local.as_ref()?.threads_28d))).collect();
+    let threads: u32 = local.iter().map(|(_, t)| t).sum();
+    BlendedCost {
+        per_plan_percent: (used > 0.0).then(|| judged.iter().map(|(c, _)| c).sum::<f64>() / (WEEKS_PER_MONTH * used)),
+        per_local_thread: (threads > 0).then(|| local.iter().map(|(c, _)| c).sum::<f64>() * 28.0 / DAYS_PER_MONTH / threads as f64),
+    }
+}
+
+/// Purchased Codex credits as the report shows them. No dollar value: OpenAI's Codex pricing page
+/// (https://learn.chatgpt.com/docs/pricing, checked 2026-10-21) says credit purchase prices
+/// "depend on your plan or agreement", and the $40 per 1,000 credits seen in third-party posts is
+/// not confirmed by OpenAI, so a balance is never priced here.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CreditInfo {
+    /// The live balance, when the provider reported a number.
+    pub balance: Option<f64>,
+    pub unlimited: bool,
+    /// Spent since `since`, from the balances SlopBar has read.
+    pub spent: Option<f64>,
+    pub since: Option<DateTime<Utc>>,
+}
+
+fn parse_balance(raw: &str) -> Option<f64> {
+    raw.trim().replace(',', "").parse::<f64>().ok().filter(|b| b.is_finite() && *b >= 0.0)
+}
+
+/// Keeps the latest balance and adds every drop to what was spent. A rise is a purchase: it is
+/// not spending, and the count carries on from the new balance. Credits that expire count as spent.
+fn note_credits(h: &mut AccountHistory, balance: f64, now: DateTime<Utc>) {
+    match &mut h.credits {
+        Some(m) => {
+            if balance < m.balance { m.spent += m.balance - balance; }
+            m.balance = balance;
+            m.at = now;
+        }
+        None => h.credits = Some(CreditMark { balance, at: now, spent: 0.0, since: now }),
+    }
+}
+
+fn credit_info(live: Option<&str>, mark: Option<&CreditMark>) -> Option<CreditInfo> {
+    let unlimited = live == Some("unlimited");
+    let balance = live.and_then(parse_balance);
+    if !unlimited && balance.is_none() && mark.is_none() { return None; }
+    Some(CreditInfo {
+        // Only the live figure: Codex reports none once the credits run out.
+        balance,
+        unlimited,
+        spent: mark.filter(|_| !unlimited).map(|m| m.spent),
+        since: mark.filter(|_| !unlimited).map(|m| m.since),
+    })
 }
 
 #[cfg(test)]
@@ -1127,5 +1392,182 @@ mod tests {
         assert!(!lapsed(&settings, Provider::Claude, "a1", at("2026-10-28T12:00:00Z")));
         assert!(lapsed(&settings, Provider::Claude, "a1", at("2026-10-29T00:00:00Z")));
         assert!(!lapsed(&settings, Provider::Codex, "a1", at("2026-12-01T00:00:00Z")));
+    }
+
+    fn max(id: &str, tier: &str, now: DateTime<Utc>, used: f64) -> AccountUsage {
+        let mut acc = reading("weekly", used, now + days(2));
+        acc.id = id.into();
+        acc.plan = Some("max".into());
+        acc.billing.tier = Some(format!("default_claude_max_{tier}"));
+        acc
+    }
+
+    /// A Claude fleet: each account's weekly peaks, aligned on the same weeks.
+    fn fleet(plans: &[(&str, &str, &[f64])]) -> (Snapshot, History, DateTime<Utc>) {
+        let mut history = History::default();
+        let mut now = at("2000-01-01T00:00:00Z");
+        let mut accounts = vec![];
+        for (id, tier, peaks) in plans {
+            let (h, end) = weeks(peaks, 100);
+            now = now.max(end);
+            history.accounts.insert(format!("Claude:{id}"), h);
+            accounts.push(max(id, tier, end, 0.0));
+        }
+        (Snapshot { accounts, updated_at: None }, history, now)
+    }
+
+    #[test]
+    fn the_pool_fits_the_busiest_week_of_the_fleet_with_a_buffer() {
+        let (snapshot, history, now) = fleet(&[
+            ("a", "20x", &[50.0, 60.0, 40.0, 70.0]),
+            ("b", "20x", &[10.0, 20.0, 10.0, 30.0]),
+            ("c", "20x", &[0.0, 0.0, 0.0, 0.0]),
+        ]);
+        let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
+        // Weekly totals 0.6, 0.8, 0.5 and 1.0 plans: the busiest of four is the 90th percentile.
+        assert_eq!((p.unit, p.plans_held, p.weeks_used, p.weeks_estimated), ("Max 20x", 3.0, 4, 0));
+        assert!((p.demand_p90.unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!((p.plans_needed, p.confidence), (Some(2), Confidence::High));
+        assert!((p.spare_percent.unwrap() - 100.0).abs() < 1e-9);
+        assert_eq!(p.live_demand, Some(0.0));
+    }
+
+    #[test]
+    fn the_pool_says_not_enough_history_below_two_weeks() {
+        let (snapshot, history, now) = fleet(&[("a", "20x", &[90.0]), ("b", "20x", &[90.0])]);
+        let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
+        assert_eq!((p.weeks_used, p.demand_p90, p.plans_needed, p.spare_percent), (1, None, None, None));
+        assert_eq!((p.plans_held, p.confidence), (2.0, Confidence::Low));
+        let p = &report(&snapshot, &History::default(), &Settings::default(), None, now).providers[0].pool;
+        assert_eq!((p.weeks_used, p.plans_needed), (0, None));
+    }
+
+    #[test]
+    fn tiers_count_in_plans_of_the_largest_and_unknown_tiers_stay_out() {
+        assert_eq!(plan_weight(&max("a", "5x", Utc::now(), 0.0)), Some(0.25));
+        assert_eq!(plan_weight(&reading("weekly", 0.0, Utc::now())), Some(0.05));
+        let now = Utc::now();
+        for (plan, w) in [("prolite", 0.5), ("pro", 1.0), ("promax", 2.5), ("plus", 0.1)] {
+            let mut c = codex_pro("u:a", 0.0, days(2), now);
+            c.plan = Some(plan.into());
+            assert_eq!(plan_weight(&c), Some(w));
+        }
+        // A Max 5x running out every week is a quarter of a Max 20x: one plan covers it.
+        let (mut snapshot, history, now) = fleet(&[("small", "5x", &[100.0, 100.0, 100.0]), ("big", "20x", &[0.0, 0.0, 0.0])]);
+        let mut odd = max("odd", "20x", now, 0.0);
+        odd.billing.tier = Some("default_claude_max_7x".into());
+        snapshot.accounts.push(odd);
+        let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
+        assert_eq!((p.plans_held, p.unweighted, p.plans_needed), (1.25, 1, Some(1)));
+        assert!((p.demand_p90.unwrap() - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_missed_week_is_filled_from_the_accounts_own_weeks_and_lowers_confidence() {
+        let (snapshot, mut history, now) = fleet(&[("a", "20x", &[80.0; 4]), ("b", "20x", &[20.0, 40.0, 30.0, 60.0]), ("c", "20x", &[10.0; 4])]);
+        let second = at("2026-09-14T00:00:00Z");
+        // b was not watched in the second week: filled in with its median (30%).
+        history.accounts.get_mut("Claude:b").unwrap().windows.retain(|r| r.resets_at != second);
+        let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
+        assert_eq!((p.weeks_used, p.weeks_estimated, p.confidence), (4, 1, Confidence::Low));
+        assert!((p.demand_p90.unwrap() - 1.5).abs() < 1e-9);
+        // With c missing too, fewer than half the plans were watched: the week does not count.
+        history.accounts.get_mut("Claude:c").unwrap().windows.retain(|r| r.resets_at != second);
+        let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
+        assert_eq!((p.weeks_used, p.weeks_estimated), (3, 0));
+    }
+
+    #[test]
+    fn a_busier_week_in_progress_raises_the_demand() {
+        let (mut snapshot, history, now) = fleet(&[("a", "20x", &[30.0, 30.0]), ("b", "20x", &[30.0, 30.0])]);
+        snapshot.accounts[0].windows[0].used_percent = 95.0;
+        snapshot.accounts[1].windows[0].used_percent = 90.0;
+        let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
+        assert!((p.live_demand.unwrap() - 1.85).abs() < 1e-9 && (p.demand_p90.unwrap() - 1.85).abs() < 1e-9);
+        assert_eq!(p.plans_needed, Some(3));
+        // A stale reading is not this week's use.
+        snapshot.accounts[0].stale = true;
+        let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
+        assert!((p.demand_p90.unwrap() - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn percentiles_rank_to_the_nearest_week() {
+        assert_eq!(percentile(&[], 0.9), 0.0);
+        assert_eq!(percentile(&[3.0, 1.0, 2.0], 0.9), 3.0);
+        let ten: Vec<f64> = (1..=10).map(f64::from).collect();
+        assert_eq!(percentile(&ten, 0.9), 9.0);
+    }
+
+    #[test]
+    fn cost_per_use_spreads_the_price_over_what_was_used() {
+        let (snapshot, history, now) = fleet(&[("a", "20x", &[50.0, 50.0]), ("b", "5x", &[0.0, 0.0]), ("new", "20x", &[10.0])]);
+        let r = report(&snapshot, &history, &Settings::default(), None, now);
+        let per = |i: usize| r.accounts[i].cost_per_use.as_ref().unwrap().per_percent;
+        assert!((per(0).unwrap() - 200.0 / (4.35 * 50.0)).abs() < 1e-9);
+        // Nothing used, or too little history to have an average: no figure.
+        assert_eq!((per(1), per(2)), (None, None));
+        // Blended over the plans with a verdict, in percent of one Max 20x week: the idle Max 5x adds cost, not use.
+        let blended = r.providers[0].cost_per_use.per_plan_percent.unwrap();
+        assert!((blended - 300.0 / (4.35 * 50.0)).abs() < 1e-9);
+        assert!(r.providers[0].cost_per_use.per_local_thread.is_none());
+        // Free and unpriced plans have no cost per use.
+        let mut free = max("f", "20x", now, 0.0);
+        free.plan = Some("free".into());
+        let r = report(&Snapshot { accounts: vec![free], updated_at: None }, &History::default(), &Settings::default(), None, now);
+        assert!(r.accounts[0].cost_per_use.is_none() && r.providers[0].cost_per_use.per_plan_percent.is_none());
+    }
+
+    #[test]
+    fn codex_cost_per_thread_counts_this_pcs_threads_only() {
+        let now = at("2026-10-21T12:00:00Z");
+        let local = local_codex(now);
+        let snapshot = Snapshot { accounts: vec![codex_pro("u1:acct-idle", 0.0, days(7), now), codex_pro("u2:acct-busy", 5.0, days(3), now)], updated_at: None };
+        let r = report(&snapshot, &History::default(), &Settings::default(), Some(&local), now);
+        assert_eq!(r.accounts[0].cost_per_use.as_ref().unwrap().per_local_thread, None);
+        let busy = r.accounts[1].cost_per_use.as_ref().unwrap().per_local_thread.unwrap();
+        assert!((busy - 200.0 * 28.0 / 30.44 / 5.0).abs() < 1e-9);
+        let blended = r.providers[0].cost_per_use.per_local_thread.unwrap();
+        assert!((blended - 400.0 * 28.0 / 30.44 / 5.0).abs() < 1e-9);
+        // Without this PC's history there is nothing to count.
+        let r = report(&snapshot, &History::default(), &Settings::default(), None, now);
+        assert!(r.providers[0].cost_per_use.per_local_thread.is_none());
+    }
+
+    #[test]
+    fn credits_track_what_was_spent_across_a_top_up() {
+        let start = at("2026-10-01T00:00:00Z");
+        let mut acc = codex_pro("u:a", 10.0, days(3), start);
+        let mut h = AccountHistory::default();
+        for (i, balance) in ["100", "80", "1,120", "1,110"].into_iter().enumerate() {
+            acc.credits = Some(balance.into());
+            observe(&mut h, &acc, start + Duration::hours(i as i64));
+        }
+        // A stale reading or none at all changes nothing.
+        acc.stale = true;
+        acc.credits = Some("5".into());
+        observe(&mut h, &acc, start + days(1));
+        let m = h.credits.clone().unwrap();
+        assert_eq!((m.balance, m.spent, m.since), (1110.0, 30.0, start));
+        let info = credit_info(Some("1110"), Some(&m)).unwrap();
+        assert_eq!((info.balance, info.unlimited, info.spent, info.since), (Some(1110.0), false, Some(30.0), Some(start)));
+        // Unlimited has no balance and nothing to spend; no credits ever and none now is no entry.
+        let info = credit_info(Some("unlimited"), None).unwrap();
+        assert_eq!((info.balance, info.unlimited, info.spent), (None, true, None));
+        assert_eq!(credit_info(None, None), None);
+        assert_eq!(credit_info(Some("n/a"), None), None);
+        // The report shows them for Codex accounts and totals the balances.
+        let now = start + days(2);
+        let mut acc = codex_pro("u:a", 10.0, days(3), now);
+        acc.credits = Some("1110".into());
+        let mut history = History::default();
+        history.accounts.insert("Codex:u:a".into(), h);
+        let r = report(&Snapshot { accounts: vec![acc], updated_at: None }, &history, &Settings::default(), None, now);
+        assert_eq!(r.accounts[0].credits.as_ref().and_then(|c| c.spent), Some(30.0));
+        assert_eq!(r.providers[0].credit_balance, Some(1110.0));
+        // The trend survives a save.
+        let json = serde_json::to_string(&history).unwrap();
+        let back: History = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.accounts["Codex:u:a"].credits.as_ref().map(|c| c.spent), Some(30.0));
     }
 }
