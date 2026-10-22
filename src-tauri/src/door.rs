@@ -39,6 +39,25 @@ pub enum Request {
     GetSubscriptions,
     /// An RFC 7386 merge patch over the current settings (see `settings::patched`).
     UpdateSettings { patch: Value },
+    /// Used share, reset, pace and forecast per window for one account (or each provider's account
+    /// in use), from the last snapshot (see `headroom`).
+    GetHeadroom {
+        #[serde(default)]
+        provider: Option<Provider>,
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// The provider's accounts ranked for a job; with `switch`, moves to the best one as
+    /// `SwitchAccount` does.
+    RecommendAccount {
+        provider: Provider,
+        #[serde(default)]
+        expected_percent: Option<f64>,
+        #[serde(default)]
+        hours: Option<f64>,
+        #[serde(default)]
+        switch: bool,
+    },
     SwitchAccount { provider: Provider, id: String },
     AddAccount { provider: Provider },
     ConnectMonitoring { provider: Provider, id: String },

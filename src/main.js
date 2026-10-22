@@ -1,7 +1,7 @@
-import { t, windowResetText, windowLabel, errorText, creditsText, time, translateDom, setLanguage, setSystemLocale, duration, resetText, groupResets, visibleResetWindows, placesText } from "./i18n.js";
+import { t, windowResetText, windowLabel, errorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, duration, resetText, groupResets, visibleResetWindows, placesText } from "./i18n.js";
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
-import { checkUsage, checkSwitch } from "./alerts.js";
+import { checkUsage, checkSwitch, checkPlans } from "./alerts.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -137,6 +137,7 @@ function renderDetails(snap) {
             ? `<button class="monitor" data-provider="${provider}" data-id="${esc(a.id)}">${t(a.monitor_connected ? "monitorReconnect" : "monitorConnect")}</button>` : ""}
           ${a.monitor_connected ? `<button class="monitor" data-disconnect="true" data-provider="${provider}" data-id="${esc(a.id)}">${t("monitorDisconnect")}</button>` : ""}
           ${bars(a)}
+          ${a.runs_out_at && !a.stale ? `<div class="reset runs-out" title="${esc(a.runs_out_at)}">${esc(t("runsOut", { at: dayTime(a.runs_out_at) }))}</div>` : ""}
           ${resetLines(a)}
           ${a.credits ? `<div class="reset" style="margin-top:6px">${esc(creditsText(a.credits))}</div>` : ""}
         </div>`;
@@ -208,7 +209,7 @@ function layout() {
 
 function render(snap) {
   lastSnap = snap;
-  if (IS_DOCK && notifications && snap.updated_at) checkUsage(snap, notifications);
+  if (IS_DOCK && notifications && snap.updated_at) { checkUsage(snap, notifications); checkPlans(); }
   if (IS_DOCK) renderCompact(snap);
   else renderDetails(snap);
   layout();

@@ -1,4 +1,4 @@
-use crate::{accounts, balancer, codex_local, diagnostics, dock, door, inspect, migrate, model, monitoring, notify, panel, presence, providers, settings, sources, subscriptions, updates};
+use crate::{accounts, balancer, codex_local, diagnostics, dock, door, headroom, inspect, migrate, model, monitoring, notify, panel, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -12,7 +12,7 @@ use accounts::Provider;
 use model::Snapshot;
 use settings::Settings;
 
-const SETTINGS_LABEL: &str = "settings";
+pub(crate) const SETTINGS_LABEL: &str = "settings";
 const MENU_IDS: [&str; 3] = ["refresh", "settings", "quit"];
 
 pub struct AppState {
@@ -41,10 +41,16 @@ pub struct AppState {
     pub(crate) codex_local: Mutex<Option<std::sync::Arc<codex_local::Local>>>,
     /// When each provider was last switched automatically (the balancer's cooldown).
     pub(crate) last_switch: Mutex<HashMap<Provider, Instant>>,
+    /// The past few hours of readings, for the agents' pace forecasts.
+    pub(crate) recent: Mutex<headroom::Recent>,
     /// Sources found by the last refresh, where switches are written.
     pub(crate) sources: Mutex<Vec<sources::Source>>,
     /// Recent readings of unclaimed accounts, to notice use outside this PC.
     presence_tracks: Mutex<presence::Tracks>,
+    /// Use seen where none of the user's computers is, for a week (see `unexpected`).
+    unexpected_log: Mutex<unexpected::Log>,
+    /// Plan notifications already shown (renewals, running out), so each is shown once.
+    plan_alerts: Mutex<plan_alerts::Sent>,
 }
 
 #[tauri::command]
@@ -62,6 +68,21 @@ fn subscription_report(state: &AppState) -> subscriptions::Report {
 #[tauri::command]
 fn get_subscriptions(state: tauri::State<AppState>) -> subscriptions::Report {
     subscription_report(&state)
+}
+
+/// The plan notifications due now (see `plan_alerts`), each returned once. The taskbar widget
+/// asks after every refresh and words them in the user's language.
+#[tauri::command]
+fn take_plan_alerts(state: tauri::State<AppState>) -> Vec<plan_alerts::Alert> {
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    if snapshot.updated_at.is_none() { return vec![]; }
+    let report = subscription_report(&state);
+    let prefs = state.settings.lock().unwrap().notifications.clone();
+    let mut sent = state.plan_alerts.lock().unwrap();
+    let due = plan_alerts::due(&report, &snapshot, &prefs, &mut sent, chrono::Utc::now());
+    // Unsaved, they are still remembered until the app restarts.
+    if !due.is_empty() { let _ = plan_alerts::save(&sent); }
+    due
 }
 
 /// Opens the provider's billing page in the browser. The address is fixed per provider, so the
@@ -95,6 +116,18 @@ async fn export_diagnostics(app: AppHandle) -> Result<String, String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// An agent's switch: the same as Use in Settings, then the balancer's cooldown so the next poll
+/// does not switch straight back. Returns the new snapshot and whether the account held.
+async fn agent_switch(app: &AppHandle, provider: Provider, id: String) -> Result<serde_json::Value, String> {
+    switch_to(app, provider, id.clone(), false).await?;
+    app.state::<AppState>().last_switch.lock().unwrap().insert(provider, Instant::now());
+    let snapshot = do_refresh(app).await;
+    let active = snapshot.accounts.iter().find(|a| a.provider == provider && a.active).map(|a| a.id.clone());
+    let mut result = serde_json::to_value(snapshot).map_err(|e| e.to_string())?;
+    result["switched_to_requested"] = (active.as_deref() == Some(id.as_str())).into();
+    Ok(result)
+}
+
 /// One operation for an agent, through the door (see `door` and `mcp`). Each runs the same code as
 /// the matching Settings action, so the windows and journal see it the same way.
 async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json::Value, String> {
@@ -122,15 +155,43 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             store_settings(&app, next.clone()).await?;
             value(next)
         }
-        R::SwitchAccount { provider, id } => {
-            // An agent's explicit choice gets the balancer's cooldown, as an automatic switch does,
-            // so the next poll does not switch straight back.
-            switch_to(&app, provider, id.clone(), false).await?;
-            app.state::<AppState>().last_switch.lock().unwrap().insert(provider, Instant::now());
-            let snapshot = do_refresh(&app).await;
-            let active = snapshot.accounts.iter().find(|a| a.provider == provider && a.active).map(|a| a.id.clone());
-            let mut result = value(snapshot)?;
-            result["switched_to_requested"] = (active.as_deref() == Some(id.as_str())).into();
+        R::SwitchAccount { provider, id } => agent_switch(&app, provider, id).await,
+        R::GetHeadroom { provider, id } => {
+            let state = app.state::<AppState>();
+            let snapshot = state.snapshot.lock().unwrap().clone();
+            let settings = state.settings.lock().unwrap().clone();
+            let now = chrono::Utc::now();
+            let picked: Vec<_> = snapshot.accounts.iter().filter(|a| match (&provider, &id) {
+                (_, Some(id)) => a.id == *id && provider.map_or(true, |p| a.provider == p),
+                (Some(p), None) => a.provider == *p && a.active,
+                (None, None) => a.active,
+            }).collect();
+            if picked.is_empty() {
+                return Err(if id.is_some() { "monitor_wrong_account".into() } else { "no_active_account".into() });
+            }
+            let accounts: Vec<_> = {
+                let recent = state.recent.lock().unwrap();
+                picked.into_iter().map(|a| headroom::headroom(a, &settings, &recent, now)).collect()
+            };
+            Ok(serde_json::json!({ "accounts": value(accounts)?, "updated_at": snapshot.updated_at }))
+        }
+        R::RecommendAccount { provider, expected_percent, hours, switch } => {
+            if expected_percent.is_some_and(|p| !(0.0..=100.0).contains(&p)) || hours.is_some_and(|h| !(0.0..=168.0).contains(&h)) {
+                return Err("expected_percent must be 0-100 and hours 0-168".into());
+            }
+            let rec = {
+                let state = app.state::<AppState>();
+                let snapshot = state.snapshot.lock().unwrap().clone();
+                let settings = state.settings.lock().unwrap().clone();
+                headroom::recommend(&snapshot.accounts, &settings, provider, expected_percent, hours, chrono::Utc::now())
+            };
+            let mut result = value(&rec)?;
+            result["switched"] = false.into();
+            if let (true, headroom::Action::Switch, Some(id)) = (switch, rec.action, rec.recommended.clone()) {
+                let done = agent_switch(&app, provider, id).await?;
+                result["switched"] = true.into();
+                result["switched_to_requested"] = done["switched_to_requested"].clone();
+            }
             Ok(result)
         }
         R::AddAccount { provider } => {
@@ -541,7 +602,7 @@ fn set_menu_labels(state: tauri::State<AppState>, labels: HashMap<String, String
     }
 }
 
-fn show_settings(app: &AppHandle) {
+pub(crate) fn show_settings(app: &AppHandle) {
     if let Some(w) = app.get_webview_window(SETTINGS_LABEL) {
         let _ = w.show();
         let _ = w.unminimize();
@@ -628,29 +689,49 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     // Other machines: what they share through the presence folder, then what rising usage implies.
     let now = chrono::Utc::now();
     let interval = settings.refresh_minutes.max(1) as u64 * 60;
+    // Whether every computer is covered: sharing is on and someone (this one or a peer) published.
+    let mut covered = false;
     if let Some(store) = presence::store(&settings) {
         let mine = list.clone();
-        let peers = tauri::async_runtime::spawn_blocking(move || {
-            let Some((id, name)) = presence::identity() else { return vec![] };
-            let _ = store.write(&presence::own(id, name, interval, &mine, now));
-            presence::read(store.as_ref(), id, now)
+        let (peers, wrote) = tauri::async_runtime::spawn_blocking(move || {
+            let Some((id, name)) = presence::identity() else { return (vec![], false) };
+            let wrote = store.write(&presence::own(id, name, interval, &mine, now)).is_ok();
+            (presence::read(store.as_ref(), id, now), wrote)
         }).await.unwrap_or_default();
+        covered = wrote || peers.iter().any(|p| p.live);
         presence::attach(&mut list, &peers, now);
     }
     // Two refresh intervals without a rise (readings are at least a minute apart), plus slack.
     let hold = chrono::Duration::seconds(2 * interval.max(60) as i64 + 30);
-    presence::infer(&mut state.presence_tracks.lock().unwrap(), &mut list, hold, now);
+    // Consecutive readings of a few refreshes at most (a missed one is fine; a night asleep is not).
+    let surge = presence::Surge {
+        min_rise: settings.unexpected_min_rise.max(1) as f64,
+        max_gap: chrono::Duration::seconds((3 * interval as i64 + 60).max(15 * 60)),
+    };
+    let surged = presence::infer(&mut state.presence_tracks.lock().unwrap(), &mut list, hold, surge, now);
+    let watch = unexpected::Watch { covered, notify: settings.notifications.unexpected_use, web_use: &settings.web_use };
+    let log = {
+        let mut log = state.unexpected_log.lock().unwrap();
+        unexpected::apply(&mut log, &mut list, &surged, &watch, now).then(|| log.clone())
+    };
+    if let Some(log) = log {
+        let _ = unexpected::save(&log);
+    }
 
-    let snapshot = Snapshot { accounts: list, updated_at: Some(chrono::Utc::now()) };
+    let mut snapshot = Snapshot { accounts: list, updated_at: Some(chrono::Utc::now()) };
     state.diagnostics.samples(&snapshot);
     let history = {
         let mut history = state.usage_history.lock().unwrap();
         subscriptions::record(&mut history, &snapshot, &valid, chrono::Utc::now());
         history.clone()
     };
+    // A reading older than two refresh intervals is not the current rate.
+    let max_age = chrono::Duration::seconds(2 * interval as i64 + 300);
+    subscriptions::attach_forecasts(&mut snapshot, &history, max_age, chrono::Utc::now());
     if subscriptions::save(&history).is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::HistorySave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
     state.diagnostics.record(None, None, diagnostics::Event::PollFinished { elapsed_ms: diagnostics::millis(started), accounts: snapshot.accounts.len(),
         native_sources: found.iter().filter(|s| s.distro.is_none()).count(), wsl_sources: found.iter().filter(|s| s.distro.is_some()).count() });
+    state.recent.lock().unwrap().record(&snapshot.accounts, chrono::Utc::now());
     *state.snapshot.lock().unwrap() = snapshot.clone();
     let _ = app.emit("usage-updated", &snapshot);
     if settings.providers.codex { scan_codex_local(app); }
@@ -711,8 +792,11 @@ pub fn run() {
         settings_lock: tokio::sync::Mutex::new(()),
         account_operations: monitoring::Operations::default(),
         last_switch: Mutex::default(),
+        recent: Mutex::default(),
         sources: Mutex::default(),
         presence_tracks: Mutex::default(),
+        unexpected_log: Mutex::new(unexpected::load()),
+        plan_alerts: Mutex::new(plan_alerts::load()),
     };
     tauri::Builder::default()
         // Must come first: a second launch hands over to the running instance and exits.
@@ -727,6 +811,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_usage,
             get_subscriptions,
+            take_plan_alerts,
             open_billing_page,
             export_diagnostics,
             record_frontend_error,
@@ -754,6 +839,7 @@ pub fn run() {
             dock_menu,
             accent_colors,
             notify::notify,
+            notify::notify_unexpected,
             has_mica,
             taskbar_theme
         ])
