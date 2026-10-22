@@ -1,7 +1,7 @@
 import { t, windowResetText, windowLabel, errorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, duration, resetText, groupResets, visibleResetWindows, placesText } from "./i18n.js";
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
-import { checkUsage, checkSwitch, checkPlans } from "./alerts.js";
+import { checkUsage, checkSwitch, checkPlans, checkDigest } from "./alerts.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -209,7 +209,7 @@ function layout() {
 
 function render(snap) {
   lastSnap = snap;
-  if (IS_DOCK && notifications && snap.updated_at) { checkUsage(snap, notifications); checkPlans(); }
+  if (IS_DOCK && notifications && snap.updated_at) { checkUsage(snap, notifications); checkPlans(); checkDigest(); }
   if (IS_DOCK) renderCompact(snap);
   else renderDetails(snap);
   layout();
@@ -231,6 +231,7 @@ theme();
 setInterval(theme, 10_000);
 
 document.getElementById("open-settings").addEventListener("click", () => invoke("open_settings"));
+document.getElementById("open-switcher").addEventListener("click", () => invoke("open_switcher"));
 
 function applySettings(settings) {
   notifications = settings.notifications;
@@ -253,6 +254,10 @@ $refresh.addEventListener("click", async () => {
   try { render(await invoke("refresh")); } finally { $refresh.classList.remove("spin"); }
 });
 
+// An automatic monitoring sign-in started (see auto_monitor.rs): the user finishes it in the browser.
+listen("monitoring-auto-started", ({ payload }) => invoke("notify", {
+  title: t("monitorAutoTitle", { name: payload.name ?? t("unknownAccount") }), body: t("monitorAutoBody"), page: null,
+}).catch(() => {}));
 listen("monitoring-login", ({ payload }) => showToast(payload.error ? errorText("", payload.error) : t("monitorConnected")));
 listen("usage-updated", (e) => render(e.payload));
 invoke("get_usage").then(render);

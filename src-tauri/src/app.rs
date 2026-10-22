@@ -1,4 +1,4 @@
-use crate::{accounts, balancer, codex_local, diagnostics, dock, door, headroom, health, inspect, migrate, model, monitoring, notify, panel, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates};
+use crate::{accounts, active_log, auto_monitor, balancer, bulk, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, migrate, model, monitoring, notify, panel, pins, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates, usage_index};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -39,6 +39,11 @@ pub struct AppState {
     pub(crate) usage_history: Mutex<subscriptions::History>,
     /// The Codex CLI's own history on this PC, read in the background after each refresh.
     pub(crate) codex_local: Mutex<Option<std::sync::Arc<codex_local::Local>>>,
+    /// Which account each CLI had signed in when (see `active_log`), and when it was last saved.
+    pub(crate) active_log: Mutex<active_log::Log>,
+    active_saved: Mutex<Option<Instant>>,
+    /// Tokens by account, repository and model from the CLIs' files here, read after each refresh.
+    pub(crate) usage_index: Mutex<Option<std::sync::Arc<usage_index::Index>>>,
     /// When each provider was last switched automatically (the balancer's cooldown).
     pub(crate) last_switch: Mutex<HashMap<Provider, Instant>>,
     /// The past few hours of readings, for the agents' pace forecasts.
@@ -51,8 +56,29 @@ pub struct AppState {
     unexpected_log: Mutex<unexpected::Log>,
     /// Plan notifications already shown (renewals, running out), so each is shown once.
     plan_alerts: Mutex<plan_alerts::Sent>,
+    /// Connect monitoring automatically: how long accounts have been in use, and backoffs.
+    auto_monitor: Mutex<auto_monitor::Tracker>,
     /// What refreshes and startup learned for Settings > Health.
     health: Mutex<HealthSeen>,
+    /// Where each pinned account's project profile stood after the last sync (see `pins`).
+    profile_states: Mutex<HashMap<(Provider, String), accounts::ProfileState>>,
+    /// The queued "Connect monitoring for all" while it runs: the accounts left, done first.
+    bulk_connect: Mutex<Option<BulkConnect>>,
+    /// Why the switcher's shortcut could not be registered (taken by another app, say).
+    hotkey_error: Mutex<Option<String>>,
+}
+
+pub(crate) const SWITCHER_LABEL: &str = "switcher";
+
+/// Progress of "Connect monitoring for all", sent to Settings as `bulk-monitoring`.
+#[derive(Clone, Serialize)]
+struct BulkConnect {
+    total: usize,
+    done: usize,
+    /// The account whose sign-in is open now: sign in as this one.
+    current: Option<bulk::Target>,
+    finished: bool,
+    error: Option<String>,
 }
 
 /// Outcomes `health::checks` needs that nothing else keeps.
@@ -89,6 +115,7 @@ async fn health_report(app: &AppHandle) -> health::Report {
         journal: state.diagnostics.health(),
         notifications: health::Notifications { registered: seen.notifications_registered, app_enabled, system_enabled,
             any_wanted: n.usage || n.resets || n.switches || n.renewals || n.unexpected_use },
+        auto_connect: settings.auto_connect_monitoring,
     }, chrono::Utc::now())
 }
 
@@ -149,6 +176,50 @@ fn take_plan_alerts(state: tauri::State<AppState>) -> Vec<plan_alerts::Alert> {
     due
 }
 
+/// The Monday digest (see `digest`), once per week. The taskbar widget asks after every refresh
+/// and words it in the user's language.
+#[tauri::command]
+fn take_digest(state: tauri::State<AppState>) -> Option<digest::Digest> {
+    if state.snapshot.lock().unwrap().updated_at.is_none() { return None; }
+    let enabled = state.settings.lock().unwrap().notifications.digest;
+    let local = chrono::Local::now().naive_local();
+    digest::week_due(local)?;
+    let report = subscription_report(&state);
+    let history = state.usage_history.lock().unwrap().clone();
+    let mut sent = state.plan_alerts.lock().unwrap();
+    let digest = digest::take(&report, &history, enabled, &mut sent, local, chrono::Utc::now());
+    if digest.is_some() { let _ = plan_alerts::save(&sent); }
+    digest
+}
+
+/// Writes the plan-renewal calendar now (see `calendar`); shared by Settings, the agents' door and
+/// each refresh while it is turned on.
+async fn write_calendar(app: &AppHandle) -> Result<serde_json::Value, String> {
+    let state = app.state::<AppState>();
+    let report = subscription_report(&state);
+    let settings = state.settings.lock().unwrap().clone();
+    let (path, events) = tauri::async_runtime::spawn_blocking(move || calendar::export(&report, &settings, chrono::Utc::now()))
+        .await.map_err(|e| e.to_string())??;
+    Ok(serde_json::json!({ "path": path, "events": events }))
+}
+
+#[tauri::command]
+async fn export_calendar(app: AppHandle) -> Result<serde_json::Value, String> {
+    write_calendar(&app).await
+}
+
+/// Whether Settings may store `path` as the calendar's path.
+#[tauri::command]
+fn check_calendar_path(path: String) -> bool {
+    calendar::valid_path(path.trim())
+}
+
+/// Where the calendar goes when no path is set.
+#[tauri::command]
+fn default_calendar_path() -> Option<String> {
+    calendar::default_path().map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Opens the provider's billing page in the browser. The address is fixed per provider, so the
 /// window can only choose which of the two opens.
 #[tauri::command]
@@ -205,6 +276,13 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::Refresh => value(do_refresh(&app).await),
         R::GetSettings => value(app.state::<AppState>().settings.lock().unwrap().clone()),
         R::GetSubscriptions => value(subscription_report(&app.state::<AppState>())),
+        R::GetUsageBreakdown { provider, account, days, group_by } => {
+            if days.is_some_and(|d| !(1..=usage_index::LOOKBACK_DAYS as u32).contains(&d)) {
+                return Err(format!("days must be 1-{}", usage_index::LOOKBACK_DAYS));
+            }
+            value(usage_breakdown(&app, usage_index::Filter { provider, account, days: days.unwrap_or(7), group_by: group_by.unwrap_or_default() }).await)
+        }
+        R::ExportCsv { folder } => value(write_csv(&app, folder).await?),
         R::UpdateSettings { patch } => {
             let state = app.state::<AppState>();
             let _held = state.settings_lock.lock().await;
@@ -270,6 +348,29 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         }
         R::DisconnectMonitoring { provider, id } => value(disconnect_monitoring(app.clone(), provider, id).await?),
         R::RemoveAccount { provider, id } => value(remove_account(app.clone(), provider, id).await?),
+        R::ConnectMonitoringAll { confirm } => {
+            if !confirm {
+                let to_connect = bulk::unmonitored(&app.state::<AppState>().snapshot.lock().unwrap());
+                return Ok(serde_json::json!({ "started": false, "to_connect": to_connect,
+                    "next": "Nothing was started. With confirm: true the sign-ins open one at a time; the user signs in as each account named here." }));
+            }
+            let queued = connect_all(&app).await?;
+            Ok(serde_json::json!({ "started": !queued.is_empty(), "queued": queued,
+                "next": "Each sign-in opens after the previous one finishes; the user signs in as the account named in Settings. get_usage shows monitor_connected as they complete." }))
+        }
+        R::RemoveLapsedAccounts { confirm } => {
+            if !confirm {
+                let state = app.state::<AppState>();
+                let snapshot = state.snapshot.lock().unwrap().clone();
+                let settings = state.settings.lock().unwrap().clone();
+                let plan = bulk::lapsed(&snapshot, &settings, chrono::Utc::now());
+                return Ok(serde_json::json!({ "removed": false, "to_remove": plan.remove, "in_use": plan.in_use,
+                    "next": "Nothing was removed. confirm: true removes to_remove and revokes their monitoring sign-ins; accounts in use are never removed." }));
+            }
+            Ok(remove_lapsed(&app).await)
+        }
+        R::ListProjectPins => value(pin_listing(&app)),
+        R::SetProjectPin { folder, provider, id } => value(set_project_pin(app.clone(), folder, provider, id).await?),
         R::CheckForUpdates => value(check_for_updates(app.clone()).await?),
         R::InstallUpdate => {
             let latest = check_for_updates(app.clone()).await?.latest;
@@ -290,7 +391,14 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             "build": diagnostics::build_info(),
         })),
         R::InspectWindow { window, page, screenshot } => {
-            let target = match window { door::InspectTarget::Settings => inspect::Target::Settings, door::InspectTarget::Flyout => inspect::Target::Flyout };
+            let target = match window {
+                door::InspectTarget::Settings => inspect::Target::Settings,
+                door::InspectTarget::Flyout => inspect::Target::Flyout,
+                door::InspectTarget::Switcher => {
+                    switcher_window(&app).await.ok_or("window not available")?;
+                    inspect::Target::Switcher
+                }
+            };
             value(inspect::inspect(&app, target, page, screenshot).await?)
         }
         R::GetHealth => value(health_report(&app).await),
@@ -310,6 +418,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             open_billing_page(provider).await?;
             Ok(serde_json::json!({ "opened": subscriptions::billing_page(provider) }))
         }
+        R::ExportCalendar => write_calendar(&app).await,
         R::OpenSettings => {
             show_settings(&app);
             Ok(serde_json::json!({ "opened": true }))
@@ -374,6 +483,8 @@ async fn switch_to(app: &AppHandle, provider: Provider, id: String, auto: bool) 
         action: if auto { diagnostics::Action::SwitchAuto } else { diagnostics::Action::SwitchManual },
         code: diagnostics::Code::from_error(result.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) });
     result?;
+    // The account left behind gets its project profile back at once, not at the next refresh.
+    sync_pins(app, None).await;
     let event = Switched {
         provider,
         from: from.and_then(|f| account_label(app, provider, &f)),
@@ -424,7 +535,17 @@ async fn start_add_account(app: AppHandle, provider: Provider, pending: Option<m
 /// A one-time login owns its own refresh-token chain; it never changes the active CLI.
 #[tauri::command]
 async fn connect_monitoring(app: AppHandle, provider: Provider, id: String) -> Result<(), String> {
+    let key = format!("{}:{id}", provider.name());
+    auto_monitor_saved(&app, |t| t.manual(&key, true));
+    start_monitoring_login(app, provider, id, false).await.map(|_| ())
+}
+
+/// Connect monitoring's sign-in, started by the user or on its own (`auto`, see `auto_monitor`).
+/// One sign-in is open at a time across the app (`monitoring::SIGN_IN`); the returned task
+/// ends with its outcome once the user is done.
+async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, auto: bool) -> Result<tauri::async_runtime::JoinHandle<Result<(), String>>, String> {
     let operation = app.state::<AppState>().account_operations.begin(provider, &id)?;
+    let sign_in = app.state::<AppState>().account_operations.begin_key(monitoring::SIGN_IN)?;
     let expected = accounts::load_slots().into_iter().find(|s| s.provider == provider && s.id == id)
         .ok_or("monitor_wrong_account")?;
     let key = monitoring::key(&expected);
@@ -440,8 +561,14 @@ async fn connect_monitoring(app: AppHandle, provider: Provider, id: String) -> R
             return Err("monitor_login_failed".into());
         }
     };
-    tauri::async_runtime::spawn(async move {
+    if auto {
+        let name = app.state::<AppState>().snapshot.lock().unwrap().accounts.iter()
+            .find(|a| a.provider == provider && a.id == id).and_then(|a| a.alias.clone().or_else(|| a.email.clone()));
+        let _ = app.emit("monitoring-auto-started", serde_json::json!({ "provider": provider, "id": id, "name": name }));
+    }
+    Ok(tauri::async_runtime::spawn(async move {
         let operation = operation;
+        let sign_in = sign_in;
         let outcome = match job.wait_isolated(&http_client()).await {
             Some(login) => {
                 let slots = accounts::load_slots();
@@ -457,9 +584,14 @@ async fn connect_monitoring(app: AppHandle, provider: Provider, id: String) -> R
             None => Err("monitor_login_failed".into()),
         };
         drop(operation);
+        drop(sign_in);
+        if auto {
+            let ok = outcome.is_ok();
+            auto_monitor_saved(&app, |t| t.finished(&key, ok, chrono::Utc::now()));
+        }
         app.state::<AppState>().diagnostics.record(Some(provider), Some(&id), diagnostics::Event::Action { action: diagnostics::Action::ConnectFinished,
             code: diagnostics::Code::from_error(outcome.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) });
-        let _ = app.emit("monitoring-login", serde_json::json!({ "provider": provider, "id": id, "error": outcome.err() }));
+        let _ = app.emit("monitoring-login", serde_json::json!({ "provider": provider, "id": id, "error": outcome.as_ref().err() }));
         // Preserve last-known data, but allow the new login to bypass an earlier error's backoff.
         {
             let state = app.state::<AppState>();
@@ -467,12 +599,122 @@ async fn connect_monitoring(app: AppHandle, provider: Provider, id: String) -> R
             providers::retry_now(&mut state.usage_cache.lock().unwrap(), &key);
         }
         do_refresh(&app).await;
+        outcome
+    }))
+}
+
+/// Updates "Connect monitoring for all" and tells Settings.
+fn publish_bulk(app: &AppHandle, change: impl FnOnce(&mut BulkConnect)) {
+    let state = app.state::<AppState>();
+    let mut running = state.bulk_connect.lock().unwrap();
+    if let Some(bulk) = running.as_mut() {
+        change(bulk);
+        let _ = app.emit("bulk-monitoring", bulk.clone());
+    }
+}
+
+/// Queues a monitoring sign-in for every account without one: one terminal at a time, each
+/// started once the previous sign-in finished, stopping at the first that fails (the user closed
+/// it, or signed in as another account). Returns the queued accounts.
+async fn connect_all(app: &AppHandle) -> Result<Vec<bulk::Target>, String> {
+    let state = app.state::<AppState>();
+    let targets = bulk::unmonitored(&state.snapshot.lock().unwrap());
+    {
+        let mut running = state.bulk_connect.lock().unwrap();
+        if running.as_ref().is_some_and(|b| !b.finished) {
+            return Err("monitor_busy".into());
+        }
+        *running = Some(BulkConnect { total: targets.len(), done: 0, current: None, finished: targets.is_empty(), error: None });
+    }
+    let h = app.clone();
+    let queue = targets.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut error = None;
+        for (done, target) in queue.iter().enumerate() {
+            publish_bulk(&h, |b| { b.done = done; b.current = Some(target.clone()); });
+            // Connected (or removed) since the queue started: nothing to do.
+            let waiting = h.state::<AppState>().snapshot.lock().unwrap().accounts.iter()
+                .any(|a| a.provider == target.provider && a.id == target.id && !a.monitor_connected);
+            if !waiting {
+                continue;
+            }
+            // Another sign-in is open (one the user or automatic monitoring started): wait for it.
+            while h.state::<AppState>().account_operations.busy(monitoring::SIGN_IN) {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            // The user asked for these, so they count as manual starts, never automatic ones.
+            let key = format!("{}:{}", target.provider.name(), target.id);
+            auto_monitor_saved(&h, |t| t.manual(&key, true));
+            let outcome = match start_monitoring_login(h.clone(), target.provider, target.id.clone(), false).await {
+                Ok(task) => task.await.unwrap_or_else(|_| Err("monitor_login_failed".into())),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = outcome {
+                error = Some(e);
+                break;
+            }
+        }
+        publish_bulk(&h, |b| {
+            if error.is_none() { b.done = b.total; }
+            b.current = None;
+            b.finished = true;
+            b.error = error;
+        });
     });
-    Ok(())
+    Ok(targets)
+}
+
+#[tauri::command]
+async fn connect_monitoring_all(app: AppHandle) -> Result<Vec<bulk::Target>, String> {
+    connect_all(&app).await
+}
+
+/// What the bulk actions would act on now, and how a running "Connect for all" is doing.
+#[tauri::command]
+fn bulk_status(state: tauri::State<AppState>) -> serde_json::Value {
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    let settings = state.settings.lock().unwrap().clone();
+    serde_json::json!({
+        "unmonitored": bulk::unmonitored(&snapshot),
+        "lapsed": bulk::lapsed(&snapshot, &settings, chrono::Utc::now()),
+        "connecting": state.bulk_connect.lock().unwrap().clone(),
+    })
+}
+
+/// Removes every account whose plan has ended, as each row's remove does; accounts in use stay.
+async fn remove_lapsed(app: &AppHandle) -> serde_json::Value {
+    let plan = {
+        let state = app.state::<AppState>();
+        let snapshot = state.snapshot.lock().unwrap().clone();
+        let settings = state.settings.lock().unwrap().clone();
+        bulk::lapsed(&snapshot, &settings, chrono::Utc::now())
+    };
+    let (mut removed, mut failed) = (Vec::new(), Vec::new());
+    for target in &plan.remove {
+        match remove_one(app, target.provider, &target.id).await {
+            Ok(()) => removed.push(target.clone()),
+            Err(error) => failed.push(serde_json::json!({ "account": target, "error": error })),
+        }
+    }
+    let snapshot = do_refresh(app).await;
+    serde_json::json!({ "removed": removed, "failed": failed, "in_use": plan.in_use, "snapshot": snapshot })
+}
+
+#[tauri::command]
+async fn remove_lapsed_accounts(app: AppHandle) -> serde_json::Value {
+    remove_lapsed(&app).await
 }
 
 #[tauri::command]
 async fn remove_account(app: AppHandle, provider: Provider, id: String) -> Result<Snapshot, String> {
+    remove_one(&app, provider, &id).await?;
+    Ok(do_refresh(&app).await)
+}
+
+/// Removes a saved account that is not in use: its monitoring sign-in, its project pins and its
+/// profile's login (the rest of the profile folder stays), then the saved login.
+async fn remove_one(app: &AppHandle, provider: Provider, id: &str) -> Result<(), String> {
+    let id = id.to_string();
     let operation = app.state::<AppState>().account_operations.begin(provider, &id)?;
     let active = {
         let snapshot = app.state::<AppState>().snapshot.lock().unwrap().clone();
@@ -486,9 +728,163 @@ async fn remove_account(app: AppHandle, provider: Provider, id: String) -> Resul
         app.state::<AppState>().monitor.disconnect(&slot, &http_client()).await?;
         app.state::<AppState>().usage_cache.lock().unwrap().remove(&monitoring::key(&slot));
     }
+    {
+        let state = app.state::<AppState>();
+        let _held = state.settings_lock.lock().await;
+        let current = state.settings.lock().unwrap().clone();
+        if current.project_pins.iter().any(|p| p.provider == provider && p.id == id) {
+            let project_pins = current.project_pins.iter().filter(|p| !(p.provider == provider && p.id == id)).cloned().collect();
+            store_settings(app, Settings { project_pins, ..current }).await?;
+        }
+    }
+    if let Some(root) = accounts::profiles_root() {
+        accounts::withdraw_profile(provider, &root.join(accounts::profile_name(provider, &id))).map_err(|e| e.to_string())?;
+    }
     accounts::remove_slot(provider, &id).map_err(|e| e.to_string())?;
     drop(operation);
-    Ok(do_refresh(&app).await)
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Project pins (see `pins`)
+
+/// Signs each pinned account's profile in or out (see `accounts::sync_profiles`) and rewrites the
+/// launcher. `active` is where accounts are signed in by default, when the caller just read it.
+async fn sync_pins(app: &AppHandle, active: Option<accounts::Active>) {
+    let state = app.state::<AppState>();
+    let pins = state.settings.lock().unwrap().project_pins.clone();
+    let found = state.sources.lock().unwrap().clone();
+    let states = tauri::async_runtime::spawn_blocking(move || {
+        // Never decide what is signed in by default from an empty source list.
+        let found = if found.is_empty() { sources::discover() } else { found };
+        let active = active.unwrap_or_else(|| accounts::capture(&found));
+        let states = accounts::sync_profiles(&pins::wanted(&pins), &active);
+        if !pins.is_empty() || pins::bin_dir().is_some_and(|d| d.exists()) {
+            let _ = pins::write_launcher(&pins);
+        }
+        states
+    }).await.unwrap_or_default();
+    *state.profile_states.lock().unwrap() = states;
+}
+
+fn pin_listing(app: &AppHandle) -> pins::Listing {
+    let state = app.state::<AppState>();
+    let settings = state.settings.lock().unwrap().clone();
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    let states = state.profile_states.lock().unwrap().clone();
+    let label = |provider: Provider, id: &str| snapshot.accounts.iter()
+        .find(|a| a.provider == provider && a.id == id)
+        .and_then(|a| a.alias.clone().or(a.email.clone()));
+    let root = accounts::profiles_root().unwrap_or_default();
+    pins::listing(&settings.project_pins, &states, label, &root, pins::launcher_path().as_deref())
+}
+
+#[tauri::command]
+fn list_project_pins(app: AppHandle) -> pins::Listing {
+    pin_listing(&app)
+}
+
+#[tauri::command]
+async fn set_project_pin(app: AppHandle, folder: String, provider: Provider, id: Option<String>) -> Result<pins::Listing, String> {
+    {
+        let state = app.state::<AppState>();
+        let _held = state.settings_lock.lock().await;
+        let current = state.settings.lock().unwrap().clone();
+        let known: Vec<_> = accounts::load_slots().into_iter().map(|s| (s.provider, s.id)).collect();
+        let project_pins = pins::set(&current.project_pins, &folder, provider, id.as_deref(), &known)?;
+        store_settings(&app, Settings { project_pins, ..current }).await?;
+    }
+    sync_pins(&app, None).await;
+    Ok(pin_listing(&app))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The quick switcher
+
+/// Like a launcher: clicking anywhere else hides it, and closing it (Alt+F4) only hides it, so
+/// the window lives as long as the app.
+fn watch_switcher(win: &tauri::WebviewWindow) {
+    #[cfg(windows)]
+    dock::exclude_from_peek(win);
+    let w = win.clone();
+    win.on_window_event(move |e| match e {
+        WindowEvent::Focused(false) => { let _ = w.hide(); }
+        WindowEvent::CloseRequested { api, .. } => {
+            api.prevent_close();
+            let _ = w.hide();
+        }
+        _ => {}
+    });
+}
+
+/// The switcher window, created again from its configuration if it is gone. Builds off the main
+/// thread: building a window there waits on the event loop the main thread runs.
+async fn switcher_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
+    if let Some(w) = app.get_webview_window(SWITCHER_LABEL) {
+        return Some(w);
+    }
+    let config = app.config().app.windows.iter().find(|w| w.label == SWITCHER_LABEL)?.clone();
+    let h = app.clone();
+    let win = tauri::async_runtime::spawn_blocking(move || tauri::WebviewWindowBuilder::from_config(&h, &config).ok()?.build().ok())
+        .await.ok().flatten()?;
+    watch_switcher(&win);
+    Some(win)
+}
+
+fn show_switcher(app: &AppHandle, w: &tauri::WebviewWindow) {
+    let _ = w.center();
+    let _ = w.show();
+    let _ = w.set_focus();
+    let _ = app.emit_to(SWITCHER_LABEL, "switcher-open", ());
+}
+
+/// Shows the switcher in the middle of the screen, or hides it when it is open (the shortcut).
+pub(crate) fn toggle_switcher(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(w) = switcher_window(&app).await else { return };
+        if w.is_visible().unwrap_or(false) { let _ = w.hide(); } else { show_switcher(&app, &w); }
+    });
+}
+
+#[tauri::command]
+async fn open_switcher(app: AppHandle) {
+    if let Some(panel) = app.get_webview_window(panel::LABEL) {
+        let _ = panel.hide();
+    }
+    if let Some(w) = switcher_window(&app).await {
+        if !w.is_visible().unwrap_or(false) { show_switcher(&app, &w); }
+    }
+}
+
+#[tauri::command]
+fn hide_switcher(app: AppHandle) {
+    if let Some(w) = app.get_webview_window(SWITCHER_LABEL) {
+        let _ = w.hide();
+    }
+}
+
+/// Registers the switcher's system-wide shortcut from settings, replacing the previous one.
+fn apply_hotkey(app: &AppHandle) {
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
+    let hotkey = app.state::<AppState>().settings.lock().unwrap().switcher_hotkey.clone();
+    let shortcuts = app.global_shortcut();
+    let _ = shortcuts.unregister_all();
+    let error = if hotkey.is_empty() {
+        None
+    } else {
+        match hotkey.replace("Win", "Super").parse::<Shortcut>() {
+            Ok(shortcut) => shortcuts.register(shortcut).err().map(|_| "hotkey_taken".to_string()),
+            Err(_) => Some("hotkey_invalid".to_string()),
+        }
+    };
+    *app.state::<AppState>().hotkey_error.lock().unwrap() = error;
+}
+
+/// Why the shortcut is not working, if it is not: "hotkey_taken" or "hotkey_invalid".
+#[tauri::command]
+fn hotkey_status(state: tauri::State<AppState>) -> Option<String> {
+    state.hotkey_error.lock().unwrap().clone()
 }
 
 #[derive(Serialize)]
@@ -504,6 +900,7 @@ async fn disconnect_monitoring(app: AppHandle, provider: Provider, id: String) -
     app.state::<AppState>().diagnostics.record(Some(provider), Some(&id), diagnostics::Event::Action { action: diagnostics::Action::Disconnect,
         code: diagnostics::Code::from_error(result.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) });
     let revoked = result?;
+    auto_monitor_saved(&app, |t| t.manual(&monitoring::key(&slot), false));
     {
         let state = app.state::<AppState>();
         let _refresh = state.refresh_lock.lock().await;
@@ -576,6 +973,11 @@ async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String>
 
 /// Saves and applies settings; callers hold `settings_lock`.
 async fn store_settings(app: &AppHandle, settings: Settings) -> Result<(), String> {
+    // A changed shortcut is checked here too: the window saves whole settings.
+    let stored = app.state::<AppState>().settings.lock().unwrap().switcher_hotkey.clone();
+    let settings = if settings.switcher_hotkey == stored { settings } else {
+        Settings { switcher_hotkey: settings::normalize_hotkey(&settings.switcher_hotkey)?, ..settings }
+    };
     settings::save(&settings)?;
     diagnostics::set_crash_records(settings.crash_records);
     let previous = std::mem::replace(&mut *app.state::<AppState>().settings.lock().unwrap(), settings.clone());
@@ -583,6 +985,9 @@ async fn store_settings(app: &AppHandle, settings: Settings) -> Result<(), Strin
     let providers_changed = previous.providers.claude != settings.providers.claude
         || previous.providers.codex != settings.providers.codex;
     let presence_changed = previous.presence_folder != settings.presence_folder || previous.presence_remote != settings.presence_remote;
+    if previous.switcher_hotkey != settings.switcher_hotkey {
+        apply_hotkey(app);
+    }
     if presence_changed {
         app.state::<AppState>().health.lock().unwrap().sharing = None;
         // The old folder's other machines should not keep seeing this one as signed in.
@@ -709,11 +1114,15 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
         .unwrap_or_default();
     *state.sources.lock().unwrap() = found.clone();
     static CLEANUP_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    accounts::resolve_identities(&http_client(), &found).await;
+    let profiles = accounts::profile_sources(&pins::wanted(&settings.project_pins));
+    accounts::resolve_identities(&http_client(), &[found.clone(), profiles].concat()).await;
     let scan = found.clone();
-    let (active, slots) = tauri::async_runtime::spawn_blocking(move || (accounts::capture(&scan), accounts::load_slots()))
+    let active = tauri::async_runtime::spawn_blocking(move || accounts::capture(&scan))
         .await
         .unwrap_or_default();
+    // Before reading the vault: renewals made in project profiles are synced into it.
+    sync_pins(app, Some(active.clone())).await;
+    let slots = tauri::async_runtime::spawn_blocking(accounts::load_slots).await.unwrap_or_default();
     if !CLEANUP_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         let homes = found.clone();
         let protected = state.monitor.protected_tokens(&slots).await;
@@ -792,6 +1201,7 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
 
     let mut snapshot = Snapshot { accounts: list, updated_at: Some(chrono::Utc::now()) };
     state.diagnostics.samples(&snapshot);
+    note_active(&state, &snapshot, settings.refresh_minutes);
     let history = {
         let mut history = state.usage_history.lock().unwrap();
         subscriptions::record(&mut history, &snapshot, &valid, chrono::Utc::now());
@@ -816,7 +1226,109 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     *state.snapshot.lock().unwrap() = snapshot.clone();
     let _ = app.emit("usage-updated", &snapshot);
     if settings.providers.codex { scan_codex_local(app); }
+    if settings.calendar.enabled {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move { let _ = write_calendar(&app).await; });
+    }
+    scan_usage_index(app);
     snapshot
+}
+
+/// Records which account each CLI has signed in, seeding the log once from the diagnostics
+/// journal's past week. Saved when an interval starts, else every ten minutes.
+fn note_active(state: &AppState, snapshot: &Snapshot, refresh_minutes: u32) {
+    let now = chrono::Utc::now();
+    let gap = active_log::max_gap(refresh_minutes);
+    let marks = (!state.active_log.lock().unwrap().backfilled).then(|| state.diagnostics.active_marks());
+    let mut log = state.active_log.lock().unwrap();
+    let mut started = false;
+    if let Some(marks) = marks {
+        // The journal keeps a steady reading only hourly.
+        log.backfill(marks, chrono::Duration::minutes(75));
+        started = true;
+    }
+    for (provider, id) in active_log::active_ids(&snapshot.accounts) {
+        started |= log.note(provider, id, now, gap);
+    }
+    let mut saved = state.active_saved.lock().unwrap();
+    if started || saved.map_or(true, |t| t.elapsed() >= Duration::from_secs(600)) {
+        log.prune(now);
+        let _ = active_log::save(&log);
+        *saved = Some(Instant::now());
+    }
+}
+
+/// Re-reads the CLIs' transcripts and rollouts off the async runtime, one scan at a time. The
+/// first run reads weeks of files; later ones only what changed.
+fn scan_usage_index(app: &AppHandle) {
+    static SCANNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SCANNING.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let index = tauri::async_runtime::spawn_blocking(|| usage_index::scan(chrono::Utc::now())).await;
+        SCANNING.store(false, std::sync::atomic::Ordering::Release);
+        let Ok(index) = index else { return };
+        *app.state::<AppState>().usage_index.lock().unwrap() = Some(index);
+    });
+}
+
+/// The last index, or a scan now when there is none yet.
+async fn usage_index_now(app: &AppHandle) -> std::sync::Arc<usage_index::Index> {
+    if let Some(index) = app.state::<AppState>().usage_index.lock().unwrap().clone() { return index; }
+    let index = tauri::async_runtime::spawn_blocking(|| usage_index::scan(chrono::Utc::now())).await
+        .unwrap_or_else(|_| std::sync::Arc::new(usage_index::Index::default()));
+    *app.state::<AppState>().usage_index.lock().unwrap() = Some(index.clone());
+    index
+}
+
+async fn usage_breakdown(app: &AppHandle, filter: usage_index::Filter) -> usage_index::Breakdown {
+    let index = usage_index_now(app).await;
+    let state = app.state::<AppState>();
+    let known = usage_index::Known::from_snapshot(&state.snapshot.lock().unwrap());
+    let log = state.active_log.lock().unwrap().clone();
+    usage_index::breakdown(&index, &log, &known, &filter, chrono::Utc::now(), &chrono::Local)
+}
+
+#[tauri::command]
+async fn get_usage_breakdown(app: AppHandle, provider: Option<Provider>, account: Option<String>, days: Option<u32>, group_by: Option<usage_index::GroupBy>) -> usage_index::Breakdown {
+    usage_breakdown(&app, usage_index::Filter { provider, account, days: days.unwrap_or(7), group_by: group_by.unwrap_or_default() }).await
+}
+
+/// Writes the CSV exports into `folder` (default Documents\SlopBar Exports).
+async fn write_csv(app: &AppHandle, folder: Option<String>) -> Result<csv_export::Written, String> {
+    let folder = match folder.map(|f| f.trim().to_string()).filter(|f| !f.is_empty()) {
+        Some(f) => std::path::PathBuf::from(f),
+        None => csv_export::default_folder().ok_or("no_documents_folder")?,
+    };
+    let index = usage_index_now(app).await;
+    let state = app.state::<AppState>();
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    let known = usage_index::Known::from_snapshot(&snapshot);
+    let log = state.active_log.lock().unwrap().clone();
+    let history = state.usage_history.lock().unwrap().clone();
+    let report = subscription_report(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let now = chrono::Utc::now();
+        let rows = usage_index::daily(&index, &log, &known, now, &chrono::Local);
+        let stamp = now.with_timezone(&chrono::Local).format("%Y-%m-%d-%H%M%S").to_string();
+        csv_export::write(&folder, &csv_export::history_csv(&history, &known), &csv_export::breakdown_csv(&rows), &csv_export::subscriptions_csv(&report), &stamp)
+    }).await.map_err(|_| "export_folder_unwritable".to_string())?
+}
+
+#[tauri::command]
+async fn export_csv(app: AppHandle, folder: Option<String>) -> Result<csv_export::Written, String> {
+    let written = write_csv(&app, folder).await?;
+    #[cfg(windows)]
+    {
+        let folder = written.folder.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || std::process::Command::new("explorer.exe").arg(folder).spawn()).await;
+    }
+    Ok(written)
+}
+
+#[tauri::command]
+fn csv_default_folder() -> Option<String> {
+    csv_export::default_folder().map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Re-reads the Codex CLI's local history off the async runtime, one scan at a time, then has
@@ -836,13 +1348,57 @@ fn scan_codex_local(app: &AppHandle) {
     });
 }
 
+/// Changes the automatic-connect state, saving it when `change` says it changed.
+fn auto_monitor_saved(app: &AppHandle, change: impl FnOnce(&mut auto_monitor::Tracker) -> bool) {
+    let state = app.state::<AppState>();
+    let saved = {
+        let mut tracker = state.auto_monitor.lock().unwrap();
+        change(&mut tracker).then(|| tracker.saved.clone())
+    };
+    if let Some(saved) = saved {
+        let _ = auto_monitor::save(&saved);
+    }
+}
+
+/// Starts monitoring's sign-in for the account in use when it is due (see `auto_monitor`). Reads
+/// the last snapshot, so it is cheap to call often.
+fn auto_connect_tick(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    // One sign-in at a time: never alongside an open one or a running "Connect monitoring for all".
+    let queued = state.bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished);
+    if queued || state.account_operations.busy(monitoring::SIGN_IN) {
+        return;
+    }
+    let enabled = state.settings.lock().unwrap().auto_connect_monitoring;
+    let seen: Vec<_> = state.snapshot.lock().unwrap().accounts.iter().map(auto_monitor::Seen::of).collect();
+    let fullscreen = enabled && dock::fullscreen();
+    let busy = |key: &str| state.account_operations.busy(key);
+    let guards = auto_monitor::Guards { enabled, fullscreen, busy: &busy };
+    let decision = state.auto_monitor.lock().unwrap().decide(&seen, &guards, chrono::Utc::now());
+    let auto_monitor::Decision::Start { provider, id } = decision else { return };
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let key = format!("{}:{id}", provider.name());
+        if let Err(e) = start_monitoring_login(app.clone(), provider, id, true).await {
+            // Someone else started on it meanwhile: no reason to wait a day.
+            let ok = e == "monitor_busy";
+            auto_monitor_saved(&app, |t| t.finished(&key, ok, chrono::Utc::now()));
+        }
+    });
+}
+
 /// Refreshes on the interval from settings, re-reading it so changes apply without a restart.
 async fn refresh_loop(app: AppHandle) {
     loop {
         do_refresh(&app).await;
+        auto_connect_tick(&app);
         let started = Instant::now();
+        let mut seconds = 0u32;
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
+            seconds += 1;
+            // Every half minute, so an account is connected soon after its 3 minutes in use.
+            if seconds % 30 == 0 { auto_connect_tick(&app); }
             let minutes = app.state::<AppState>().settings.lock().unwrap().refresh_minutes.max(1);
             if started.elapsed() >= Duration::from_secs(minutes as u64 * 60) {
                 break;
@@ -871,6 +1427,9 @@ pub fn run() {
         usage_cache: Mutex::new(providers::load_cache()),
         usage_history: Mutex::new(subscriptions::load()),
         codex_local: Mutex::default(),
+        active_log: Mutex::new(active_log::load()),
+        active_saved: Mutex::default(),
+        usage_index: Mutex::default(),
         monitor: monitoring::Monitor::new(settings::app_dir().expect("config directory").join("monitoring")).with_diagnostics(diagnostics.clone()),
         diagnostics: diagnostics.clone(),
         refresh_lock: tokio::sync::Mutex::new(()),
@@ -882,13 +1441,24 @@ pub fn run() {
         presence_tracks: Mutex::default(),
         unexpected_log: Mutex::new(unexpected::load()),
         plan_alerts: Mutex::new(plan_alerts::load()),
+        auto_monitor: Mutex::new(auto_monitor::Tracker::new(auto_monitor::load())),
         health: Mutex::default(),
+        profile_states: Mutex::default(),
+        bulk_connect: Mutex::default(),
+        hotkey_error: Mutex::default(),
     };
     tauri::Builder::default()
         // Must come first: a second launch hands over to the running instance and exits.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_settings(app)))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new()
+            .with_handler(|app, _shortcut, event| {
+                if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                    toggle_switcher(app);
+                }
+            })
+            .build())
         .manage(state)
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -899,7 +1469,14 @@ pub fn run() {
             get_health,
             restart_app,
             get_subscriptions,
+            get_usage_breakdown,
+            export_csv,
+            csv_default_folder,
             take_plan_alerts,
+            take_digest,
+            export_calendar,
+            check_calendar_path,
+            default_calendar_path,
             open_billing_page,
             export_diagnostics,
             record_frontend_error,
@@ -922,6 +1499,14 @@ pub fn run() {
             connect_monitoring,
             disconnect_monitoring,
             remove_account,
+            connect_monitoring_all,
+            remove_lapsed_accounts,
+            bulk_status,
+            list_project_pins,
+            set_project_pin,
+            open_switcher,
+            hide_switcher,
+            hotkey_status,
             set_dock_width,
             dock_clicked,
             dock_menu,
@@ -992,7 +1577,12 @@ pub fn run() {
                 });
             }
 
+            if let Some(win) = app.get_webview_window(SWITCHER_LABEL) {
+                watch_switcher(&win);
+            }
+
             apply_settings(handle);
+            apply_hotkey(handle);
             dock::show_docked(handle);
 
             // Updates install silently; after one, say so once in the widget.

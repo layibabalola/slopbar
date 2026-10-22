@@ -12,7 +12,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 default = ["desktop"]
-desktop = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-autostart", "dep:tauri-plugin-single-instance", "dep:tauri-plugin-updater", "dep:tauri-plugin-notification", "dep:webview2-com", "dep:tauri-winrt-notification"]
+desktop = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-autostart", "dep:tauri-plugin-single-instance", "dep:tauri-plugin-updater", "dep:tauri-plugin-notification", "dep:tauri-plugin-global-shortcut", "dep:webview2-com", "dep:tauri-winrt-notification"]
 # Local fixes must not silently replace themselves with an upstream release.
 upstream-updates = ["desktop"]
 
@@ -46,9 +46,14 @@ tauri-plugin-single-instance = { version = "2", optional = true }
 tauri-plugin-updater = { version = "2", optional = true }
 tokio = { version = "1", features = ["time", "sync", "rt", "macros", "net", "io-util"] }
 tauri-plugin-notification = { version = "2", optional = true }
+# The quick switcher's system-wide hotkey.
+# 2.4 needs a newer tauri than the one locked here.
+tauri-plugin-global-shortcut = { version = "~2.3", optional = true }
 # Read-only view of the Codex CLI's own thread list and rollouts.
 rusqlite = { version = "0.32", features = ["bundled"] }
 zstd = { version = "0.13", default-features = false }
+# Fast substring search over long transcript lines (already in the tree through serde_json).
+memchr = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes"] }

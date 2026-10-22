@@ -21,6 +21,8 @@ pub enum Target {
     Settings,
     /// The flyout that opens from the taskbar widget.
     Flyout,
+    /// The quick switcher.
+    Switcher,
 }
 
 impl Target {
@@ -28,6 +30,7 @@ impl Target {
         match self {
             Target::Settings => "settings",
             Target::Flyout => crate::panel::LABEL,
+            Target::Switcher => crate::app::SWITCHER_LABEL,
         }
     }
 }

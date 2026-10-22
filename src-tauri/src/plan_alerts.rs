@@ -131,16 +131,16 @@ pub fn due(report: &Report, snapshot: &Snapshot, prefs: &Notifications, sent: &m
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::{AccountUsage, BillingHints, UsageWindow};
     use crate::settings::{Settings, Subscription};
     use crate::subscriptions::{report, AccountHistory, History, WindowRecord};
     use crate::test_support::TempDir;
 
-    fn at(s: &str) -> DateTime<Utc> { DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc) }
+    pub(crate) fn at(s: &str) -> DateTime<Utc> { DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc) }
 
-    fn account(id: &str, used: f64, resets_at: DateTime<Utc>) -> AccountUsage {
+    pub(crate) fn account(id: &str, used: f64, resets_at: DateTime<Utc>) -> AccountUsage {
         AccountUsage {
             id: id.into(), provider: Provider::Codex, email: Some(format!("{id}@example.invalid")), alias: None,
             plan: Some("pro".into()), org: None, active: false, sources: vec![],
@@ -151,7 +151,7 @@ mod tests {
     }
 
     /// Four watched weeks peaking at `peak`, ending before `now`.
-    fn watched(peak: f64, now: DateTime<Utc>) -> AccountHistory {
+    pub(crate) fn watched(peak: f64, now: DateTime<Utc>) -> AccountHistory {
         let windows = (1..=4).map(|i| {
             let end = now - Duration::days(7 * i - 6);
             WindowRecord { kind: "weekly".into(), resets_at: end, peak, first_obs: end - Duration::days(7), last_obs: end - Duration::hours(1),
@@ -160,10 +160,10 @@ mod tests {
         AccountHistory { first_seen: Some(now - Duration::days(30)), windows, ..Default::default() }
     }
 
-    struct World { snapshot: Snapshot, history: History, settings: Settings }
+    pub(crate) struct World { pub snapshot: Snapshot, pub history: History, pub settings: Settings }
 
     /// Three paid Codex plans renewing on the 24th: one unused, one busy, one already cancelled.
-    fn world(now: DateTime<Utc>) -> World {
+    pub(crate) fn world(now: DateTime<Utc>) -> World {
         let mut settings = Settings::default();
         let mut history = History::default();
         let mut accounts = vec![];

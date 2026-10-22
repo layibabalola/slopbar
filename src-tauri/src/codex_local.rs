@@ -360,7 +360,7 @@ impl Local {
     }
 }
 
-fn account_id(slot_id: &str) -> Option<&str> {
+pub(crate) fn account_id(slot_id: &str) -> Option<&str> {
     if slot_id.starts_with("token:") { return None; }
     slot_id.rsplit_once(':').map(|(_, a)| a).filter(|a| !a.is_empty())
 }

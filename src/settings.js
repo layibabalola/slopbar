@@ -251,7 +251,7 @@ listen("account-added", () => { $("add-hint").hidden = true; });
 // The verdicts come from the backend (subscriptions.rs); this page only words them.
 
 let report = null;
-const NOTIFY_KINDS = ["usage", "resets", "switches", "renewals", "unexpected_use"];
+const NOTIFY_KINDS = ["usage", "resets", "switches", "renewals", "unexpected_use", "digest"];
 const money = (v) => (v == null ? "" : `$${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`);
 const pct = (v) => `${Math.round(v)}%`;
 const VERDICT_TONE = { exhausted_weekly: "bad", unused: "warn", underused: "warn", healthy: "ok", insufficient_data: "" };
@@ -487,6 +487,136 @@ listen("usage-updated", loadSubscriptions);
 listen("show-page", ({ payload: page }) => document.querySelector(`.nav[data-page="${page}"]`)?.click());
 
 // ---------------------------------------------------------------------------------------------
+// Usage: the backend's index of the CLIs' files (usage_index.rs), by repository and by model.
+
+const USAGE_DAYS = [7, 28];
+let usage = null;
+let usageDays = 7;
+const heatPick = {};
+try { usageDays = Number(localStorage.getItem("usage-days")) || usageDays; } catch {}
+
+const accountName = (s) => s.alias || s.email || (s.id ? t("usageUnknown") : t("usageUnattributed"));
+
+function bars(groups, limit = 5) {
+  if (!groups?.length) return `<div class="usage-empty">${t("usageNone")}</div>`;
+  return `<ol class="bars">${groups.slice(0, limit).map((g) => `
+    <li title="${esc(t("usageSplit", { i: compact(g.tokens.input + g.tokens.cache_write), o: compact(g.tokens.output), c: compact(g.tokens.cached) }))}">
+      <span class="bar-key">${esc(g.key)}</span><span class="bar-value">${compact(g.tokens.total)} · ${g.share}%</span>
+      <span class="bar" style="--w:${Math.max(1, g.share)}%"></span>
+    </li>`).join("")}</ol>`;
+}
+
+function weekdayNames() {
+  // 2024-01-01 was a Monday.
+  return [...Array(7)].map((_, i) => new Date(2024, 0, 1 + i).toLocaleDateString(undefined, { weekday: "short" }));
+}
+
+function heatmap(grid) {
+  const max = Math.max(1, ...grid.flat());
+  const days = weekdayNames();
+  const hours = [...Array(24).keys()];
+  return `<div class="heat" role="img" aria-label="${esc(t("usageHeatmap"))}">
+    <span></span>${hours.map((h) => `<span class="heat-hour">${h % 6 === 0 ? h : ""}</span>`).join("")}
+    ${grid.map((row, d) => `<span class="heat-day">${esc(days[d])}</span>${row.map((v, h) =>
+      `<span class="heat-cell" style="--a:${v ? 0.12 + 0.88 * (v / max) : 0}" title="${esc(`${days[d]} ${h}:00 · ${compact(v)}`)}"></span>`).join("")}`).join("")}
+  </div>`;
+}
+
+function usageAccount(s, models) {
+  const note = s.id == null ? t("usageUnattributedHint") : !s.known ? t("usageUnknown")
+    : s.attribution === "inferred_from_active_account" ? t("usageInferred") : s.attribution === "mixed" ? t("usageMixed") : "";
+  const tok = s.tokens;
+  return `
+    <div class="row usage-account" data-key="${esc(`${s.provider}:${s.id ?? ""}`)}">
+      <div class="usage-who">
+        <label>${esc(accountName(s))}</label>
+        <small>${tok.total ? esc(`${t("usageTotal", { v: compact(tok.total) })} · ${t("usageSplit", { i: compact(tok.input + tok.cache_write), o: compact(tok.output), c: compact(tok.cached) })}`) : esc(t("usageNone"))}</small>
+        ${note && tok.total ? `<small class="usage-note">${esc(note)}</small>` : ""}
+      </div>
+      ${tok.total ? `<div class="usage-cols">
+        <div><h4>${t("usageTopRepos")}</h4>${bars(s.groups)}</div>
+        <div><h4>${t("usageTopModels")}</h4>${bars(models?.groups)}</div>
+      </div>` : ""}
+    </div>`;
+}
+
+function renderUsage() {
+  if (!settings) return;
+  const box = $("usage");
+  if (!usage) { box.innerHTML = `<p class="hint">${t("usageLoading")}</p>`; return; }
+  const [repos, models] = usage;
+  const slice = (b, s) => b.accounts.find((x) => x.provider === s.provider && x.id === s.id);
+  box.innerHTML = PROVIDERS.filter(([p]) => settings.providers[p]).map(([p, name]) => {
+    const total = repos.providers.find((x) => x.provider === p);
+    const accounts = repos.accounts.filter((s) => s.provider === p)
+      .sort((a, b) => (a.id == null) - (b.id == null) || b.tokens.total - a.tokens.total);
+    const pick = heatPick[p] ?? "";
+    const heatFrom = pick ? accounts.find((s) => (s.id ?? "-") === pick) : total;
+    const summary = [t("usageTotal", { v: compact(total?.tokens.total ?? 0) })];
+    if (total?.unattributed.total) summary.push(t("usageUnattributedTotal", { v: compact(total.unattributed.total) }));
+    return `
+      <div class="provider">
+        <div class="provider-head"><span class="logo ${p}">${MARK[p]}</span><h3>${name}</h3><small class="sub-summary">${esc(summary.join(" · "))}</small></div>
+        ${total?.tokens.total ? `<div class="row usage-overview">
+          <div><h4>${t("usageModelMix")}</h4>${bars(total.models)}</div>
+          <div>
+            <div class="usage-heat-head"><h4>${t("usageHeatmap")}</h4>
+              <div class="select"><select data-heat="${p}">
+                <option value="">${t("usageHeatmapAll")}</option>
+                ${accounts.filter((s) => s.tokens.total).map((s) => `<option value="${esc(s.id ?? "-")}" ${(s.id ?? "-") === pick ? "selected" : ""}>${esc(accountName(s))}</option>`).join("")}
+              </select></div>
+            </div>
+            ${heatmap((heatFrom ?? total).heatmap)}
+          </div>
+        </div>` : ""}
+        <div class="group">${accounts.length ? accounts.map((s) => usageAccount(s, slice(models, s))).join("") : `<div class="empty">${t("noAccounts")}</div>`}</div>
+      </div>`;
+  }).join("");
+}
+
+async function loadUsage() {
+  renderUsage();
+  try {
+    usage = await Promise.all(["repo", "model"].map((group_by) => invoke("get_usage_breakdown", { days: usageDays, groupBy: group_by })));
+  } catch { return; }
+  renderUsage();
+}
+
+$("usage-days").innerHTML = USAGE_DAYS.map((n) => `<option value="${n}">${t("usageDays", { n })}</option>`).join("");
+$("usage-days").value = String(usageDays);
+$("usage-days").addEventListener("change", (e) => {
+  usageDays = Number(e.target.value);
+  try { localStorage.setItem("usage-days", String(usageDays)); } catch {}
+  loadUsage();
+});
+$("usage").addEventListener("change", (e) => {
+  const p = e.target.dataset.heat;
+  if (p == null) return;
+  heatPick[p] = e.target.value;
+  renderUsage();
+});
+document.querySelector('.nav[data-page="usage"]').addEventListener("click", loadUsage);
+listen("usage-updated", () => { if ($("page-usage").classList.contains("active")) loadUsage(); });
+
+invoke("csv_default_folder").then((folder) => {
+  let saved = "";
+  try { saved = localStorage.getItem("export-folder") || ""; } catch {}
+  $("export-folder").value = saved || folder || "";
+}, () => {});
+$("export-csv").addEventListener("click", async () => {
+  const status = $("export-status");
+  const folder = $("export-folder").value.trim();
+  status.textContent = t("exportCsvSaving"); status.hidden = false;
+  try {
+    const written = await invoke("export_csv", { folder: folder || null });
+    try { localStorage.setItem("export-folder", folder); } catch {}
+    status.textContent = t("exportCsvSaved", { n: written.files.length, path: written.folder });
+  } catch {
+    status.textContent = t("exportCsvFailed");
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
 // Everything else
 
 async function render() {
@@ -508,6 +638,8 @@ async function render() {
   $("auto-update").disabled = !updatesEnabled;
   for (const kind of NOTIFY_KINDS) $(`notify-${kind}`).checked = settings.notifications[kind];
   $("crash-records").checked = settings.crash_records;
+  $("auto-monitoring").checked = settings.auto_connect_monitoring;
+  renderCalendar();
   renderPresence();
   const version = await invoke("app_version");
   $("version").textContent = /^\d/.test(version) ? `v${version}` : version;
@@ -519,6 +651,9 @@ async function render() {
   } else if (!$("check-updates").disabled) $("check-updates").textContent = latest ? t("installUpdate") : t("checkUpdates");
   renderAccounts();
   if (!editingPlan()) renderSubscriptions();
+  renderHotkey();
+  loadBulk();
+  loadPins();
 }
 
 async function update(patch) {
@@ -543,6 +678,34 @@ $("export-diagnostics").addEventListener("click", async () => {
   finally { button.disabled = false; }
 });
 $("crash-records").addEventListener("change", (e) => update({ crash_records: e.target.checked }));
+$("auto-monitoring").addEventListener("change", (e) => update({ auto_connect_monitoring: e.target.checked }));
+
+// The plan-renewal calendar (calendar.rs): an .ics file calendar apps can subscribe to.
+let calendarDefault = "";
+invoke("default_calendar_path").then((p) => { calendarDefault = p ?? ""; if (settings) renderCalendar(); }, () => {});
+function renderCalendar() {
+  $("calendar-enabled").checked = settings.calendar?.enabled ?? false;
+  if (document.activeElement !== $("calendar-path")) $("calendar-path").value = settings.calendar?.path ?? calendarDefault;
+}
+const calendarStatus = (text) => { $("calendar-status").textContent = text; $("calendar-status").hidden = !text; };
+async function exportCalendar() {
+  try {
+    const { path, events } = await invoke("export_calendar");
+    calendarStatus(t("calendarSaved", { n: events, path }));
+  } catch { calendarStatus(t("calendarFailed")); }
+}
+$("calendar-enabled").addEventListener("change", async (e) => {
+  await update({ calendar: { ...settings.calendar, enabled: e.target.checked } });
+  if (e.target.checked) exportCalendar();
+});
+$("calendar-save").addEventListener("click", async () => {
+  const path = $("calendar-path").value.trim();
+  if (path && path !== calendarDefault && !(await invoke("check_calendar_path", { path }))) { calendarStatus(t("calendarPathInvalid")); return; }
+  calendarStatus("");
+  await update({ calendar: { ...settings.calendar, path: path && path !== calendarDefault ? path : null } });
+  if (settings.calendar.enabled) exportCalendar();
+});
+$("calendar-export").addEventListener("click", exportCalendar);
 
 // ---------------------------------------------------------------------------------------------
 // Health: the backend's self-check (health.rs) with each check's fix wired to the matching action.
@@ -689,6 +852,150 @@ $("check-updates").addEventListener("click", async () => {
 
 listen("settings-changed", (e) => { settings = e.payload; render(); });
 
+// ---------------------------------------------------------------------------------------------
+// The quick switcher's shortcut (General)
+
+async function renderHotkey() {
+  if (document.activeElement !== $("hotkey")) $("hotkey").value = settings.switcher_hotkey ?? "";
+  $("hotkey").placeholder = t("hotkeyOff");
+  const problem = settings.switcher_hotkey ? await invoke("hotkey_status").catch(() => null) : null;
+  $("hotkey-hint").textContent = problem ? t(problem) : settings.switcher_hotkey ? t("switcherShortcutHint") : t("hotkeyOffHint");
+  $("hotkey-hint").classList.toggle("problem", !!problem);
+}
+async function saveHotkey() {
+  const before = settings.switcher_hotkey;
+  settings = { ...settings, switcher_hotkey: $("hotkey").value.trim() };
+  try {
+    await invoke("save_settings", { settings });
+    settings = await invoke("get_settings");
+    $("hotkey").value = settings.switcher_hotkey;
+  } catch {
+    settings = { ...settings, switcher_hotkey: before };
+    $("hotkey-hint").textContent = t("hotkey_invalid");
+    $("hotkey-hint").classList.add("problem");
+    return;
+  }
+  renderHotkey();
+}
+$("hotkey-save").addEventListener("click", saveHotkey);
+$("hotkey").addEventListener("keydown", (e) => { if (e.key === "Enter") saveHotkey(); });
+
+// ---------------------------------------------------------------------------------------------
+// Bulk actions (Accounts): monitoring for every unmonitored account, one sign-in at a time, and
+// removing accounts whose plan has ended.
+
+let bulk = { unmonitored: [], lapsed: { remove: [], in_use: [] }, connecting: null };
+const who = (target) => target.account || t("unknownAccount");
+
+function renderBulk() {
+  const c = bulk.connecting;
+  const running = c && !c.finished;
+  $("bulk-connect").disabled = running || !bulk.unmonitored.length;
+  $("bulk-connect-hint").textContent = bulk.unmonitored.length ? t("bulkConnectHint", { n: bulk.unmonitored.length }) : t("bulkConnectNone");
+  $("bulk-remove").disabled = !bulk.lapsed.remove.length;
+  $("bulk-remove-hint").textContent = bulk.lapsed.remove.length
+    ? t("bulkRemoveHint", { list: bulk.lapsed.remove.map(who).join(", ") })
+    : bulk.lapsed.in_use.length ? t("bulkRemoveInUse", { list: bulk.lapsed.in_use.map(who).join(", ") }) : t("bulkRemoveNone");
+  const status = $("bulk-status");
+  if (running && c.current) status.textContent = t("bulkConnecting", { i: c.done + 1, n: c.total, account: who(c.current) });
+  else if (c?.finished && c.error) status.textContent = t("bulkConnectStopped", { done: c.done, n: c.total, error: errorText("", c.error) });
+  else if (c?.finished && c.total) status.textContent = t("bulkConnectDone", { n: c.total });
+  status.hidden = !(running || (c?.finished && c.total)) || !status.textContent;
+}
+async function loadBulk() {
+  bulk = await invoke("bulk_status").catch(() => bulk);
+  renderBulk();
+}
+$("bulk-connect").addEventListener("click", async () => {
+  $("bulk-connect").disabled = true;
+  try { await invoke("connect_monitoring_all"); } catch (err) { alert(errorText("", String(err))); }
+  loadBulk();
+});
+$("bulk-remove").addEventListener("click", async () => {
+  await loadBulk();
+  const list = bulk.lapsed.remove;
+  if (!list.length) return;
+  const lines = list.map((a) => `• ${who(a)} (${a.provider === "claude" ? "Claude" : "Codex"}) — ${t("bulkEnded", { d: shortDay(a.ended) })}`);
+  if (!confirm(`${t("bulkRemoveConfirm", { n: list.length })}\n\n${lines.join("\n")}`)) return;
+  $("bulk-remove").disabled = true;
+  const result = await invoke("remove_lapsed_accounts").catch((err) => ({ removed: [], failed: [{ error: String(err) }] }));
+  if (result.snapshot) { snapshot = result.snapshot; renderAccounts(); }
+  const status = $("bulk-status");
+  status.textContent = result.failed.length
+    ? t("bulkRemoveFailed", { n: result.removed.length, failed: result.failed.length })
+    : t("bulkRemoved", { n: result.removed.length });
+  status.hidden = false;
+  loadBulk();
+});
+listen("bulk-monitoring", ({ payload }) => { bulk.connecting = payload; renderBulk(); if (payload.finished) loadBulk(); });
+listen("usage-updated", loadBulk);
+
+// ---------------------------------------------------------------------------------------------
+// An account per project (Accounts): pinned folders, and the lines that use them.
+
+let pinListing = { pins: [], launcher: null };
+const PIN_STATE = { ready: "pinReady", at_default: "pinAtDefault", no_login: "pinNoLogin" };
+
+function renderPins() {
+  $("pins").innerHTML = pinListing.pins.length ? pinListing.pins.map((p) => `
+    <div class="row pin" data-pin="${esc(p.provider)}|${esc(p.folder)}">
+      <span class="logo ${p.provider}">${MARK[p.provider]}</span>
+      <div class="title">
+        <label title="${esc(p.folder)}">${esc(p.folder)}</label>
+        <small>${esc(p.account ?? t("unknownAccount"))} · ${esc(t(PIN_STATE[p.state]))}</small>
+      </div>
+      <button class="btn" data-copy="${esc(p.launch)}" title="${esc(p.launch)}">${t("pinCopyLaunch")}</button>
+      <button class="btn" data-copy="${esc(p.powershell)}" title="${esc(p.powershell)}">${t("pinCopyPowerShell")}</button>
+      <button class="btn" data-copy="${esc(p.envrc)}" title="${esc(p.envrc)}">${t("pinCopyEnvrc")}</button>
+      <button class="remove" data-unpin="${esc(p.provider)}" data-folder="${esc(p.folder)}" title="${t("pinRemove")}">
+        <svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+      </button>
+    </div>`).join("") : `<div class="empty">${t("pinsNone")}</div>`;
+  const choice = $("pin-account").value;
+  $("pin-account").innerHTML = snapshot.accounts.map((a) =>
+    `<option value="${esc(a.provider)}|${esc(a.id)}">${a.provider === "claude" ? "Claude" : "Codex"} · ${esc(a.alias || a.email || t("unknownAccount"))}</option>`).join("");
+  if (choice) $("pin-account").value = choice;
+  $("pin-folder").placeholder = t("pinFolderPlaceholder");
+  $("pin-save").disabled = !snapshot.accounts.length;
+  $("pins-launcher").textContent = pinListing.launcher ? t("pinsLauncher", { path: pinListing.launcher }) : "";
+}
+async function loadPins() {
+  pinListing = await invoke("list_project_pins").catch(() => pinListing);
+  renderPins();
+}
+function pinStatus(text) {
+  $("pins-status").textContent = text;
+  $("pins-status").hidden = !text;
+}
+async function savePin() {
+  const folder = $("pin-folder").value.trim();
+  const [provider, id] = $("pin-account").value.split(/\|(.*)/s);
+  if (!folder || !provider) return;
+  try {
+    pinListing = await invoke("set_project_pin", { folder, provider, id });
+    $("pin-folder").value = "";
+    pinStatus("");
+    renderPins();
+  } catch (err) { pinStatus(String(err).includes("folder") ? t("presenceFolderInvalid") : String(err)); }
+}
+$("pin-save").addEventListener("click", savePin);
+$("pin-folder").addEventListener("keydown", (e) => { if (e.key === "Enter") savePin(); });
+$("pins").addEventListener("click", async (e) => {
+  const copy = e.target.closest("[data-copy]");
+  if (copy) {
+    try { await navigator.clipboard.writeText(copy.dataset.copy); pinStatus(t("pinCopied")); } catch { pinStatus(copy.dataset.copy); }
+    return;
+  }
+  const unpin = e.target.closest("[data-unpin]");
+  if (unpin) {
+    try {
+      pinListing = await invoke("set_project_pin", { folder: unpin.dataset.folder, provider: unpin.dataset.unpin, id: null });
+      renderPins();
+    } catch (err) { pinStatus(String(err)); }
+  }
+});
+listen("usage-updated", loadPins);
+
 // The window draws its own title bar (see settings.html).
 $("close").addEventListener("click", () => window.__TAURI__.window.getCurrentWindow().close());
 window.addEventListener("blur", () => document.body.classList.add("inactive"));
@@ -715,3 +1022,4 @@ await loadHealth();
 let page = "accounts";
 try { page = localStorage.getItem("settings-page") || page; } catch {}
 showPage(page);
+if (page === "usage") loadUsage();

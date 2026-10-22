@@ -21,6 +21,7 @@ Your Claude Code and Codex plan limits, right in the Windows taskbar, next to th
 - **Lives in your taskbar**: a small widget next to the clock shows each provider's usage as a ring around its logo; hover for the exact number.
 - **One click for the details**: click the widget for a flyout with every account, its session and weekly limits, reset times, limit resets and credits. Right-click it to refresh, open Settings or quit.
 - **Multiple accounts**: add as many Claude and Codex accounts as you like and switch with one click, or let it switch for you when one hits its limit.
+- **Usage by project and model**: Settings > Usage shows each account's tokens by repository and model over the last 7 or 28 days, its busiest hours of the week, and each provider's model mix, read from Claude Code's and the Codex CLI's own files on this PC (token counts, models, times and folders only, never what was written). Claude use is credited to the account SlopBar saw signed in at the time. Export the weekly history, this breakdown and the subscription report as CSV files.
 - **Feels native**: follows the taskbar's light or dark theme, and steps aside while a fullscreen app is running.
 - **Speaks your language**: follows the system language (10 languages, English fallback).
 
@@ -36,7 +37,11 @@ Add accounts in **Settings → Accounts**: SlopBar opens the CLI's own sign-in (
 
 ### Monitoring accounts you aren't using
 
-Choose **Connect monitoring** next to each account in Settings or the flyout. Complete the official CLI's sign-in for that same account and organization. This creates a separate monitoring session in a temporary configuration folder; it is never imported into the switching vault or written to the active CLI's files. The temporary folder is removed when sign-in completes, fails, or times out.
+While an account is the one signed in to the CLI, SlopBar reads its usage with the CLI's own access token. That stops when you switch away: the CLI's refresh token rotates every time it is used, so SlopBar can't keep renewing a copy of it in the background without signing the CLI out. To keep reading an account you aren't using, SlopBar needs its own sign-in for it, a separate session it alone renews.
+
+SlopBar starts that sign-in for you. Once an account without monitoring has been the one in use for 3 minutes, it opens the sign-in and shows a notification, **Finish connecting monitoring for** that account; your browser is usually already signed in to it, so one approval is enough. It runs one sign-in at a time, waits while a fullscreen app is in front, never retries a cancelled or failed sign-in for that account within 24 hours, and leaves alone an account whose monitoring you disconnected. Turn it off with **Settings → Data → Connect monitoring automatically**.
+
+You can also choose **Connect monitoring** next to each account in Settings or the flyout. Complete the official CLI's sign-in for that same account and organization. This creates a separate monitoring session in a temporary configuration folder; it is never imported into the switching vault or written to the active CLI's files. The temporary folder is removed when sign-in completes, fails, or times out.
 
 SlopBar renews this separate session automatically when its access token is about to expire, and polls the provider's usage endpoint. No prompt or model request is sent. Existing accounts need this one-time sign-in because their copied CLI refresh tokens cannot safely be shared with an independent background refresher.
 
@@ -91,9 +96,31 @@ command = 'C:\Users\<you>\AppData\Local\SlopBar\slopbar-mcp.exe'
 | `add_account`, `connect_monitoring`, `disconnect_monitoring` | Start the CLI's own sign-in for the user to complete, or revoke a monitoring sign-in. |
 | `check_for_updates`, `install_update`, `get_app_info`, `open_settings` | Updates (builds with automatic updates only), version and build, and showing the Settings window. |
 | `quit_app`, `restart_app` | Quit as the tray's Quit does, or quit and start the installed executable again. |
+| `get_usage_breakdown` | Tokens on this PC by account and repository, model or day, with each provider's model mix and an hour-of-week heatmap, and how each account's tokens were attributed. |
+| `export_csv` | Write the weekly history, the usage breakdown and the subscription report as CSV files (default `Documents\SlopBar Exports`) and return their paths. |
 | `export_diagnostics`, `list_diagnostic_exports` | Write a diagnostics export (a repeat within 30 seconds returns the same file) or list earlier ones; listing works while SlopBar is closed. |
+| `export_calendar` | Write the plan-renewal calendar (below) now and return its path. |
 
 The server never starts SlopBar, reads credentials or contacts a provider itself: each tool asks the running app, which performs the same action as the matching Settings control. They talk over a named pipe that only the signed-in user and SYSTEM can open and that rejects remote clients. The server checks that the process answering runs as the same Windows user, connects so that process cannot act as the agent's, bounds every reply in size and time, and only passes on an export path inside the export folder. Sign-ins always happen in the CLI's own login, completed by the user. Usage results include account emails, so treat them like the Settings window. `slopbar-mcp.exe` is a separate executable so that app updates, which stop `slopbar.exe`, do not cut agents off mid-session.
+
+### Claude Code status line
+
+`slopbar-mcp.exe --statusline` prints one line about the Claude account in use, for Claude Code's [status line](https://docs.claude.com/en/docs/claude-code/statusline), for example `work · 12% 5h · 42% wk · runs out Fri 3PM`. It asks the running app, reuses an answer for 15 seconds, gives up after 120 ms and prints nothing when SlopBar is not running. To use it, add this to `~/.claude/settings.json` (forward slashes keep the JSON simple):
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "C:/Users/<you>/AppData/Local/SlopBar/slopbar-mcp.exe --statusline"
+  }
+}
+```
+
+### Renewal calendar and Monday digest
+
+**Settings → Subscriptions → Renewal calendar** keeps an iCalendar file (`Documents\SlopBar\renewals.ics` unless you pick another path) with an all-day event for each paid plan's next renewal, and a reminder three days ahead for plans that look unused or underused. Subscribe to the file from Outlook (**Add calendar → From file**) or import it into Google Calendar; with **Keep a renewal calendar** on, SlopBar rewrites it after each refresh, and each renewal keeps the same event ID across rewrites, so subscribed calendars update rather than duplicate it. **Export now** writes it once.
+
+The **Monday digest** (Settings → Notifications, on by default) is one notification on Monday mornings with what your paid plans cost per month, what you could save, the plans renewing that week, accounts that ran out in the past week and how many plans your usage needs. Clicking it opens Settings → Subscriptions.
 
 To install a local release build without quitting SlopBar by hand, run `scripts/install-local-build.ps1` after `cargo build --locked --release --features tauri/custom-protocol --manifest-path src-tauri/Cargo.toml`. It checks the build matches the clean checkout, moves the running executables into a rollback folder under `%LOCALAPPDATA%\SlopBar-Rollback`, copies the new ones in and restarts SlopBar through `restart_app`.
 

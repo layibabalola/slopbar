@@ -306,12 +306,19 @@ fn vault_dir() -> Option<PathBuf> {
 }
 
 fn slot_path(provider: Provider, id: &str) -> Option<PathBuf> {
+    vault_dir().map(|d| slot_path_in(&d, provider, id))
+}
+
+fn slot_path_in(vault: &Path, provider: Provider, id: &str) -> PathBuf {
     let safe: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
-    vault_dir().map(|d| d.join(format!("{}-{safe}.json", provider.key())))
+    vault.join(format!("{}-{safe}.json", provider.key()))
 }
 
 pub fn load_slots() -> Vec<Slot> {
-    let Some(dir) = vault_dir() else { return vec![] };
+    vault_dir().map(|d| load_slots_in(&d)).unwrap_or_default()
+}
+
+fn load_slots_in(dir: &Path) -> Vec<Slot> {
     let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
     let mut slots: Vec<Slot> = entries
         .flatten()
@@ -322,11 +329,12 @@ pub fn load_slots() -> Vec<Slot> {
 }
 
 fn save_slot(slot: &Slot) -> std::io::Result<()> {
-    let path = slot_path(slot.provider, &slot.id).ok_or_else(|| std::io::Error::other("no config dir"))?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    write_json(&path, &serde_json::to_value(slot)?)
+    save_slot_in(&vault_dir().ok_or_else(|| std::io::Error::other("no config dir"))?, slot)
+}
+
+fn save_slot_in(vault: &Path, slot: &Slot) -> std::io::Result<()> {
+    std::fs::create_dir_all(vault)?;
+    write_json(&slot_path_in(vault, slot.provider, &slot.id), &serde_json::to_value(slot)?)
 }
 
 pub fn remove_slot(provider: Provider, id: &str) -> std::io::Result<()> {
@@ -364,10 +372,17 @@ pub fn switch(sources: &[Source], provider: Provider, id: &str) -> Result<(), St
     // Sync live logins first: the account being left may have refreshed its tokens.
     capture(sources);
     let _guard = VAULT.lock().unwrap();
-    let target = load_slots()
+    let mut target = load_slots()
         .into_iter()
         .find(|s| s.provider == provider && s.id == id)
         .ok_or("account not found")?;
+    // A project profile holding this account hands its (possibly newer) login over first, so
+    // the account is never signed in at two places at once (see "Project profiles" below).
+    if let (Some(vault), Some(root)) = (vault_dir(), profiles_root()) {
+        if let Some(newer) = reclaim_profile(&vault, &root, &target) {
+            target = newer;
+        }
+    }
     let mut written = 0;
     for source in sources.iter().filter(|s| installed(provider, s)) {
         write_login(&target, source).map_err(|e| format!("{}: {e}", source.label))?;
@@ -377,6 +392,211 @@ pub fn switch(sources: &[Source], provider: Provider, id: &str) -> Result<(), St
         return Err("CLI not found".into());
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Project profiles
+//
+// A folder can be pinned to an account (see `pins`): its CLI then runs with CLAUDE_CONFIG_DIR or
+// CODEX_HOME set to that account's profile, a config dir under the app data folder that holds the
+// account's saved login.
+//
+// Both CLIs rotate their refresh token when they renew a login, and the old one stops working, so
+// a login copied into two live places breaks whichever copy renews second. The vault avoids this
+// for the default location by keeping one account signed in there at a time; profiles keep the
+// same rule, an account is signed in at exactly one place:
+// - while the CLI's default login is another account, the profile holds the login, and renewals
+//   made there are synced back into the vault (the newer login wins, see `keeps`);
+// - switching the CLI to the account first takes the profile's login back (`reclaim_profile`) and
+//   removes it from the profile. The launcher then runs that folder on the default login, which is
+//   the same account, until the CLI is switched away and the profile is signed in again.
+// The trade-off: a CLI process that is already running when its login moves keeps the login it
+// read in memory, and a renewal made there leaves the other place with a stale login, exactly as
+// when switching accounts under a running CLI. Starting the CLI through the launcher picks the
+// right place each time.
+
+/// Where profiles live: one folder per pinned account, under the app data folder.
+pub fn profiles_root() -> Option<PathBuf> {
+    crate::settings::app_dir().map(|d| d.join("profiles"))
+}
+
+/// A profile's folder name: short, stable across builds (FNV-1a) and never the account id itself.
+pub fn profile_name(provider: Provider, id: &str) -> String {
+    let hash = id.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    format!("{}-{hash:016x}", provider.key())
+}
+
+fn profile_source(dir: &Path) -> Source {
+    Source {
+        label: "Project profile".into(),
+        home: dir.to_owned(),
+        claude_dir: Some(dir.to_owned()),
+        codex_dir: Some(dir.to_owned()),
+        distro: None,
+        native_home: dir.to_string_lossy().into_owned(),
+    }
+}
+
+/// The profiles of these accounts as sources, so their Claude logins' identities can be resolved.
+pub fn profile_sources(wanted: &[(Provider, String)]) -> Vec<Source> {
+    let Some(root) = profiles_root() else { return vec![] };
+    wanted.iter().map(|(p, id)| profile_source(&root.join(profile_name(*p, id)))).collect()
+}
+
+/// The file in a profile that holds its login.
+pub fn profile_login_file(provider: Provider, dir: &Path) -> PathBuf {
+    dir.join(match provider {
+        Provider::Claude => ".credentials.json",
+        Provider::Codex => "auth.json",
+    })
+}
+
+/// When a login was issued, to tell two copies of one account's login apart: Claude records its
+/// access token's expiry, Codex when it last renewed.
+fn issued(slot: &Slot) -> Option<i64> {
+    match slot.provider {
+        Provider::Claude => slot.data["credentials"]["claudeAiOauth"]["expiresAt"].as_i64(),
+        Provider::Codex => slot.data["auth"]["last_refresh"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.timestamp_millis()),
+    }
+}
+
+fn refresh_token(slot: &Slot) -> Option<&str> {
+    match slot.provider {
+        Provider::Claude => slot.data["credentials"]["claudeAiOauth"]["refreshToken"].as_str(),
+        Provider::Codex => slot.data["auth"]["tokens"]["refresh_token"].as_str(),
+    }
+}
+
+/// Whether a profile's `live` login should replace the vault's `saved` copy of the same account:
+/// it differs and the saved one is not certainly newer. The profile is where the account was in
+/// use, so it wins when the order is unknown.
+fn keeps(live: &Slot, saved: &Slot) -> bool {
+    let saved_newer = matches!((issued(saved), issued(live)), (Some(s), Some(l)) if s > l);
+    refresh_token(live) != refresh_token(saved) && !saved_newer
+}
+
+/// Signs a profile in as `slot`, creating what a fresh config dir needs.
+fn write_profile(slot: &Slot, dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    match slot.provider {
+        Provider::Claude => {
+            // `write_login` only replaces the account block of an existing .claude.json.
+            let config = dir.join(".claude.json");
+            if !config.exists() {
+                write_json(&config, &json!({ "hasCompletedOnboarding": true }))?;
+            }
+        }
+        Provider::Codex => {
+            // Keep the profile's login in its own auth.json, out of the shared credential store.
+            let config = dir.join("config.toml");
+            if !config.exists() {
+                std::fs::write(config, "cli_auth_credentials_store = \"file\"\n")?;
+            }
+        }
+    }
+    write_login(slot, &profile_source(dir))
+}
+
+/// Removes a profile's login, keeping the rest of the folder (the CLI's settings and history).
+pub fn withdraw_profile(provider: Provider, dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(profile_login_file(provider, dir)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// Takes `target`'s login back from its profile before the default location is signed in as it.
+/// Returns the profile's login when that one should be used instead (saved into the vault), and
+/// leaves the profile without a login. Callers hold `VAULT`.
+fn reclaim_profile(vault: &Path, root: &Path, target: &Slot) -> Option<Slot> {
+    let dir = root.join(profile_name(target.provider, &target.id));
+    let live = read_login(target.provider, &profile_source(&dir), std::slice::from_ref(target))
+        .filter(|l| l.id == target.id && keeps(l, target));
+    if let Some(l) = &live {
+        let _ = save_slot_in(vault, l);
+    }
+    let _ = withdraw_profile(target.provider, &dir);
+    live
+}
+
+/// Where a pinned account's profile stands after `sync_profiles`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileState {
+    /// The profile is signed in as the account.
+    Ready,
+    /// The account is the CLI's default login, so the profile is empty and the folder uses that.
+    AtDefault,
+    /// SlopBar has no saved login for the account.
+    NoLogin,
+}
+
+/// Keeps each pinned account's profile signed in, or empty while the account is the default
+/// login somewhere (`active`), syncing renewals made in profiles back into the vault. Profiles
+/// no longer pinned lose their login.
+pub fn sync_profiles(wanted: &[(Provider, String)], active: &Active) -> HashMap<(Provider, String), ProfileState> {
+    let (Some(vault), Some(root)) = (vault_dir(), profiles_root()) else { return HashMap::new() };
+    if wanted.is_empty() && !root.exists() {
+        return HashMap::new();
+    }
+    let _guard = VAULT.lock().unwrap();
+    sync_profiles_in(&vault, &root, wanted, active)
+}
+
+fn sync_profiles_in(vault: &Path, root: &Path, wanted: &[(Provider, String)], active: &Active) -> HashMap<(Provider, String), ProfileState> {
+    let slots = load_slots_in(vault);
+    let saved = |provider: Provider, id: &str| slots.iter().find(|s| s.provider == provider && s.id == id);
+    let mut states = HashMap::new();
+    for (provider, id) in wanted {
+        let key = (*provider, id.clone());
+        if states.contains_key(&key) {
+            continue;
+        }
+        let dir = root.join(profile_name(*provider, id));
+        let live = read_login(*provider, &profile_source(&dir), &slots);
+        let mut current = saved(*provider, id).cloned();
+        match &live {
+            Some(l) if l.id == *id => {
+                if current.as_ref().map_or(true, |s| keeps(l, s)) && save_slot_in(vault, l).is_ok() {
+                    current = Some(l.clone());
+                }
+            }
+            // Someone signed in to another account here: keep it, like any login SlopBar sees.
+            Some(l) => { let _ = save_slot_in(vault, l); }
+            None => {}
+        }
+        let state = if active.contains_key(&key) {
+            let _ = withdraw_profile(*provider, &dir);
+            ProfileState::AtDefault
+        } else if let Some(slot) = current {
+            let signed_in = live.as_ref().is_some_and(|l| l.id == *id && refresh_token(l) == refresh_token(&slot));
+            if signed_in || write_profile(&slot, &dir).is_ok() { ProfileState::Ready } else { ProfileState::NoLogin }
+        } else {
+            ProfileState::NoLogin
+        };
+        states.insert(key, state);
+    }
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(provider) = Provider::ALL.into_iter().find(|p| name.starts_with(&format!("{}-", p.key()))) else { continue };
+            if wanted.iter().any(|(p, id)| profile_name(*p, id) == name) {
+                continue;
+            }
+            let dir = entry.path();
+            if let Some(l) = read_login(provider, &profile_source(&dir), &slots) {
+                // Only into an account the vault still has: a removed account stays removed.
+                if saved(provider, &l.id).is_some_and(|s| keeps(&l, s)) {
+                    let _ = save_slot_in(vault, &l);
+                }
+            }
+            let _ = withdraw_profile(provider, &dir);
+        }
+    }
+    states
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -612,5 +832,146 @@ mod billing_tests {
         let text = serde_json::to_string(&b).unwrap();
         assert!(!text.contains("example.invalid") && !text.contains("\"a\""), "{text}");
         assert!(codex_slot(json!({ "tokens": { "access_token": "a" } })).unwrap().billing().active_until.is_none());
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    fn claude(refresh: &str, expires: i64) -> Slot {
+        claude_slot(
+            json!({ "claudeAiOauth": { "accessToken": format!("at-{refresh}"), "refreshToken": refresh, "expiresAt": expires }, "organizationUuid": "org-1" }),
+            Some(json!({ "accountUuid": "user-1", "organizationUuid": "org-1", "emailAddress": "test@example.invalid" })),
+        ).unwrap()
+    }
+
+    fn codex(refresh: &str, last: &str) -> Slot {
+        let claims = json!({ "email": "test@example.invalid", "https://api.openai.com/auth": { "chatgpt_user_id": "user-2", "chatgpt_account_id": "acct-2" } });
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+        codex_slot(json!({ "last_refresh": last, "tokens": { "access_token": format!("at-{refresh}"), "refresh_token": refresh, "id_token": format!("h.{payload}.s") } })).unwrap()
+    }
+
+    fn stored(vault: &Path, slot: &Slot) -> Option<String> {
+        load_slots_in(vault).into_iter().find(|s| s.id == slot.id).and_then(|s| refresh_token(&s).map(String::from))
+    }
+
+    fn in_profile(root: &Path, slot: &Slot) -> Option<String> {
+        read_login(slot.provider, &profile_source(&root.join(profile_name(slot.provider, &slot.id))), &[]).and_then(|s| refresh_token(&s).map(String::from))
+    }
+
+    #[test]
+    fn a_pinned_account_not_in_use_is_signed_in_to_its_profile_and_renewals_come_back() {
+        let (vault, root) = (TempDir::new(), TempDir::new());
+        let slot = claude("r1", 1_000);
+        save_slot_in(&vault.0, &slot).unwrap();
+        let wanted = [(Provider::Claude, slot.id.clone())];
+        let states = sync_profiles_in(&vault.0, &root.0, &wanted, &Active::new());
+        assert_eq!(states[&wanted[0]], ProfileState::Ready);
+        assert_eq!(in_profile(&root.0, &slot).as_deref(), Some("r1"));
+        let dir = root.0.join(profile_name(Provider::Claude, &slot.id));
+        let config = read_json(&dir.join(".claude.json")).unwrap();
+        assert_eq!(config["oauthAccount"]["accountUuid"], "user-1", "the profile knows whose login it holds");
+
+        // The CLI in the project renews its login: the vault takes the newer one.
+        write_login(&claude("r2", 2_000), &profile_source(&dir)).unwrap();
+        sync_profiles_in(&vault.0, &root.0, &wanted, &Active::new());
+        assert_eq!(stored(&vault.0, &slot).as_deref(), Some("r2"));
+        assert_eq!(in_profile(&root.0, &slot).as_deref(), Some("r2"));
+
+        // A newer login in the vault (renewed while it was the default) replaces an older profile copy.
+        save_slot_in(&vault.0, &claude("r3", 3_000)).unwrap();
+        sync_profiles_in(&vault.0, &root.0, &wanted, &Active::new());
+        assert_eq!(in_profile(&root.0, &slot).as_deref(), Some("r3"));
+    }
+
+    #[test]
+    fn an_account_in_use_by_the_cli_is_never_also_signed_in_to_its_profile() {
+        let (vault, root) = (TempDir::new(), TempDir::new());
+        let slot = claude("r1", 1_000);
+        save_slot_in(&vault.0, &slot).unwrap();
+        let wanted = [(Provider::Claude, slot.id.clone())];
+        sync_profiles_in(&vault.0, &root.0, &wanted, &Active::new());
+        let dir = root.0.join(profile_name(Provider::Claude, &slot.id));
+        write_login(&claude("r2", 2_000), &profile_source(&dir)).unwrap();
+
+        let mut active = Active::new();
+        active.insert((Provider::Claude, slot.id.clone()), vec!["Windows".into()]);
+        let states = sync_profiles_in(&vault.0, &root.0, &wanted, &active);
+        assert_eq!(states[&wanted[0]], ProfileState::AtDefault);
+        assert!(!profile_login_file(Provider::Claude, &dir).exists(), "one live copy only");
+        assert_eq!(stored(&vault.0, &slot).as_deref(), Some("r2"), "the profile's renewal was kept first");
+        assert!(dir.join(".claude.json").exists(), "the rest of the profile stays");
+
+        // Switched away again: the profile is signed in from the vault.
+        assert_eq!(sync_profiles_in(&vault.0, &root.0, &wanted, &Active::new())[&wanted[0]], ProfileState::Ready);
+        assert_eq!(in_profile(&root.0, &slot).as_deref(), Some("r2"));
+    }
+
+    #[test]
+    fn switching_to_a_pinned_account_takes_its_newer_login_back_from_the_profile() {
+        let (vault, root) = (TempDir::new(), TempDir::new());
+        let slot = claude("r1", 1_000);
+        save_slot_in(&vault.0, &slot).unwrap();
+        let dir = root.0.join(profile_name(Provider::Claude, &slot.id));
+        write_profile(&claude("r2", 2_000), &dir).unwrap();
+        let taken = reclaim_profile(&vault.0, &root.0, &slot).expect("the profile's login is newer");
+        assert_eq!(refresh_token(&taken), Some("r2"));
+        assert_eq!(stored(&vault.0, &slot).as_deref(), Some("r2"));
+        assert!(!profile_login_file(Provider::Claude, &dir).exists());
+
+        // An older copy is dropped and the vault's login is used.
+        write_profile(&claude("r0", 500), &dir).unwrap();
+        assert!(reclaim_profile(&vault.0, &root.0, &claude("r2", 2_000)).is_none());
+        assert!(!profile_login_file(Provider::Claude, &dir).exists());
+        // No profile at all is fine.
+        assert!(reclaim_profile(&vault.0, &TempDir::new().0, &slot).is_none());
+    }
+
+    #[test]
+    fn unpinned_profiles_lose_their_login_and_removed_accounts_stay_removed() {
+        let (vault, root) = (TempDir::new(), TempDir::new());
+        let kept = claude("r1", 1_000);
+        save_slot_in(&vault.0, &kept).unwrap();
+        let kept_dir = root.0.join(profile_name(Provider::Claude, &kept.id));
+        write_profile(&claude("r2", 2_000), &kept_dir).unwrap();
+        let gone = codex("c1", "2026-10-01T00:00:00Z");
+        let gone_dir = root.0.join(profile_name(Provider::Codex, &gone.id));
+        write_profile(&gone, &gone_dir).unwrap();
+
+        sync_profiles_in(&vault.0, &root.0, &[], &Active::new());
+        assert!(!profile_login_file(Provider::Claude, &kept_dir).exists() && !profile_login_file(Provider::Codex, &gone_dir).exists());
+        assert_eq!(stored(&vault.0, &kept).as_deref(), Some("r2"), "a renewal is not lost on unpinning");
+        assert!(stored(&vault.0, &gone).is_none(), "an account missing from the vault is not brought back");
+        assert!(gone_dir.join("config.toml").exists());
+    }
+
+    #[test]
+    fn codex_profiles_use_their_own_auth_file_and_renewal_time() {
+        let (vault, root) = (TempDir::new(), TempDir::new());
+        let slot = codex("c1", "2026-10-01T00:00:00Z");
+        save_slot_in(&vault.0, &slot).unwrap();
+        let wanted = [(Provider::Codex, slot.id.clone())];
+        assert_eq!(sync_profiles_in(&vault.0, &root.0, &wanted, &Active::new())[&wanted[0]], ProfileState::Ready);
+        let dir = root.0.join(profile_name(Provider::Codex, &slot.id));
+        assert!(std::fs::read_to_string(dir.join("config.toml")).unwrap().contains("cli_auth_credentials_store = \"file\""));
+        assert_eq!(in_profile(&root.0, &slot).as_deref(), Some("c1"));
+        // A stale profile copy (older renewal) never overwrites the vault.
+        save_slot_in(&vault.0, &codex("c2", "2026-10-05T00:00:00Z")).unwrap();
+        write_login(&codex("c0", "2026-09-01T00:00:00Z"), &profile_source(&dir)).unwrap();
+        sync_profiles_in(&vault.0, &root.0, &wanted, &Active::new());
+        assert_eq!(stored(&vault.0, &slot).as_deref(), Some("c2"));
+        assert_eq!(in_profile(&root.0, &slot).as_deref(), Some("c2"));
+        // No saved login: nothing to sign in with.
+        let none = [(Provider::Codex, "missing".to_string())];
+        assert_eq!(sync_profiles_in(&vault.0, &root.0, &none, &Active::new())[&none[0]], ProfileState::NoLogin);
+    }
+
+    #[test]
+    fn profile_names_are_stable_and_hide_the_account_id() {
+        assert_eq!(profile_name(Provider::Claude, "user-1:org-1"), profile_name(Provider::Claude, "user-1:org-1"));
+        assert_ne!(profile_name(Provider::Claude, "a"), profile_name(Provider::Codex, "a"));
+        assert!(!profile_name(Provider::Codex, "user-2:acct-2").contains("user-2"));
     }
 }
