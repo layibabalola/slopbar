@@ -62,6 +62,15 @@ impl Recent {
         self.trails.retain(|k, _| live.contains(k));
     }
 
+    /// How far a window rose over the readings of the last `minutes`: (points, minutes between
+    /// the first of them and the newest). None without two readings in that time.
+    pub fn rise(&self, provider: Provider, id: &str, kind: &str, minutes: i64, now: DateTime<Utc>) -> Option<(f64, i64)> {
+        let trail = self.trails.get(&trail_key(provider, id, kind))?;
+        let first = trail.iter().find(|(t, _)| (now - *t).num_minutes() <= minutes)?;
+        let last = trail.back()?;
+        (last.0 > first.0).then(|| ((last.1 - first.1).max(0.0), (last.0 - first.0).num_minutes().max(1)))
+    }
+
     /// Percentage points per hour between the oldest recent reading and the newest.
     fn pace(&self, acc: &AccountUsage, kind: &str, now: DateTime<Utc>) -> Option<f64> {
         let trail = self.trails.get(&trail_key(acc.provider, &acc.id, kind))?;

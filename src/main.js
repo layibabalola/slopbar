@@ -1,7 +1,7 @@
 import { t, windowResetText, windowLabel, errorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, duration, resetText, groupResets, visibleResetWindows, placesText } from "./i18n.js";
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
-import { checkUsage, checkSwitch, checkPlans, checkDigest } from "./alerts.js";
+import { checkUsage, checkSwitch, checkPlans, checkDigest, checkCapacity, creditAdviceText } from "./alerts.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -81,6 +81,18 @@ const PROVIDER_NAME = { claude: "Claude", codex: "Codex" };
 const accountName = (a) => a.alias || a.email || t("unknownAccount");
 
 /** Usage-limit resets the account holds, one line each; green when usable now. */
+let creditAdvice = {};
+/** Spend-or-switch advice for Codex accounts at their limit with a reset credit; re-renders when it changes. */
+function loadCreditAdvice() {
+  invoke("get_credit_advice").then((list) => {
+    const next = Object.fromEntries((list ?? []).map((c) => [`${c.provider}:${c.id}`, creditAdviceText(c)]));
+    if (JSON.stringify(next) === JSON.stringify(creditAdvice)) return;
+    creditAdvice = next;
+    renderDetails(lastSnap);
+    layout();
+  }, () => {});
+}
+
 function resetLines(a) {
   return groupResets(a.resets).map((r) =>
     `<div class="reset-grant ${r.usable ? "usable" : ""}"><span>↺</span>${esc(resetText(r))}</div>`).join("");
@@ -139,6 +151,7 @@ function renderDetails(snap) {
           ${bars(a)}
           ${a.runs_out_at && !a.stale ? `<div class="reset runs-out" title="${esc(a.runs_out_at)}">${esc(t("runsOut", { at: dayTime(a.runs_out_at) }))}</div>` : ""}
           ${resetLines(a)}
+          ${creditAdvice[`${provider}:${a.id}`] ? `<div class="reset-grant advice"><span>↺</span>${esc(creditAdvice[`${provider}:${a.id}`])}</div>` : ""}
           ${a.credits ? `<div class="reset" style="margin-top:6px">${esc(creditsText(a.credits))}</div>` : ""}
         </div>`;
       }).join("")}
@@ -209,7 +222,8 @@ function layout() {
 
 function render(snap) {
   lastSnap = snap;
-  if (IS_DOCK && notifications && snap.updated_at) { checkUsage(snap, notifications); checkPlans(); checkDigest(); }
+  if (IS_DOCK && notifications && snap.updated_at) { checkUsage(snap, notifications); checkPlans(); checkDigest(); checkCapacity(); }
+  if (!IS_DOCK) loadCreditAdvice();
   if (IS_DOCK) renderCompact(snap);
   else renderDetails(snap);
   layout();

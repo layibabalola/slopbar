@@ -4,6 +4,10 @@
 //! (90th percentile) plus 20%. Each move says what it saves a month; the provider says how much
 //! capacity would be left once every move is made.
 //!
+//! The other way round, a provider whose busiest weeks plus 20% need more than its plans hold, or
+//! whose plans keep running out with little to spare, gets the cheapest fix with its monthly cost:
+//! upgrade one plan, or add one of the tier that fits. Never in the same advice as a cut.
+//!
 //! With too little history to size the pool, only clear evidence counts: plans judged unused
 //! (weeks watched near zero, or a Codex plan idle for weeks on this PC's history). SlopBar cannot
 //! change a plan; every move links to the provider's own billing page.
@@ -76,6 +80,55 @@ pub struct ProviderAdvice {
     pub spare_after_percent: Option<f64>,
     /// Unused or underused plans kept because moving them would cut below the floor.
     pub kept_for_capacity: usize,
+    /// Too little capacity, and the cheapest fix. Only when there are no moves: a provider is
+    /// never told to cancel or downgrade and to add in the same advice.
+    pub shortage: Option<Shortage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortageCause {
+    /// The busiest weeks plus 20% need more than the renewing plans hold.
+    OverCapacity,
+    /// Plans keep reaching their weekly limit with under 40% to spare over the busiest weeks:
+    /// use that hits a limit is cut short, so the real demand is higher than measured.
+    HittingLimits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FixAction {
+    /// Move one plan to a bigger tier.
+    Upgrade,
+    /// Buy another plan.
+    Add,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Shortage {
+    pub cause: ShortageCause,
+    /// Capacity missing, in `unit`.
+    pub shortfall: f64,
+    /// Plans judged to run out most weeks.
+    pub exhausted: usize,
+    pub fix: Fix,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Fix {
+    pub action: FixAction,
+    /// Upgrade: the account and its plan now.
+    pub id: Option<String>,
+    pub email: Option<String>,
+    pub alias: Option<String>,
+    pub from: Option<String>,
+    pub to: String,
+    /// Plans of `to` to add: one, unless no single tier covers the shortfall.
+    pub count: u32,
+    /// What the fix adds to the monthly bill, in dollars (list prices).
+    pub monthly_cost: f64,
+    pub capacity_after: f64,
+    pub manage_url: &'static str,
 }
 
 /// Tiers a provider sells, largest first: (name, weekly allowance in `reference_plan`s, US list
@@ -153,6 +206,7 @@ fn advise_provider(summary: &ProviderSummary, accounts: &[Entry]) -> ProviderAdv
         }
     }
     let demand = pool.demand_p90.or(match evidence { Evidence::ClearOnly => pool.live_demand, Evidence::Pool => None });
+    let shortage = if moves.is_empty() { shortage(provider, &candidates, capacity_now, demand, summary.exhausted) } else { None };
     ProviderAdvice {
         provider,
         evidence,
@@ -168,7 +222,38 @@ fn advise_provider(summary: &ProviderSummary, accounts: &[Entry]) -> ProviderAdv
         spare_after_percent: demand.filter(|d| *d > 0.0).map(|d| round((capacity / d - 1.0) * 100.0)),
         moves,
         kept_for_capacity: kept,
+        shortage,
     }
+}
+
+/// Whether the plans fall short of the demand, and the cheapest way to cover it: upgrading one
+/// plan to a bigger tier, or adding one plan of the smallest tier that covers the shortfall (or
+/// several of the largest, when none does). Ties go to the fix that adds more capacity.
+fn shortage(provider: Provider, candidates: &[Candidate], capacity: f64, demand: Option<f64>, exhausted: usize) -> Option<Shortage> {
+    let demand = demand?;
+    let over = demand * (1.0 + POOL_BUFFER) - capacity;
+    let limited = demand * (1.0 + 2.0 * POOL_BUFFER) - capacity;
+    let (cause, need) = if over > 1e-9 { (ShortageCause::OverCapacity, over) }
+        else if exhausted > 0 && limited > 1e-9 { (ShortageCause::HittingLimits, limited) }
+        else { return None };
+    let tiers = tiers(provider);
+    let manage_url = billing_page(provider);
+    let mut options: Vec<Fix> = vec![];
+    for c in candidates {
+        for (name, w, price) in tiers.iter().filter(|(_, w, _)| *w > c.weight && *w - c.weight + 1e-9 >= need) {
+            let e = c.entry;
+            options.push(Fix { action: FixAction::Upgrade, id: Some(e.id.clone()), email: e.email.clone(), alias: e.alias.clone(), from: Some(c.plan.clone()),
+                to: name.to_string(), count: 1, monthly_cost: round((price - c.cost).max(0.0)), capacity_after: round(capacity + w - c.weight), manage_url });
+        }
+    }
+    let add = |(name, w, price): &(&str, f64, f64), count: u32| Fix { action: FixAction::Add, id: None, email: None, alias: None, from: None,
+        to: name.to_string(), count, monthly_cost: round(price * count as f64), capacity_after: round(capacity + w * count as f64), manage_url };
+    match tiers.iter().filter(|(_, w, _)| *w + 1e-9 >= need).min_by(|a, b| a.2.total_cmp(&b.2)) {
+        Some(t) => options.push(add(t, 1)),
+        None => options.push(add(&tiers[0], (need / tiers[0].1 - 1e-9).ceil() as u32)),
+    }
+    let fix = options.into_iter().min_by(|a, b| a.monthly_cost.total_cmp(&b.monthly_cost).then_with(|| b.capacity_after.total_cmp(&a.capacity_after)))?;
+    Some(Shortage { cause, shortfall: round(need), exhausted, fix })
 }
 
 fn new_move(c: &Candidate, action: Action, to: Option<String>, saving: f64) -> Move {
@@ -248,6 +333,42 @@ mod tests {
         // Every plan idle: all but one go.
         let a = &claude(&[("x", "20x", 0.0), ("y", "20x", 0.0), ("z", "20x", 0.0)], now)[0];
         assert_eq!((a.moves.len(), a.capacity_after, a.kept_for_capacity), (2, 1.0, 1));
+    }
+
+    #[test]
+    fn a_shortage_gets_the_cheapest_fix_and_never_alongside_a_cut() {
+        let now = at("2026-10-21T12:00:00Z");
+        // Busiest weeks 2 plans; floor 2.4 over 2 held: add one Max 20x (no tier above to upgrade to).
+        let a = &claude(&[("a", "20x", 100.0), ("b", "20x", 100.0)], now)[0];
+        let s = a.shortage.as_ref().unwrap();
+        assert_eq!((s.cause, s.shortfall, s.exhausted), (ShortageCause::OverCapacity, 0.4, 2));
+        assert_eq!((s.fix.action, s.fix.to.as_str(), s.fix.count, s.fix.monthly_cost, s.fix.capacity_after), (FixAction::Add, "Max 20x", 1, 200.0, 3.0));
+        assert!(a.moves.is_empty());
+
+        // Short by 0.25: adding a Max 5x and upgrading the Max 5x to 20x both cost $100; the upgrade adds more.
+        let a = &claude(&[("a", "20x", 100.0), ("b", "5x", 100.0)], now)[0];
+        let f = &a.shortage.as_ref().unwrap().fix;
+        assert_eq!((f.action, f.id.as_deref(), f.from.as_deref(), f.to.as_str(), f.monthly_cost, f.capacity_after), (FixAction::Upgrade, Some("b"), Some("Max 5x"), "Max 20x", 100.0, 2.0));
+        assert_eq!(f.manage_url, "https://claude.ai/settings/billing");
+        // Busiest weeks 1.05 plans, floor 1.26 over 1.25 held: a Pro plan is the cheapest cover.
+        let a = &claude(&[("a", "20x", 80.0), ("b", "5x", 100.0)], now)[0];
+        let s = a.shortage.as_ref().unwrap();
+        assert_eq!((s.shortfall, s.fix.action, s.fix.to.as_str(), s.fix.monthly_cost), (0.01, FixAction::Add, "Pro", 20.0));
+
+        // Within capacity but running into limits with little spare: real demand is cut short, so add.
+        let a = &claude(&[("a", "20x", 100.0), ("b", "20x", 100.0), ("c", "20x", 50.0)], now)[0];
+        let s = a.shortage.as_ref().unwrap();
+        assert_eq!((s.cause, s.shortfall, s.fix.action, s.fix.monthly_cost), (ShortageCause::HittingLimits, 0.5, FixAction::Add, 200.0));
+        // With room enough, plans at their limit are a matter of spreading the work: nothing to buy.
+        assert!(claude(&[("a", "20x", 100.0), ("b", "20x", 100.0), ("idle", "20x", 0.0)], now)[0].shortage.is_none());
+        assert!(claude(&[("a", "20x", 50.0), ("b", "20x", 50.0)], now)[0].shortage.is_none());
+        // A cut and an addition never come together.
+        for busy in [0.0, 50.0, 100.0] {
+            for light in [0.0, 10.0, 100.0] {
+                let a = &claude(&[("busy", "20x", busy), ("x", "20x", 100.0), ("idle", "20x", 0.0), ("light", "5x", light)], now)[0];
+                assert!(a.moves.is_empty() || a.shortage.is_none(), "{busy} {light}: {a:?}");
+            }
+        }
     }
 
     #[test]

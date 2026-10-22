@@ -1,4 +1,4 @@
-use crate::{accounts, active_log, auto_monitor, balancer, ledger, bulk, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, migrate, model, monitoring, notify, panel, pins, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates, usage_index};
+use crate::{accounts, active_log, auto_monitor, balancer, burn, ledger, bulk, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, migrate, model, monitoring, notify, panel, pins, plan_alerts, presence, providers, reset_credits, settings, sources, subscriptions, unexpected, updates, usage_index};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -56,6 +56,9 @@ pub struct AppState {
     unexpected_log: Mutex<unexpected::Log>,
     /// Plan notifications already shown (renewals, running out), so each is shown once.
     plan_alerts: Mutex<plan_alerts::Sent>,
+    /// Runaway agents seen in the past day (see `burn`), and notifications not yet shown.
+    burn_log: Mutex<burn::Log>,
+    burn_due: Mutex<Vec<burn::BurnAlert>>,
     /// What the plans have cost month by month (see `ledger`).
     ledger: Mutex<ledger::Ledger>,
     /// Connect monitoring automatically: how long accounts have been in use, and backoffs.
@@ -192,6 +195,28 @@ fn take_plan_alerts(state: tauri::State<AppState>) -> Vec<plan_alerts::Alert> {
     due
 }
 
+/// Runaway-agent (see `burn`) and reset-credit (see `reset_credits`) notifications due now, each
+/// returned once. The taskbar widget asks after every refresh and words them.
+#[tauri::command]
+fn take_capacity_alerts(state: tauri::State<AppState>) -> serde_json::Value {
+    let burn = std::mem::take(&mut *state.burn_due.lock().unwrap());
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    let enabled = state.settings.lock().unwrap().notifications.reset_credits;
+    let credits = if snapshot.updated_at.is_some() {
+        let mut sent = state.plan_alerts.lock().unwrap();
+        let due = reset_credits::due(&snapshot.accounts, enabled, &mut sent, chrono::Utc::now());
+        if !due.is_empty() { let _ = plan_alerts::save(&sent); }
+        due
+    } else { vec![] };
+    serde_json::json!({ "burn": burn, "credits": credits })
+}
+
+/// Spend or switch, per Codex account at its limit with a reset credit, for the flyout.
+#[tauri::command]
+fn get_credit_advice(state: tauri::State<AppState>) -> Vec<reset_credits::CreditAdvice> {
+    reset_credits::advise(&state.snapshot.lock().unwrap().accounts, chrono::Utc::now())
+}
+
 /// The Monday digest (see `digest`), once per week. The taskbar widget asks after every refresh
 /// and words it in the user's language.
 #[tauri::command]
@@ -294,7 +319,14 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::GetSubscriptions => value(subscription_report(&app.state::<AppState>())),
         R::GetPlanAdvice => {
             let report = subscription_report(&app.state::<AppState>());
-            Ok(serde_json::json!({ "providers": report.advice, "generated_at": report.generated_at }))
+            let credits = reset_credits::advise(&app.state::<AppState>().snapshot.lock().unwrap().accounts, chrono::Utc::now());
+            Ok(serde_json::json!({ "providers": report.advice, "reset_credits": credits, "generated_at": report.generated_at }))
+        }
+        R::GetBurnAlerts => {
+            let state = app.state::<AppState>();
+            let settings = state.settings.lock().unwrap().clone();
+            let alerts = burn::seen(&state.burn_log.lock().unwrap(), chrono::Utc::now());
+            Ok(serde_json::json!({ "alerts": value(alerts)?, "thresholds": settings.burn, "notify": settings.notifications.burn, "notify_every_hours": burn::NOTIFY_EVERY_H }))
         }
         R::GetUsageBreakdown { provider, account, days, group_by } => {
             if days.is_some_and(|d| !(1..=usage_index::LOOKBACK_DAYS as u32).contains(&d)) {
@@ -1347,8 +1379,30 @@ fn scan_usage_index(app: &AppHandle) {
         let index = tauri::async_runtime::spawn_blocking(|| usage_index::scan(chrono::Utc::now())).await;
         SCANNING.store(false, std::sync::atomic::Ordering::Release);
         let Ok(index) = index else { return };
-        *app.state::<AppState>().usage_index.lock().unwrap() = Some(index);
+        *app.state::<AppState>().usage_index.lock().unwrap() = Some(index.clone());
+        let _ = tauri::async_runtime::spawn_blocking(move || check_burn(&app, &index)).await;
     });
+}
+
+/// Looks for runaway agents (see `burn`) with the index just read, queuing their notifications
+/// for the taskbar widget.
+fn check_burn(app: &AppHandle, index: &usage_index::Index) {
+    let state = app.state::<AppState>();
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    if snapshot.updated_at.is_none() { return; }
+    let settings = state.settings.lock().unwrap().clone();
+    let now = chrono::Utc::now();
+    let log = state.active_log.lock().unwrap().clone();
+    let window = chrono::Duration::minutes(settings.burn.minutes as i64);
+    let rates = usage_index::local_rates(index, &log, &usage_index::Known::from_snapshot(&snapshot), window, chrono::Duration::days(burn::BASELINE_DAYS), now);
+    let found = burn::detect(&snapshot.accounts, &state.recent.lock().unwrap(), &rates, &settings, now);
+    let (due, changed) = {
+        let mut log = state.burn_log.lock().unwrap();
+        let (due, changed) = burn::apply(&mut log, found, settings.notifications.burn, now);
+        (due, changed.then(|| log.clone()))
+    };
+    if let Some(log) = changed { let _ = burn::save(&log); }
+    state.burn_due.lock().unwrap().extend(due);
 }
 
 /// The last index, or a scan now when there is none yet.
@@ -1521,6 +1575,8 @@ pub fn run() {
         presence_tracks: Mutex::default(),
         unexpected_log: Mutex::new(unexpected::load()),
         plan_alerts: Mutex::new(plan_alerts::load()),
+        burn_log: Mutex::new(burn::load()),
+        burn_due: Mutex::default(),
         ledger: Mutex::new(ledger::load()),
         auto_monitor: Mutex::new(auto_monitor::Tracker::new(auto_monitor::load())),
         health: Mutex::default(),
@@ -1554,6 +1610,8 @@ pub fn run() {
             export_csv,
             csv_default_folder,
             take_plan_alerts,
+            take_capacity_alerts,
+            get_credit_advice,
             take_digest,
             export_calendar,
             check_calendar_path,

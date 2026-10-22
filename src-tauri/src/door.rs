@@ -39,6 +39,8 @@ pub enum Request {
     GetSubscriptions,
     /// Plan changes per provider: cancels and downgrades with savings (see `advisor`).
     GetPlanAdvice,
+    /// Accounts seen burning through their week abnormally fast in the past day (see `burn`).
+    GetBurnAlerts,
     /// Tokens by account and repository, model or day from the CLIs' files here (see `usage_index`).
     GetUsageBreakdown {
         #[serde(default)]
