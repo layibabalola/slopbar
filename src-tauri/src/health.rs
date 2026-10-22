@@ -125,6 +125,47 @@ pub struct Inputs<'a> {
     pub vault_plaintext: usize,
     /// SlopBar's processes in this Windows session, when they could be listed.
     pub processes: Option<crate::instance::Processes>,
+    /// Space SlopBar takes on disk, when it could be measured.
+    pub disk: Option<Disk>,
+}
+
+/// What SlopBar keeps on disk: its app data (diagnostics exports and captures included) and the
+/// rollback copies local installs leave (`scripts/install-local-build.ps1`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Disk {
+    pub app_data: u64,
+    pub diagnostics: u64,
+    pub rollback: u64,
+    pub rollback_folders: usize,
+}
+
+impl Disk {
+    /// Measures the app data folder and the rollback folder.
+    pub fn measure(app_data: &std::path::Path, rollback: &std::path::Path) -> Self {
+        let folders = std::fs::read_dir(rollback).map(|d| d.flatten().filter(|e| e.path().is_dir()).count()).unwrap_or(0);
+        Disk { app_data: size(app_data), diagnostics: size(&app_data.join("diagnostics")), rollback: size(rollback), rollback_folders: folders }
+    }
+}
+
+/// Bytes in the files under `path` (symbolic links are not followed).
+pub fn size(path: &std::path::Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return 0 };
+    if meta.is_file() {
+        return meta.len();
+    }
+    if !meta.is_dir() {
+        return 0;
+    }
+    std::fs::read_dir(path).map(|d| d.flatten().map(|e| size(&e.path())).sum()).unwrap_or(0)
+}
+
+/// "1.2 GB", "683 MB", "4 KB".
+pub fn bytes(n: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    let n = n as f64;
+    if n >= 1024.0 * MB { format!("{:.1} GB", n / (1024.0 * MB)) }
+    else if n >= MB { format!("{:.0} MB", n / MB) }
+    else { format!("{:.0} KB", (n / 1024.0).ceil()) }
 }
 
 fn name(a: &AccountUsage) -> String {
@@ -262,6 +303,17 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         }, None));
     }
 
+    // Information only: exports, captures and rollbacks are pruned on their own.
+    if let Some(d) = inputs.disk {
+        let rollback = match d.rollback_folders {
+            0 => "no install rollbacks".to_string(),
+            1 => format!("1 install rollback, {}", bytes(d.rollback)),
+            n => format!("{n} install rollbacks, {}", bytes(d.rollback)),
+        };
+        checks.push(check("disk", Status::Ok, "Disk use",
+            format!("App data {} (diagnostics {}); {rollback}.", bytes(d.app_data), bytes(d.diagnostics)), None));
+    }
+
     match inputs.door {
         Door::Unsupported => {}
         Door::Listening => checks.push(check("door", Status::Ok, "Agent door", "Listening for agents (slopbar-mcp).", None)),
@@ -359,6 +411,7 @@ mod tests {
         auto_connect: bool,
         vault_plaintext: usize,
         processes: Option<crate::instance::Processes>,
+        disk: Option<Disk>,
     }
 
     impl Case {
@@ -374,13 +427,14 @@ mod tests {
                 auto_connect: true,
                 vault_plaintext: 0,
                 processes: Some(crate::instance::Processes { instances: 1, mcp_servers: 3 }),
+                disk: None,
             }
         }
 
         fn run(&self) -> Report {
             checks(&Inputs { accounts: &self.accounts, monitoring: &self.monitoring, refresh_minutes: 5, last_success: self.last_success,
                 door: self.door, sharing: &self.sharing, journal: self.journal, notifications: self.notifications, auto_connect: self.auto_connect,
-                vault_plaintext: self.vault_plaintext, processes: self.processes }, now())
+                vault_plaintext: self.vault_plaintext, processes: self.processes, disk: self.disk }, now())
         }
     }
 
@@ -394,6 +448,35 @@ mod tests {
         assert_eq!((r.status, r.problems, r.warnings), (Status::Ok, 0, 0), "{:#?}", r.checks);
         let ids: Vec<_> = r.checks.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["monitoring", "freshness", "refresh", "instances", "agent_servers", "door", "sharing", "journal", "notifications"]);
+    }
+
+    #[test]
+    fn disk_use_is_information_with_app_data_and_rollback_sizes() {
+        let mut case = Case::healthy();
+        case.disk = Some(Disk { app_data: 24 * 1024 * 1024, diagnostics: 12 * 1024 * 1024, rollback: 61 * 1024 * 1024, rollback_folders: 3 });
+        let r = case.run();
+        let d = find(&r, "disk");
+        assert_eq!((d.status, d.fix.clone()), (Status::Ok, None));
+        assert_eq!(d.reason, "App data 24 MB (diagnostics 12 MB); 3 install rollbacks, 61 MB.");
+        case.disk = Some(Disk { app_data: 3000, ..Disk::default() });
+        assert_eq!(find(&case.run(), "disk").reason, "App data 3 KB (diagnostics 0 KB); no install rollbacks.");
+        assert_eq!(bytes(3 * 1024 * 1024 * 1024 / 2), "1.5 GB");
+    }
+
+    #[test]
+    fn disk_use_is_measured_from_the_files() {
+        let dir = crate::test_support::TempDir::new();
+        let data = dir.0.join("data");
+        std::fs::create_dir_all(data.join("diagnostics/exports")).unwrap();
+        std::fs::write(data.join("settings.json"), vec![0u8; 100]).unwrap();
+        std::fs::write(data.join("diagnostics/exports/a.json"), vec![0u8; 400]).unwrap();
+        let rollback = dir.0.join("rollback");
+        for name in ["20261001-100000", "20261002-100000"] {
+            std::fs::create_dir_all(rollback.join(name)).unwrap();
+            std::fs::write(rollback.join(name).join("slopbar.exe"), vec![0u8; 1000]).unwrap();
+        }
+        assert_eq!(Disk::measure(&data, &rollback), Disk { app_data: 500, diagnostics: 400, rollback: 2000, rollback_folders: 2 });
+        assert_eq!(Disk::measure(&dir.0.join("absent"), &dir.0.join("absent")), Disk::default());
     }
 
     #[test]

@@ -71,6 +71,8 @@ pub struct AppState {
     bulk_connect: Mutex<Option<BulkConnect>>,
     /// Why the switcher's shortcut could not be registered (taken by another app, say).
     hotkey_error: Mutex<Option<String>>,
+    /// The page Settings opens on when it is being created (it is destroyed when closed).
+    settings_page: Mutex<Option<String>>,
     /// Accounts reserved for jobs (see `leases`); in memory only.
     pub(crate) leases: Mutex<leases::Leases>,
 }
@@ -125,7 +127,25 @@ async fn health_report(app: &AppHandle) -> health::Report {
         auto_connect: settings.auto_connect_monitoring,
         vault_plaintext: accounts::plaintext_slots(),
         processes: tauri::async_runtime::spawn_blocking(crate::instance::processes).await.ok().flatten(),
+        disk: tauri::async_runtime::spawn_blocking(disk_use).await.ok().flatten(),
     }, chrono::Utc::now())
+}
+
+/// Space on disk for Health, measured at most every few minutes: the flyout asks after every
+/// refresh, and walking the folders each time would be wasted work.
+fn disk_use() -> Option<health::Disk> {
+    static LAST: Mutex<Option<(Instant, health::Disk)>> = Mutex::new(None);
+    const FRESH: Duration = Duration::from_secs(300);
+    if let Some((at, disk)) = *LAST.lock().unwrap() {
+        if at.elapsed() < FRESH {
+            return Some(disk);
+        }
+    }
+    let data = settings::app_dir()?;
+    let rollback = dirs::data_local_dir()?.join("SlopBar-Rollback");
+    let disk = health::Disk::measure(&data, &rollback);
+    *LAST.lock().unwrap() = Some((Instant::now(), disk));
+    Some(disk)
 }
 
 #[tauri::command]
@@ -524,10 +544,8 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             let target = match window {
                 door::InspectTarget::Settings => inspect::Target::Settings,
                 door::InspectTarget::Flyout => inspect::Target::Flyout,
-                door::InspectTarget::Switcher => {
-                    switcher_window(&app).await.ok_or("window not available")?;
-                    inspect::Target::Switcher
-                }
+                // Created for the look if it is closed (see inspect::inspect).
+                door::InspectTarget::Switcher => inspect::Target::Switcher,
             };
             value(inspect::inspect(&app, target, page, screenshot).await?)
         }
@@ -1041,34 +1059,65 @@ async fn set_project_pin(app: AppHandle, folder: String, provider: Provider, id:
 // ---------------------------------------------------------------------------------------------
 // The quick switcher
 
-/// Like a launcher: clicking anywhere else hides it, and closing it (Alt+F4) only hides it, so
-/// the window lives as long as the app.
+/// How long the switcher stays loaded after it hides, so opening it again soon is instant.
+const SWITCHER_LINGER: Duration = Duration::from_secs(30);
+
+/// Settings and the quick switcher are not created at startup (`"create": false`): each is
+/// built when first opened and destroyed when closed, so neither keeps a WebView2 renderer
+/// while unused. Whatever must outlive them is kept here or in settings, not in the page.
+pub(crate) const ON_DEMAND: [&str; 2] = [SETTINGS_LABEL, SWITCHER_LABEL];
+
+/// The window `label` (one of `ON_DEMAND`), created from its configuration if it is not open.
+/// Builds off the main thread: building a window there waits on the event loop it runs.
+pub(crate) async fn on_demand_window(app: &AppHandle, label: &str) -> Option<tauri::WebviewWindow> {
+    if let Some(w) = app.get_webview_window(label) {
+        return Some(w);
+    }
+    let config = app.config().app.windows.iter().find(|w| w.label == label)?.clone();
+    let h = app.clone();
+    let built = tauri::async_runtime::spawn_blocking(move || tauri::WebviewWindowBuilder::from_config(&h, &config).ok()?.build().ok())
+        .await.ok().flatten();
+    // Two callers raced: the other one built it.
+    let Some(win) = built else { return app.get_webview_window(label) };
+    match label {
+        SETTINGS_LABEL => watch_settings(&win),
+        SWITCHER_LABEL => watch_switcher(&win),
+        _ => {}
+    }
+    Some(win)
+}
+
+/// Closing Settings destroys it (the default); only its Mica backdrop is set here.
+fn watch_settings(win: &tauri::WebviewWindow) {
+    if dock::is_windows_11() {
+        use tauri::window::{Effect, EffectsBuilder};
+        let _ = win.set_effects(EffectsBuilder::new().effect(Effect::Mica).build());
+    }
+}
+
+/// Like a launcher: clicking anywhere else hides it, and it is destroyed once it has stayed
+/// hidden for `SWITCHER_LINGER`. Closing it (Alt+F4) destroys it at once.
 fn watch_switcher(win: &tauri::WebviewWindow) {
     #[cfg(windows)]
     dock::exclude_from_peek(win);
     let w = win.clone();
-    win.on_window_event(move |e| match e {
-        WindowEvent::Focused(false) => { let _ = w.hide(); }
-        WindowEvent::CloseRequested { api, .. } => {
-            api.prevent_close();
-            let _ = w.hide();
+    win.on_window_event(move |e| {
+        if let WindowEvent::Focused(false) = e {
+            hide_switcher_window(&w);
         }
-        _ => {}
     });
 }
 
-/// The switcher window, created again from its configuration if it is gone. Builds off the main
-/// thread: building a window there waits on the event loop the main thread runs.
-async fn switcher_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
-    if let Some(w) = app.get_webview_window(SWITCHER_LABEL) {
-        return Some(w);
-    }
-    let config = app.config().app.windows.iter().find(|w| w.label == SWITCHER_LABEL)?.clone();
-    let h = app.clone();
-    let win = tauri::async_runtime::spawn_blocking(move || tauri::WebviewWindowBuilder::from_config(&h, &config).ok()?.build().ok())
-        .await.ok().flatten()?;
-    watch_switcher(&win);
-    Some(win)
+/// Hides the switcher, then destroys it unless it was shown again in the meantime.
+fn hide_switcher_window(w: &tauri::WebviewWindow) {
+    let _ = w.hide();
+    let w = w.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(SWITCHER_LINGER).await;
+        if !w.is_visible().unwrap_or(true) {
+            let _ = w.destroy();
+        }
+    });
 }
 
 fn show_switcher(app: &AppHandle, w: &tauri::WebviewWindow) {
@@ -1082,8 +1131,8 @@ fn show_switcher(app: &AppHandle, w: &tauri::WebviewWindow) {
 pub(crate) fn toggle_switcher(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let Some(w) = switcher_window(&app).await else { return };
-        if w.is_visible().unwrap_or(false) { let _ = w.hide(); } else { show_switcher(&app, &w); }
+        let Some(w) = on_demand_window(&app, SWITCHER_LABEL).await else { return };
+        if w.is_visible().unwrap_or(false) { hide_switcher_window(&w); } else { show_switcher(&app, &w); }
     });
 }
 
@@ -1092,7 +1141,7 @@ async fn open_switcher(app: AppHandle) {
     if let Some(panel) = app.get_webview_window(panel::LABEL) {
         let _ = panel.hide();
     }
-    if let Some(w) = switcher_window(&app).await {
+    if let Some(w) = on_demand_window(&app, SWITCHER_LABEL).await {
         if !w.is_visible().unwrap_or(false) { show_switcher(&app, &w); }
     }
 }
@@ -1100,7 +1149,7 @@ async fn open_switcher(app: AppHandle) {
 #[tauri::command]
 fn hide_switcher(app: AppHandle) {
     if let Some(w) = app.get_webview_window(SWITCHER_LABEL) {
-        let _ = w.hide();
+        hide_switcher_window(&w);
     }
 }
 
@@ -1305,10 +1354,13 @@ async fn store_settings(app: &AppHandle, settings: Settings) -> Result<(), Strin
 /// Shows Settings, on `page` when given (the flyout's health badge opens Health).
 #[tauri::command]
 fn open_settings(app: AppHandle, page: Option<String>) {
-    if let Some(page) = page.filter(|p| door::SETTINGS_PAGES.contains(&p.as_str())) {
-        let _ = app.emit_to(SETTINGS_LABEL, "show-page", &page);
-    }
-    show_settings(&app);
+    show_settings_page(&app, page);
+}
+
+/// The page Settings was asked to open on while it was being created, once.
+#[tauri::command]
+fn take_settings_page(state: tauri::State<AppState>) -> Option<String> {
+    state.settings_page.lock().unwrap().take()
 }
 
 #[tauri::command]
@@ -1376,18 +1428,39 @@ fn set_menu_labels(state: tauri::State<AppState>, labels: HashMap<String, String
 }
 
 pub(crate) fn show_settings(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window(SETTINGS_LABEL) {
+    show_settings_page(app, None);
+}
+
+/// Shows Settings, on `page` if it is one of its pages, creating the window if it is closed.
+pub(crate) fn show_settings_page(app: &AppHandle, page: Option<String>) {
+    let page = page.filter(|p| door::SETTINGS_PAGES.contains(&p.as_str()));
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let w = match app.get_webview_window(SETTINGS_LABEL) {
+            Some(w) => {
+                if let Some(page) = &page {
+                    let _ = app.emit_to(SETTINGS_LABEL, "show-page", page);
+                }
+                w
+            }
+            None => {
+                // The new page reads it when it loads (`take_settings_page`).
+                *app.state::<AppState>().settings_page.lock().unwrap() = page;
+                let Some(w) = on_demand_window(&app, SETTINGS_LABEL).await else { return };
+                w
+            }
+        };
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
-    }
+    });
 }
 
 /// Applies the settings that live outside the webviews.
 pub(crate) fn apply_settings(app: &AppHandle) {
     let settings = app.state::<AppState>().settings.lock().unwrap().clone();
     let autolaunch = app.autolaunch();
-    if autolaunch.is_enabled().unwrap_or(false) != settings.launch_at_login {
+    if !settings::isolated() && autolaunch.is_enabled().unwrap_or(false) != settings.launch_at_login {
         let _ = if settings.launch_at_login { autolaunch.enable() } else { autolaunch.disable() };
     }
     let _ = app.emit("settings-changed", &settings);
@@ -1871,6 +1944,24 @@ async fn refresh_loop(app: AppHandle) {
     }
 }
 
+/// The app's context. An isolated run (`SLOPBAR_DATA_DIR`) takes an identifier of its own, so
+/// its WebView2 data folder, single-instance mutex and notification id are its own too.
+fn context() -> tauri::Context {
+    let mut context = tauri::generate_context!();
+    if settings::isolated() {
+        let config = context.config_mut();
+        config.identifier = format!("{}.isolated", config.identifier);
+    }
+    // Every window renders in software (see `additionalBrowserArgs` in tauri.conf.json);
+    // SLOPBAR_GPU=1 brings the GPU process back, should a driver render something wrong.
+    if std::env::var_os("SLOPBAR_GPU").is_some_and(|v| v == "1") {
+        for w in context.config_mut().app.windows.iter_mut() {
+            w.additional_browser_args = w.additional_browser_args.take().map(|a| a.replace(" --disable-gpu", ""));
+        }
+    }
+    context
+}
+
 pub fn run() {
     migrate::run();
     let diagnostics = std::sync::Arc::new(diagnostics::Recorder::new(settings::app_dir().expect("config directory").join("diagnostics/history.bin")));
@@ -1913,6 +2004,7 @@ pub fn run() {
         profile_states: Mutex::default(),
         bulk_connect: Mutex::default(),
         hotkey_error: Mutex::default(),
+        settings_page: Mutex::default(),
         leases: Mutex::default(),
     };
     tauri::Builder::default()
@@ -1969,6 +2061,7 @@ pub fn run() {
             updates_enabled,
             save_settings,
             open_settings,
+            take_settings_page,
             set_panel_height,
             set_menu_labels,
             switch_account,
@@ -1996,6 +2089,11 @@ pub fn run() {
         ])
         .setup(|app| {
             app.state::<AppState>().diagnostics.start();
+            // Old diagnostics exports and window captures would otherwise pile up for ever.
+            tauri::async_runtime::spawn_blocking(|| {
+                if let Some(dir) = door::exports_dir() { diagnostics::prune_exports(&dir, std::time::SystemTime::now()); }
+                if let Some(dir) = inspect::captures_dir() { inspect::prune(&dir); }
+            });
             // Before the first refresh reads the vault; a slot that fails stays readable as plaintext.
             let vault = accounts::migrate_vault();
             if !vault.is_empty() {
@@ -2049,24 +2147,6 @@ pub fn run() {
                     }
                 });
             }
-            if let Some(win) = app.get_webview_window(SETTINGS_LABEL) {
-                if dock::is_windows_11() {
-                    use tauri::window::{Effect, EffectsBuilder};
-                    let _ = win.set_effects(EffectsBuilder::new().effect(Effect::Mica).build());
-                }
-                let w = win.clone();
-                win.on_window_event(move |e| {
-                    if let WindowEvent::CloseRequested { api, .. } = e {
-                        api.prevent_close();
-                        let _ = w.hide();
-                    }
-                });
-            }
-
-            if let Some(win) = app.get_webview_window(SWITCHER_LABEL) {
-                watch_switcher(&win);
-            }
-
             apply_settings(handle);
             apply_hotkey(handle);
             dock::show_docked(handle);
@@ -2091,7 +2171,9 @@ pub fn run() {
             let h = handle.clone();
             std::thread::spawn(move || dock::keep_docked(h));
             tauri::async_runtime::spawn(refresh_loop(handle.clone()));
-            tauri::async_runtime::spawn(updates::run_loop(handle.clone()));
+            if !settings::isolated() {
+                tauri::async_runtime::spawn(updates::run_loop(handle.clone()));
+            }
             // Agents use Settings' operations through `slopbar-mcp`, which knocks here.
             #[cfg(windows)]
             {
@@ -2102,7 +2184,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context())
         .expect("error while building slopbar")
         .run(|app, event| {
             // App::run exits the process directly: code after it cannot flush a journal.
@@ -2115,4 +2197,40 @@ pub fn run() {
                 app.state::<AppState>().diagnostics.record(None, None, diagnostics::Event::Shutdown);
             }
         });
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    fn windows() -> Vec<serde_json::Value> {
+        let config: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        config["app"]["windows"].as_array().unwrap().clone()
+    }
+
+    #[test]
+    fn settings_and_the_switcher_are_created_only_when_opened() {
+        for w in windows() {
+            let label = w["label"].as_str().unwrap();
+            // `create` defaults to true.
+            let at_startup = w["create"].as_bool().unwrap_or(true);
+            assert_eq!(at_startup, !ON_DEMAND.contains(&label), "{label}");
+        }
+        for label in ON_DEMAND {
+            assert!(windows().iter().any(|w| w["label"] == label), "{label} has a configuration to be built from");
+        }
+    }
+
+    #[test]
+    fn every_window_shares_one_webview_environment() {
+        // WebView2 refuses a webview whose browser arguments differ from the environment's, and
+        // the same arguments keep every window in one browser, one GPU-less renderer per site.
+        let args: Vec<_> = windows().iter().map(|w| w["additionalBrowserArgs"].as_str().map(String::from)).collect();
+        assert!(args.iter().all(|a| a == &args[0]), "{args:?}");
+        let args = args[0].clone().unwrap();
+        for flag in ["--process-per-site", "--disable-gpu", "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection"] {
+            assert!(args.split(' ').any(|a| a == flag), "{flag} in {args}");
+        }
+        assert!(windows().iter().all(|w| w.get("dataDirectory").is_none()), "one WebView2 data folder for all");
+    }
 }

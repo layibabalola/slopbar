@@ -884,7 +884,39 @@ impl Recorder {
             Utc::now().format("%Y%m%d-%H%M%S-%f")
         ));
         private_store::write(&path, &bytes).map_err(|_| "diagnostic_storage")?;
+        prune_exports(&dir, std::time::SystemTime::now());
         Ok(path)
+    }
+}
+
+/// Exports always kept, newest first; older ones go unless they are recent (`EXPORTS_RECENT`).
+pub const EXPORTS_KEPT: usize = 5;
+/// Exports younger than this are kept however many there are: an agent may still be reading one.
+pub const EXPORTS_RECENT: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// Which of `exports` (modified time, path) to remove at `now`: all but the newest
+/// `EXPORTS_KEPT` and those younger than `EXPORTS_RECENT`.
+pub fn exports_to_remove(mut exports: Vec<(std::time::SystemTime, PathBuf)>, now: std::time::SystemTime) -> Vec<PathBuf> {
+    exports.sort_by(|a, b| b.0.cmp(&a.0));
+    exports.into_iter().skip(EXPORTS_KEPT)
+        .filter(|(modified, _)| now.duration_since(*modified).is_ok_and(|age| age >= EXPORTS_RECENT))
+        .map(|(_, path)| path)
+        .collect()
+}
+
+/// Removes old diagnostics exports from `dir` (see `exports_to_remove`). Only SlopBar's own
+/// export files are considered; anything else in the folder is left alone.
+pub fn prune_exports(dir: &std::path::Path, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let exports = entries.flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with("SlopBar-Diagnostics-") && name.ends_with(".json")
+        })
+        .filter_map(|e| Some((e.metadata().ok().filter(|m| m.is_file())?.modified().ok()?, e.path())))
+        .collect();
+    for path in exports_to_remove(exports, now) {
+        let _ = std::fs::remove_file(path);
     }
 }
 impl Drop for Recorder {
@@ -1118,6 +1150,38 @@ mod crash_tests {
 mod tests {
     use super::*;
     use crate::test_support::TempDir;
+    #[test]
+    fn old_exports_go_but_the_newest_five_and_the_last_day_stay() {
+        let dir = TempDir::new();
+        let now = std::time::SystemTime::now();
+        let hours = |h: u64| now - std::time::Duration::from_secs(h * 3600);
+        // Eight a week or more old, three from today.
+        let ages = [200, 190, 180, 170, 168, 160, 150, 26, 20, 3, 1];
+        for (i, age) in ages.iter().enumerate() {
+            let path = dir.0.join(format!("SlopBar-Diagnostics-{i:02}.json"));
+            std::fs::write(&path, b"{}").unwrap();
+            std::fs::File::options().write(true).open(&path).unwrap().set_modified(hours(*age)).unwrap();
+        }
+        let other = dir.0.join("notes.json");
+        std::fs::write(&other, b"keep").unwrap();
+        std::fs::File::options().write(true).open(&other).unwrap().set_modified(hours(500)).unwrap();
+        prune_exports(&dir.0, now);
+        let mut left: Vec<String> = std::fs::read_dir(&dir.0).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        // The five newest (two of them from the last day) and nothing older; other files stay.
+        assert_eq!(left, ["SlopBar-Diagnostics-06.json", "SlopBar-Diagnostics-07.json", "SlopBar-Diagnostics-08.json",
+            "SlopBar-Diagnostics-09.json", "SlopBar-Diagnostics-10.json", "notes.json"]);
+    }
+    #[test]
+    fn every_export_from_the_last_day_is_kept_however_many() {
+        let now = std::time::SystemTime::now();
+        let exports: Vec<_> = (0..9u64).map(|i| (now - std::time::Duration::from_secs(i * 3600), PathBuf::from(format!("{i}")))).collect();
+        assert!(exports_to_remove(exports.clone(), now).is_empty());
+        // A day later, all but the newest five go.
+        let later = now + EXPORTS_RECENT + std::time::Duration::from_secs(9 * 3600);
+        let gone = exports_to_remove(exports, later);
+        assert_eq!(gone, ["5", "6", "7", "8"].map(PathBuf::from));
+    }
     #[test]
     fn a_refresh_publishes_usage_before_sharing_and_bookkeeping() {
         use RefreshPhase as P;
