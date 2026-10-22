@@ -91,13 +91,13 @@ upstream PR.
 | 43 | **Encrypted backup and restore** of settings, plan details and history (never sign-ins). | done (40439db) |
 | 44 | **Opt-in phone alerts** through a self-hostable push service (ntfy). | done (40439db) |
 
-## Wave 7: running (added by the owner on 2026-10-22)
+## Wave 7: done (added by the owner on 2026-10-22; merged at ac9e355)
 
 | # | Item | Status |
 |---|---|---|
-| 45 | **Smaller footprint without losing features**: Settings, switcher and flyout built on demand; one shared WebView2 process group; quiet idle timers; capped diagnostics exports and install rollbacks. Measured before: 452 MB private, ~6.5% of a core, 1 GB of exports and rollbacks. | running |
-| 46 | **Native taskbar widget**: draw the always-visible widget with Windows' own drawing instead of a web view, for a small (~80-100 MB) idle footprint. Starts after #45 is measured. | queued |
-| 30b | **Translate the 130 strings added in waves 5 and 6.** | running |
+| 45 | **Smaller footprint without losing features**: Settings, switcher and flyout built on demand; one shared WebView2 process group; quiet idle timers; capped diagnostics exports and install rollbacks. Measured: 404 MB -> 171 MB private and 4.88% -> 0.73% of a core at idle. | done (07416eb) |
+| 46 | **Native taskbar widget**: draw the always-visible widget with Windows' own drawing instead of a web view, for a small (~80-100 MB) idle footprint. | done (ac9e355) |
+| 30b | **Translate the 130 strings added in waves 5 and 6.** | done (aab0f12) |
 
 ## Done before this roadmap (branch `claude/subscription-value`; upstream thelioo/slopbar#8–#11, stacked on #6)
 
