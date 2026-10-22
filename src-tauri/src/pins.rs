@@ -35,8 +35,10 @@ pub fn normalize_folder(folder: &str) -> Result<String, String> {
         return Err(refuse());
     }
     // Keep a drive root ("C:\") whole; strip the separator from anything longer.
-    let stripped = trimmed.trim_end_matches(['\\', '/']);
-    Ok(if stripped.ends_with(':') || stripped.is_empty() { trimmed.to_string() } else { stripped.to_string() })
+    // One spelling per folder: Windows paths with backslashes only.
+    let spelled = if cfg!(windows) { trimmed.replace('/', "\\") } else { trimmed.to_string() };
+    let stripped = spelled.trim_end_matches(['\\', '/']);
+    Ok(if stripped.ends_with(':') || stripped.is_empty() { spelled.clone() } else { stripped.to_string() })
 }
 
 fn same_folder(a: &str, b: &str) -> bool {
@@ -136,11 +138,12 @@ if ($rest.Count -gt 0 -and $rest[0] -eq '--') {{ $rest = @($rest | Select-Object
 if ($rest.Count -eq 0) {{ $rest = @($provider) }}
 $here = (Get-Location).ProviderPath
 $best = $null
+$bestLength = -1
 foreach ($pin in $pins) {{
   if ($pin.Provider -ne $provider) {{ continue }}
-  $folder = $pin.Folder.TrimEnd('\', '/')
-  $inside = $here -eq $folder -or $here -eq $pin.Folder -or $here.StartsWith($folder + '\', [StringComparison]::OrdinalIgnoreCase)
-  if ($inside -and ($null -eq $best -or $folder.Length -gt $best.Folder.TrimEnd('\', '/').Length)) {{ $best = $pin }}
+  $folder = $pin.Folder.Replace('/', '\').TrimEnd('\')
+  $inside = $here -eq $folder -or $here.StartsWith($folder + '\', [StringComparison]::OrdinalIgnoreCase)
+  if ($inside -and $folder.Length -gt $bestLength) {{ $best = $pin; $bestLength = $folder.Length }}
 }}
 if ($null -ne $best) {{
   $var = if ($provider -eq 'claude') {{ 'CLAUDE_CONFIG_DIR' }} else {{ 'CODEX_HOME' }}
@@ -302,6 +305,36 @@ mod tests {
         let written = std::fs::read_to_string(bin.0.join("slopbar-run.ps1")).unwrap();
         assert!(written.contains(&*root.0.join(accounts::profile_name(Provider::Codex, "user-2:acct-2")).to_string_lossy()));
         assert!(std::fs::read_to_string(bin.0.join("slopbar-run.cmd")).unwrap().contains("slopbar-run.ps1"));
+    }
+
+    /// Runs the generated launcher for real: the profile is set inside the pinned folder only,
+    /// and not while the account is the CLI's own sign-in (its profile has no login).
+    #[cfg(windows)]
+    #[test]
+    fn the_launcher_sets_the_profile_only_inside_pinned_folders() {
+        let out = TempDir::new();
+        let repo = out.0.join("repo");
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        let pin = ProjectPin { folder: normalize_folder(&repo.to_string_lossy().replace('\\', "/")).unwrap(), provider: Provider::Claude, id: "user-1:org-1".into() };
+        assert!(!pin.folder.contains('/'), "one spelling: {}", pin.folder);
+        let profiles = out.0.join("profiles");
+        let profile = profiles.join(accounts::profile_name(Provider::Claude, "user-1:org-1"));
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join(".credentials.json"), "{}").unwrap();
+        write_launcher_in(&out.0.join("bin"), &profiles, &[pin]).unwrap();
+        let run = |cwd: &Path, provider: &str| {
+            let output = std::process::Command::new("cmd.exe")
+                .arg("/c").arg(out.0.join("bin").join("slopbar-run.cmd")).args([provider, "--", "cmd", "/c", "set", "CLAUDE_CONFIG_DIR"])
+                .current_dir(cwd).env_remove("CLAUDE_CONFIG_DIR").output().unwrap();
+            (String::from_utf8_lossy(&output.stdout).trim().to_string(), output.status.code())
+        };
+        let expected = format!("CLAUDE_CONFIG_DIR={}", profile.to_string_lossy());
+        assert_eq!(run(&repo.join("sub"), "claude").0, expected, "inside a pinned folder");
+        assert_eq!(run(&repo, "claude").0, expected);
+        assert_eq!(run(&out.0, "claude"), (String::new(), Some(1)), "outside: untouched, and the command's exit code comes back");
+        assert_eq!(run(&repo, "codex").0, "", "a pin is per provider");
+        std::fs::remove_file(profile.join(".credentials.json")).unwrap();
+        assert_eq!(run(&repo, "claude").0, "", "while the account is the CLI's sign-in the folder runs on that");
     }
 
     #[test]
