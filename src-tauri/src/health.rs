@@ -121,6 +121,8 @@ pub struct Inputs<'a> {
     pub notifications: Notifications,
     /// Settings: Connect monitoring automatically.
     pub auto_connect: bool,
+    /// Saved sign-ins still stored as plaintext (see `accounts::migrate_vault`).
+    pub vault_plaintext: usize,
 }
 
 fn name(a: &AccountUsage) -> String {
@@ -199,6 +201,21 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         checks.push(check("monitoring", Status::Ok, "Monitoring sign-ins", reason, None));
     }
     checks.extend(monitoring);
+
+    // The CLI's own saved login, which SlopBar switches but never renews or signs in again.
+    for a in inputs.accounts.iter().filter(|a| a.cli_rejected) {
+        let cli = match a.provider { Provider::Claude => "claude /login", Provider::Codex => "codex login" };
+        let how = if a.active { format!("Run `{cli}` to sign the CLI in again.") }
+            else { format!("Switch to it and run `{cli}`, or remove it if it is no longer used.") };
+        checks.push(check(format!("cli:{}:{}", a.provider.key(), a.id), Status::Problem, format!("{}: CLI sign-in rejected", name(a)),
+            format!("The provider no longer accepts the CLI's saved sign-in for this account; the CLI manages that sign-in. {how}"),
+            Some(Fix::OpenSettings { page: "accounts" })));
+    }
+    if inputs.vault_plaintext > 0 {
+        checks.push(check("vault", Status::Warning, "Saved sign-ins",
+            format!("{} saved sign-in(s) could not be encrypted yet and are still stored as plaintext; SlopBar retries at each start. Check disk space and file access.", inputs.vault_plaintext),
+            Some(Fix::RestartApp)));
+    }
 
     // Readings older than two refresh intervals. An unmonitored account not in use is already
     // reported above: its reading cannot be fresh until monitoring is connected.
@@ -322,6 +339,7 @@ mod tests {
         journal: Journal,
         notifications: Notifications,
         auto_connect: bool,
+        vault_plaintext: usize,
     }
 
     impl Case {
@@ -335,12 +353,14 @@ mod tests {
                 journal: Journal { started: true, write_attempts: 4, storage_errors: 0, last_write_ok: Some(true), history_unreadable: false },
                 notifications: Notifications { registered: Some(true), app_enabled: None, system_enabled: None, any_wanted: true },
                 auto_connect: true,
+                vault_plaintext: 0,
             }
         }
 
         fn run(&self) -> Report {
             checks(&Inputs { accounts: &self.accounts, monitoring: &self.monitoring, refresh_minutes: 5, last_success: self.last_success,
-                door: self.door, sharing: &self.sharing, journal: self.journal, notifications: self.notifications, auto_connect: self.auto_connect }, now())
+                door: self.door, sharing: &self.sharing, journal: self.journal, notifications: self.notifications, auto_connect: self.auto_connect,
+                vault_plaintext: self.vault_plaintext }, now())
         }
     }
 
@@ -370,6 +390,23 @@ mod tests {
         }
         assert!(r.checks.iter().all(|c| c.id != "monitoring"), "the all-ok row is replaced");
         assert_eq!((r.status, r.problems), (Status::Problem, 2));
+    }
+
+    #[test]
+    fn a_rejected_cli_login_and_plaintext_sign_ins_are_reported() {
+        let mut case = Case::healthy();
+        case.accounts[1].cli_rejected = true;
+        case.accounts[1].active = true;
+        case.vault_plaintext = 2;
+        let r = case.run();
+        let c = find(&r, "cli:claude:b");
+        assert_eq!((c.status, c.fix.clone()), (Status::Problem, Some(Fix::OpenSettings { page: "accounts" })));
+        assert!(c.reason.contains("claude /login") && c.reason.contains("the CLI manages"), "{}", c.reason);
+        assert!(r.checks.iter().all(|c| c.id != "cli:claude:a"));
+        let v = find(&r, "vault");
+        assert_eq!((v.status, v.fix.clone()), (Status::Warning, Some(Fix::RestartApp)));
+        assert!(v.reason.starts_with("2 "));
+        assert_eq!((r.problems, r.warnings), (1, 1));
     }
 
     #[test]

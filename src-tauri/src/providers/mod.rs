@@ -28,6 +28,8 @@ pub struct Cached {
     monitor_error: Option<String>,
     /// The provider's own billing record, last read at most a few times a day.
     billing: Option<crate::model::BillingHints>,
+    /// Claude's extra usage, from the last successful read.
+    extra_usage: Option<crate::model::ExtraUsage>,
     #[serde(skip)]
     verified: bool,
 }
@@ -118,18 +120,18 @@ pub async fn fetch_all(
                 billing: slot.billing(),
                 remote: vec![],
                 used_outside: false,
-                runs_out_at: None, unexpected: None,
+                runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None,
             };
             let entry = cache.entry(monitoring::key(slot)).or_default();
             match result {
-                Some(Ok(Fetched { windows, credits, resets, monitor_error, billing })) => {
+                Some(Ok(Fetched { windows, credits, resets, monitor_error, billing, extra_usage })) => {
                     // Billing is read less often than usage: keep the last record between reads.
                     let billing = match (billing, entry.billing.take()) {
                         (Some(new), Some(old)) => Some(old.overlay(&new)),
                         (new, old) => new.or(old),
                     };
                     *entry = Cached { windows, credits, resets, at: Some(Utc::now()),
-                        blocked_until: None, error: None, monitor_error, billing, verified: true };
+                        blocked_until: None, error: None, monitor_error, billing, extra_usage, verified: true };
                 }
                 Some(Err(err)) => {
                     let backoff = err.strip_prefix("rate_limited:").and_then(|s| s.parse::<i64>().ok())
@@ -144,10 +146,12 @@ pub async fn fetch_all(
             acc.windows = entry.windows.clone();
             acc.credits = entry.credits.clone();
             acc.resets = entry.resets.clone();
+            acc.extra_usage = entry.extra_usage.clone();
             acc.fetched_at = entry.at;
             acc.stale = !entry.verified || entry.error.is_some();
             acc.error = entry.error.clone();
             acc.monitor_error = entry.monitor_error.clone();
+            acc.cli_rejected = cli_rejected(slot);
             if let Some(b) = &entry.billing { acc.billing = acc.billing.clone().overlay(b); }
             if let Some(p) = &acc.billing.plan_type { acc.plan = Some(p.clone()); }
             // The account record names the Pro tiers too, for when usage has not said.
@@ -173,6 +177,40 @@ pub(crate) fn billing_due(key: &str) -> bool {
     due
 }
 
+/// CLI logins the provider rejected, per account: a fingerprint of the access token that got the
+/// 401. The account counts as rejected only while its saved login still has that token, so a
+/// renewal by the CLI clears it without another request.
+fn cli_rejections() -> &'static std::sync::Mutex<HashMap<String, u64>> {
+    static REJECTED: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u64>>> = std::sync::OnceLock::new();
+    REJECTED.get_or_init(Default::default)
+}
+
+fn fingerprint(token: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut h);
+    h.finish()
+}
+
+/// Notes how a usage read with the CLI's own access token went.
+fn note_cli_login(slot: &Slot, token: &str, result: &Result<Fetched, String>) {
+    let mut rejected = cli_rejections().lock().unwrap_or_else(|e| e.into_inner());
+    match result {
+        Err(e) if e == "token_invalid" => { rejected.insert(monitoring::key(slot), fingerprint(token)); }
+        Ok(_) => { rejected.remove(&monitoring::key(slot)); }
+        Err(_) => {}
+    }
+}
+
+/// Whether the provider rejected this saved CLI login (see `note_cli_login`).
+pub fn cli_rejected(slot: &Slot) -> bool {
+    let rejected = cli_rejections().lock().unwrap_or_else(|e| e.into_inner());
+    match (rejected.get(&monitoring::key(slot)), slot.access()) {
+        (Some(bad), Some((token, _))) => *bad == fingerprint(&token),
+        _ => false,
+    }
+}
+
 pub fn alias_key(provider: Provider, id: &str) -> String {
     format!("{}:{id}", provider.name().to_lowercase())
 }
@@ -183,6 +221,7 @@ struct Fetched {
     resets: Vec<ResetGrant>,
     monitor_error: Option<String>,
     billing: Option<crate::model::BillingHints>,
+    extra_usage: Option<crate::model::ExtraUsage>,
 }
 
 trait Usage {
@@ -253,6 +292,9 @@ async fn observed_usage(usage: &impl Usage, monitor: &Monitor, slot: &Slot, toke
     let started = std::time::Instant::now();
     let observe = |evidence| monitor.record(slot, Event::ProviderEvidence { origin, evidence });
     let result = usage.fetch(slot.provider, token, account, &observe).await;
+    if matches!(origin, Origin::Cli | Origin::ActiveCliFallback) {
+        note_cli_login(slot, token, &result);
+    }
     monitor.record(slot, Event::Usage { origin, code: Code::from_error(result.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) });
     result
 }
@@ -260,9 +302,9 @@ async fn observed_usage(usage: &impl Usage, monitor: &Monitor, slot: &Slot, toke
 async fn fetch_token(client: &reqwest::Client, slot: &Slot, provider: Provider, token: &str, account: Option<&str>, observe: &evidence::Observer<'_>) -> Result<Fetched, String> {
     match provider {
         Provider::Claude => claude::fetch(client, token, slot, observe)
-            .await.map(|u| Fetched { windows: u.windows, credits: None, resets: u.resets, monitor_error: None, billing: u.billing }),
+            .await.map(|u| Fetched { windows: u.windows, credits: None, resets: u.resets, monitor_error: None, billing: u.billing, extra_usage: u.extra_usage }),
         Provider::Codex => codex::fetch(client, token, account, observe)
-            .await.map(|u| Fetched { windows: u.windows, credits: u.credits, resets: u.resets, monitor_error: None, billing: u.billing }),
+            .await.map(|u| Fetched { windows: u.windows, credits: u.credits, resets: u.resets, monitor_error: None, billing: u.billing, extra_usage: None }),
     }
 }
 
@@ -278,7 +320,7 @@ mod tests {
             async fn fetch(&self, _: Provider, token: &str, _: Option<&str>, _: &evidence::Observer<'_>) -> Result<Fetched, String> {
                 self.0.lock().unwrap().push(token.to_owned());
                 if token == "monitor-access" { return Err("bad_response".into()); }
-                Ok(Fetched { windows: observed(24.0).windows, credits: None, resets: vec![], monitor_error: None, billing: None })
+                Ok(Fetched { windows: observed(24.0).windows, credits: None, resets: vec![], monitor_error: None, billing: None, extra_usage: None })
             }
         }
         let dir = TempDir::new();
@@ -317,7 +359,7 @@ mod tests {
         impl Usage for Observed {
             async fn fetch(&self, _: Provider, token: &str, _: Option<&str>, _: &evidence::Observer<'_>) -> Result<Fetched, String> {
                 self.0.lock().unwrap().push(token.to_owned());
-                Ok(Fetched { windows: observed(24.0).windows, credits: None, resets: vec![], monitor_error: None, billing: None })
+                Ok(Fetched { windows: observed(24.0).windows, credits: None, resets: vec![], monitor_error: None, billing: None, extra_usage: None })
             }
         }
         for active in [false, true] {

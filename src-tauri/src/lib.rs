@@ -12,6 +12,8 @@ mod diagnostics;
 mod subscriptions;
 mod headroom;
 mod plan_alerts;
+mod advisor;
+mod ledger;
 mod codex_local;
 mod active_log;
 mod usage_index;

@@ -61,7 +61,7 @@ When only that hint triggers renewal, a temporary failure, rate limit, or uncert
 
 At upstream commit `60a7c8e0835b4cd320dba3e0b1352d7a8161c9e1`, `providers::fetch_one` stopped before requesting usage when a copied Claude access token had expired. SlopBar deliberately never renewed tokens, and `accounts::capture` only obtained replacements when an official CLI had already refreshed its login. Inactive accounts therefore lost live telemetry. The UI translated an inactive expired token into “Not used recently,” hiding the authentication cause. The last-success cache lived only in memory, and its reset prediction could display 0% without a provider response.
 
-Refreshing those existing copied refresh tokens would race the CLI's token rotation. This branch instead owns a separate refresh-token chain per monitored account, serializes refreshes, saves rotated tokens atomically, backs off after failures, and uses Windows DPAPI for monitoring credentials. The older account-switching vault still uses its original plaintext format; see [SECURITY.md](SECURITY.md).
+Refreshing those existing copied refresh tokens would race the CLI's token rotation. This branch instead owns a separate refresh-token chain per monitored account, serializes refreshes, saves rotated tokens atomically, backs off after failures, and uses Windows DPAPI for monitoring credentials. The account-switching vault is encrypted with DPAPI too: plaintext slots from earlier releases are encrypted on the first start, and a slot is never deleted before its encrypted copy reads back correctly; see [SECURITY.md](SECURITY.md).
 
 ## Diagnostics for real-machine testing
 
@@ -94,6 +94,7 @@ command = 'C:\Users\<you>\AppData\Local\SlopBar\slopbar-mcp.exe'
 | `get_settings`, `update_settings` | Read settings, or change them with a JSON merge patch. Only values the Settings window offers are accepted; unknown fields are refused. |
 | `switch_account`, `remove_account` | Use or remove a saved account, as in Settings. |
 | `add_account`, `connect_monitoring`, `disconnect_monitoring` | Start the CLI's own sign-in for the user to complete, or revoke a monitoring sign-in. |
+| `revoke_account_sessions` | Revoke every sign-in SlopBar holds for an account (its monitoring session, at the provider and here), optionally removing the saved CLI login with `remove_slot`. Only reports unless `confirm: true`; the CLI's own sign-in is left to the CLI. |
 | `check_for_updates`, `install_update`, `get_app_info`, `open_settings` | Updates (builds with automatic updates only), version and build, and showing the Settings window. |
 | `quit_app`, `restart_app` | Quit as the tray's Quit does, or quit and start the installed executable again. |
 | `get_usage_breakdown` | Tokens on this PC by account and repository, model or day, with each provider's model mix and an hour-of-week heatmap, and how each account's tokens were attributed. |

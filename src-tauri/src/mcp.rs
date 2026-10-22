@@ -17,7 +17,7 @@ const MAX_TEXT: usize = 512;
 
 const INSTRUCTIONS: &str = "SlopBar Ultra shows Claude and Codex account usage and switches accounts. These tools \
 act on the running SlopBar Ultra app exactly like its Settings window. Read-only tools (get_usage, get_headroom, get_settings, \
-get_subscription_report, get_usage_breakdown, get_health, list_project_pins, inspect_window, list_sharing_locations, get_app_info, list_diagnostic_exports) are always fine. To see SlopBar Ultra's \
+get_subscription_report, get_plan_advice, get_usage_breakdown, get_health, list_project_pins, inspect_window, list_sharing_locations, get_app_info, list_diagnostic_exports) are always fine. To see SlopBar Ultra's \
 windows use inspect_window, never screenshots or control of the user's desktop. Call any tool that changes something (update_settings, \
 switch_account, add_account, connect_monitoring, disconnect_monitoring, remove_account, connect_monitoring_all, remove_lapsed_accounts, set_project_pin, refresh_usage, \
 install_update, export_diagnostics, export_calendar, export_csv, open_settings, quit_app, restart_app) only when the user asked for that action in this \
@@ -65,7 +65,8 @@ fn settings_patch_schema() -> Value {
         "auto_update": { "type": "boolean", "description": "Only builds with automatic updates." },
         "aliases": { "type": "object", "description": "Display names keyed \"provider:id\" (ids from get_usage); null removes one.", "additionalProperties": { "type": ["string", "null"] } },
         "balancer": both(rule),
-        "notifications": { "type": "object", "properties": { "usage": { "type": "boolean", "description": "Limits at 75% and 90% and reached, and the account in use running out of its week within a few hours." }, "resets": { "type": "boolean" }, "switches": { "type": "boolean" }, "renewals": { "type": "boolean", "description": "A plan that looks unused or underused renewing within three days, and any paid plan renewing within a day." }, "unexpected_use": { "type": "boolean", "description": "Notify (at most every 6 h per account) when a monitored account is used while none of the user's computers sharing in-use status has it signed in." }, "digest": { "type": "boolean", "description": "One notification each Monday morning summing up the plans: monthly spend, possible savings, plans renewing this week, accounts that ran out last week and how many plans the usage needs. On by default." } } },
+        "notifications": { "type": "object", "properties": { "usage": { "type": "boolean", "description": "Limits at 75% and 90% and reached, and the account in use running out of its week within a few hours." }, "resets": { "type": "boolean" }, "switches": { "type": "boolean" }, "renewals": { "type": "boolean", "description": "A plan that looks unused or underused renewing within three days, and any paid plan renewing within a day." }, "unexpected_use": { "type": "boolean", "description": "Notify (at most every 6 h per account) when a monitored account is used while none of the user's computers sharing in-use status has it signed in." }, "digest": { "type": "boolean", "description": "One notification each Monday morning summing up the plans: monthly spend, possible savings, plans renewing this week, accounts that ran out last week and how many plans the usage needs. On by default." }, "extra_usage": { "type": "boolean", "description": "A Claude account whose extra usage reaches 75% and then 90% of its monthly limit, once each per month. On by default." } } },
+        "spend": { "type": "object", "additionalProperties": false, "properties": { "tax_percent": { "type": ["number", "null"], "minimum": 0, "maximum": 100, "description": "Sales tax or VAT added to the spend totals shown (display only)." }, "currency": { "type": ["string", "null"], "maxLength": 24, "description": "A label for spend amounts, e.g. USD; amounts are not converted." } } },
         "calendar": { "type": "object", "additionalProperties": false, "properties": {
             "enabled": { "type": "boolean", "description": "Rewrite the plan-renewal calendar file after each refresh (see export_calendar)." },
             "path": { "type": ["string", "null"], "description": "An absolute .ics file path in an existing folder; null uses Documents\\SlopBar\\renewals.ics." },
@@ -119,6 +120,7 @@ fn catalog() -> Vec<Tool> {
         tool("refresh_usage", "Refresh usage", "Poll every account's usage now (as the tray's Refresh does) and return the new snapshot. If automatic switching is on and a threshold is reached, this can switch accounts.", none(), false, true, false, true),
         tool("get_settings", "Get settings", "SlopBar Ultra's settings: refresh interval, providers, language, launch at login, updates, account aliases, automatic switching rules and notifications.", none(), true, false, true, false),
         tool("get_subscription_report", "Get subscription report", "Per account: plan, this week's usage, pace and runs_out_at (when the week runs out before its reset at the current rate), the last four completed weeks (how many reached the limit, average and median peak), a verdict (insufficient_data, exhausted_weekly, healthy, underused or unused), whether renewing looks unneeded, the next renewal with its source (entered, provider or estimated), renewal_warning (wasteful: renews within three days while unused or underused; soon: renews within a day) and the monthly cost; plus totals per provider. A verdict needs at least two well-observed weeks. Codex accounts also carry idle_now (no use anywhere in the past seven days) and local: what the Codex CLI on this PC shows (last_local_activity, days_idle, never_seen, attributed_since, threads and tokens over 7 and 28 days and per ISO week, backfilled_weeks). A long-idle Codex plan can be judged unused from that local history; such verdicts have basis local_codex, and use in WSL, on other machines or in the cloud is not seen locally. Each account has plan_weight (its weekly allowance in plans of the provider's reference tier: Max 20x for Claude, Pro 200 for Codex), cost_per_use (per_percent: dollars per 1% of its weekly limit used; per_local_thread: Codex dollars per thread on this PC only) and, for Codex, credits (purchased balance, unlimited, spent since a date; never priced in dollars). Each provider has pool: plans_needed to cover the 90th-percentile week of combined use (demand_p90, in plans) plus 20%, plans_held, weeks_used, confidence and basis (local_codex when a week came from this PC's Codex rollouts); plans_needed is null with fewer than two weeks of history. Codex Pro 200 accounts carry allowance_change until the plan's Codex allowance is cut after last_day (2026-10-29, estimated to about half): peak_percent (highest weekly use in recent weeks), projected_percent (that against the new allowance) and would_hit_limit.", none(), true, false, true, false),
+        tool("get_plan_advice", "Get plan advice", "Concrete plan changes per provider, read-only: moves (cancel a plan judged unused; downgrade an underused one to the cheapest smaller tier that still fits its busiest recent week plus 20%, e.g. Pro 200 to Pro 100 or Max 20x to Max 5x or Pro), each with the account (id, email, alias), from and to, monthly_saving in dollars, verdict, basis, peak_percent, before (the next renewal) and manage_url (the provider's billing page). No move leaves less capacity than floor: the pool's 90th-percentile week of combined use (demand_p90) plus 20%, in plans of unit (Max 20x or Pro 200), and a provider always keeps at least one plan. Per provider: evidence (pool, or clear_only when there are fewer than weeks_needed weeks of history: then only plans judged unused, such as Codex plans idle for weeks on this PC's history, and no downgrades), capacity_now and capacity_after, monthly_saving, spare_after and spare_after_percent (capacity left over the busiest weeks after every move) and kept_for_capacity. SlopBar Ultra cannot change a plan; the user does it on the billing page.", none(), true, false, true, false),
         tool("get_usage_breakdown", "Get usage breakdown", "Tokens used on this PC by account, read from Claude Code's transcripts and the Codex CLI's rollouts (model names, token counts, times and working folders only; never prompt or reply text). For the last `days` local days (default 7, at most 63): per provider the totals, unattributed tokens, model mix, groups and heatmap; per account (email, alias) its tokens split into input, cache_write, cached and output, groups by group_by (repo: the git repository name of the working folder, model, or day) with each group's share in percent, and heatmap (tokens by local weekday, Monday first, and hour; utc_offset_minutes gives the zone). attribution says how tokens were tied to the account: session (the Codex session names it), inferred_from_active_account (the account SlopBar Ultra saw signed in to the CLI then; all Claude use), mixed, or unattributed (a time SlopBar Ultra was not watching). Use elsewhere (WSL, other machines, web) is not included. Repository names stay on this machine.",
             schema(json!({
                 "provider": { "type": "string", "enum": ["claude", "codex"] },
@@ -126,9 +128,9 @@ fn catalog() -> Vec<Tool> {
                 "days": { "type": "integer", "minimum": 1, "maximum": 63 },
                 "group_by": { "type": "string", "enum": ["repo", "model", "day"], "description": "Default repo." },
             }), &[]), true, false, true, false),
-        tool("export_csv", "Export CSV", "Write three CSV files (weekly usage history per account, the usage breakdown by local day, account, repository and model for 63 days, and the subscription report) into folder (an absolute path, created if missing; default Documents\\SlopBar Ultra Exports) and return their paths, row counts and sizes. The files hold account emails and repository names; they stay on this machine unless the user shares them.",
+        tool("export_csv", "Export CSV", "Write four CSV files (weekly usage history per account, the usage breakdown by local day, account, repository and model for 63 days, the subscription report, and the spend ledger: plan charges and Claude extra usage by month) into folder (an absolute path, created if missing; default Documents\\SlopBar Ultra Exports) and return their paths, row counts and sizes. The files hold account emails and repository names; they stay on this machine unless the user shares them.",
             schema(json!({ "folder": { "type": "string", "description": "Absolute folder path; default Documents\\SlopBar Ultra Exports." } }), &[]), false, false, false, false),
-        tool("get_health", "Get health", "SlopBar Ultra's self-check, as Settings > Health shows it: overall status (ok, warning or problem), counts, and each check with id, status, title, a one-line reason and its fix (connect_monitoring with provider and id, refresh, restart_app, or open_settings with a page). Checks: monitoring sign-ins needing reconnecting, expiring within three days, failing or not connected; usage readings older than two refresh intervals; the last refresh that read usage; the agent door; in-use sharing writing and reading; rclone when a remote is chosen; the diagnostics journal; notification registration and the Windows notification switches. Computed from what SlopBar Ultra already knows, no network. Apply a fix only when the user asks.", none(), true, false, true, false),
+        tool("get_health", "Get health", "SlopBar Ultra's self-check, as Settings > Health shows it: overall status (ok, warning or problem), counts, and each check with id, status, title, a one-line reason and its fix (connect_monitoring with provider and id, refresh, restart_app, or open_settings with a page). Checks: monitoring sign-ins needing reconnecting, expiring within three days, failing or not connected; CLI sign-ins the provider rejected (cli:<provider>:<id>; the CLI signs in again on its own); saved sign-ins still stored as plaintext (vault); usage readings older than two refresh intervals; the last refresh that read usage; the agent door; in-use sharing writing and reading; rclone when a remote is chosen; the diagnostics journal; notification registration and the Windows notification switches. Computed from what SlopBar Ultra already knows, no network. Apply a fix only when the user asks.", none(), true, false, true, false),
         tool("update_settings", "Update settings", "Change settings with a JSON merge patch over get_settings' shape, e.g. {\"refresh_minutes\": 15, \"balancer\": {\"claude\": {\"auto\": true, \"threshold\": 85}}}. Only values the Settings window offers are accepted. Returns the saved settings.", settings_patch_schema(), false, true, true, false),
         tool("switch_account", "Switch account", "Make this saved account the one the provider's CLI uses (as Use in Settings). Running agent sessions on that CLI are affected. Returns the new snapshot and switched_to_requested (false if automatic switching moved away again).", account_schema(), false, true, true, true),
         tool("add_account", "Add account", "Open the provider CLI's own sign-in in a terminal for the user to complete; the account appears in get_usage once they finish. Returns at once; only one can be pending per provider.",
@@ -136,6 +138,13 @@ fn catalog() -> Vec<Tool> {
         tool("connect_monitoring", "Connect monitoring", "Start a separate monitoring sign-in for this account (the user completes it) so its usage stays visible while it is not in use. Returns at once; check get_usage afterwards.", account_schema(), false, false, false, true),
         tool("disconnect_monitoring", "Disconnect monitoring", "Stop independent monitoring for this account and revoke its monitoring sign-in. Returns the new snapshot and whether the provider confirmed the revocation.", account_schema(), false, true, true, true),
         tool("remove_account", "Remove account", "Remove a saved account that is not in use, revoking its monitoring sign-in. Returns the new usage snapshot.", account_schema(), false, true, true, true),
+        tool("revoke_account_sessions", "Revoke all SlopBar Ultra sessions", "Revoke every sign-in SlopBar Ultra itself holds for this account: its monitoring session is revoked at the provider and forgotten here. The CLI's own sign-in is managed by the CLI and is not revoked (sign out there: claude /logout, codex logout); remove_slot: true also removes SlopBar Ultra's saved copy of it, as remove_account does (never while in use). Without confirm: true it only reports what it would do (monitoring_connected, in_use); with it, it returns monitoring (revoked, unconfirmed or none), slot_removed and the new snapshot. Only when the user asked.",
+            schema(json!({
+                "provider": { "type": "string", "enum": ["claude", "codex"] },
+                "id": { "type": "string", "description": "The account id from get_usage." },
+                "confirm": { "type": "boolean", "description": "Revoke (default false: only report)." },
+                "remove_slot": { "type": "boolean", "description": "Also remove the saved CLI login from SlopBar Ultra (default false)." },
+            }), &["provider", "id"]), false, true, true, true),
         tool("connect_monitoring_all", "Connect monitoring for all", "Monitoring sign-ins for every account without monitoring, queued one after another (one terminal at a time, never in parallel); each waits for the user to sign in as the account named in Settings and the queue stops at the first that fails. Without confirm: true it only returns the accounts it would queue (to_connect); with it, it starts the queue and returns at once. Only when the user asked.",
             schema(json!({ "confirm": { "type": "boolean", "description": "Start the queue (default false: only list the accounts)." } }), &[]), false, false, false, true),
         tool("remove_lapsed_accounts", "Remove lapsed accounts", "Remove every saved account whose plan has ended: its last paid day (subscriptions cancel_after) has passed, or the provider said it would not renew and its end has passed. Accounts in use are never removed (in_use). Without confirm: true it only returns what it would remove (to_remove, each with the day it ended); with it, it removes them as remove_account does, revoking their monitoring sign-ins. Only when the user asked.",
@@ -198,12 +207,13 @@ fn request(name: &str, args: &Value) -> Option<Result<Request, String>> {
         "refresh_usage" => simple("refresh"),
         "get_settings" => simple("get_settings"),
         "get_subscription_report" => simple("get_subscriptions"),
+        "get_plan_advice" => simple("get_plan_advice"),
         "get_health" => simple("get_health"),
         "get_usage_breakdown" => with("get_usage_breakdown"),
         "export_csv" => with("export_csv"),
         "update_settings" => with("update_settings"),
         "switch_account" | "add_account" | "connect_monitoring" | "disconnect_monitoring" | "remove_account" => with(name),
-        "connect_monitoring_all" | "remove_lapsed_accounts" | "set_project_pin" => with(name),
+        "connect_monitoring_all" | "remove_lapsed_accounts" | "set_project_pin" | "revoke_account_sessions" => with(name),
         "list_project_pins" => simple("list_project_pins"),
         "check_for_updates" => simple("check_for_updates"),
         "install_update" => simple("install_update"),
@@ -463,7 +473,7 @@ mod tests {
     fn every_listed_tool_maps_to_a_door_operation() {
         let listed = rpc(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).unwrap();
         let tools = listed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 31);
+        assert_eq!(tools.len(), 33);
         let account = json!({ "provider": "claude", "id": "a1" });
         for t in tools {
             let name = t["name"].as_str().unwrap();
@@ -475,7 +485,7 @@ mod tests {
                 "inspect_window" => json!({ "window": "settings", "page": "subscriptions" }),
                 "open_billing_page" => json!({ "provider": "codex" }),
                 "recommend_account" => json!({ "provider": "claude", "expected_percent": 30, "hours": 6 }),
-                "switch_account" | "connect_monitoring" | "disconnect_monitoring" | "remove_account" => account.clone(),
+                "switch_account" | "connect_monitoring" | "disconnect_monitoring" | "remove_account" | "revoke_account_sessions" => account.clone(),
                 "set_project_pin" => json!({ "folder": "C:/code/repo", "provider": "claude", "id": "a1" }),
                 _ => json!({}),
             };
@@ -487,11 +497,13 @@ mod tests {
         let rec = tool("recommend_account", json!({ "provider": "codex" }), None);
         assert_eq!(rec["result"]["structuredContent"]["switch"], false, "recommend_account only reports by default");
         let marked = |hint: &str| -> Vec<&str> { tools.iter().filter(|t| t["annotations"][hint] == true).map(|t| t["name"].as_str().unwrap()).collect() };
-        assert_eq!(marked("destructiveHint"), ["recommend_account", "refresh_usage", "update_settings", "switch_account", "disconnect_monitoring", "remove_account", "remove_lapsed_accounts", "set_project_pin", "install_update", "quit_app"]);
+        assert_eq!(marked("destructiveHint"), ["recommend_account", "refresh_usage", "update_settings", "switch_account", "disconnect_monitoring", "remove_account", "revoke_account_sessions", "remove_lapsed_accounts", "set_project_pin", "install_update", "quit_app"]);
         assert_eq!(tool("remove_lapsed_accounts", json!({}), None)["result"]["structuredContent"], json!({ "op": "remove_lapsed_accounts", "confirm": false }), "bulk tools only report by default");
         assert_eq!(tool("connect_monitoring_all", json!({}), None)["result"]["structuredContent"], json!({ "op": "connect_monitoring_all", "confirm": false }));
+        assert_eq!(tool("revoke_account_sessions", json!({ "provider": "codex", "id": "a1" }), None)["result"]["structuredContent"],
+            json!({ "op": "revoke_account_sessions", "provider": "codex", "id": "a1", "confirm": false, "remove_slot": false }), "revoking only reports by default");
         assert_eq!(tool("set_project_pin", json!({ "folder": "C:/a", "provider": "codex", "id": null }), None)["result"]["structuredContent"]["id"], Value::Null);
-        assert_eq!(marked("readOnlyHint"), ["get_usage", "get_headroom", "get_settings", "get_subscription_report", "get_usage_breakdown", "get_health", "list_project_pins", "check_for_updates", "get_app_info", "inspect_window", "list_sharing_locations", "list_diagnostic_exports"]);
+        assert_eq!(marked("readOnlyHint"), ["get_usage", "get_headroom", "get_settings", "get_subscription_report", "get_plan_advice", "get_usage_breakdown", "get_health", "list_project_pins", "check_for_updates", "get_app_info", "inspect_window", "list_sharing_locations", "list_diagnostic_exports"]);
     }
 
     #[test]
@@ -508,6 +520,8 @@ mod tests {
             ("get_headroom", json!({ "provider": "claude", "window": "weekly" })),
             ("set_project_pin", json!({ "folder": "C:/a" })),
             ("remove_lapsed_accounts", json!({ "confirm": "yes" })),
+            ("revoke_account_sessions", json!({ "provider": "claude" })),
+            ("revoke_account_sessions", json!({ "provider": "claude", "id": "a", "confirm": 1 })),
             ("list_project_pins", json!({ "folder": "C:/a" })),
             ("get_usage_breakdown", json!({ "group_by": "hour" })),
             ("export_csv", json!({ "path": "C:\\x" })),
