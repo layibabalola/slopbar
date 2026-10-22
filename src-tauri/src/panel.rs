@@ -150,12 +150,14 @@ fn show(app: &AppHandle) {
     let _ = win.set_theme(Some(theme));
     place(app);
     let _ = win.show();
+    set_webview_visible(&win, true);
     let _ = win.set_focus();
     let _ = app.emit("panel-visible", true);
 }
 
 fn hide(app: &AppHandle) {
     if let Some(win) = app.get_webview_window(LABEL) {
+        set_webview_visible(&win, false);
         let _ = win.hide();
     }
     *app.state::<AppState>().panel_hidden_at.lock().unwrap() = Some(Instant::now());
@@ -170,6 +172,23 @@ pub fn close(app: &AppHandle) {
 pub fn on_blur(app: &AppHandle) {
     hide(app);
 }
+
+/// Tells the flyout's webview it is (or is no longer) on screen. Showing the window alone can leave
+/// a webview that was built hidden, and stayed hidden, not drawing: the flyout then opens as an
+/// empty panel. `inspect` does the same when it shows a hidden window off-screen.
+#[cfg(windows)]
+fn set_webview_visible(win: &tauri::WebviewWindow, visible: bool) {
+    let _ = win.with_webview(move |w| unsafe {
+        let controller = w.controller();
+        let _ = controller.SetIsVisible(visible);
+        if visible {
+            let _ = controller.NotifyParentWindowPositionChanged();
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn set_webview_visible(_win: &tauri::WebviewWindow, _visible: bool) {}
 
 /// Rounded corners like every Windows 11 flyout (undecorated windows are square by default).
 #[cfg(windows)]
