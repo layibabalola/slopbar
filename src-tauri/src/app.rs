@@ -193,6 +193,19 @@ fn get_subscriptions(state: tauri::State<AppState>) -> subscriptions::Report {
     subscription_report(&state)
 }
 
+/// Each account's weekly usage over the last 7 days, for the sparklines (see
+/// `subscriptions::sparklines`), keyed `provider:id`.
+#[tauri::command]
+fn get_sparklines(state: tauri::State<AppState>) -> HashMap<String, Vec<(i64, f64)>> {
+    subscriptions::sparklines(&state.usage_history.lock().unwrap(), chrono::Utc::now())
+}
+
+/// Esc in the flyout closes it.
+#[tauri::command]
+fn hide_panel(app: AppHandle) {
+    panel::close(&app);
+}
+
 /// The plan notifications due now (see `plan_alerts`), each returned once. The taskbar widget
 /// asks after every refresh and words them in the user's language.
 #[tauri::command]
@@ -1924,6 +1937,8 @@ pub fn run() {
             get_health,
             restart_app,
             get_subscriptions,
+            get_sparklines,
+            hide_panel,
             get_usage_breakdown,
             export_csv,
             csv_default_folder,

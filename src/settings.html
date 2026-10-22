@@ -13,7 +13,7 @@
     <button id="close" class="caption" data-i18n-title="close">&#xE8BB;</button>
   </div>
   <div class="shell">
-  <nav class="sidebar">
+  <nav class="sidebar" data-i18n-aria="settingsPages">
     <button class="nav active" data-page="accounts">
       <svg viewBox="0 0 20 20"><circle cx="8" cy="7" r="3"/><path d="M2.5 16.5c.6-3 2.8-4.5 5.5-4.5s4.9 1.5 5.5 4.5"/><path d="M13 4.2a3 3 0 0 1 0 5.6M15 12.4c1.3.6 2.1 1.9 2.5 4.1"/></svg>
       <span data-i18n="sAccounts"></span>
@@ -50,6 +50,7 @@
     <!-- Accounts -->
     <section class="page active" id="page-accounts">
       <header><h1 data-i18n="sAccounts"></h1><p data-i18n="descAccounts"></p></header>
+      <section class="guide" id="guide" aria-labelledby="guide-title" hidden></section>
       <div id="accounts"></div>
       <p class="hint notice" id="add-hint" hidden data-i18n="addHint"></p>
 
@@ -274,6 +275,14 @@
         <div class="row">
           <label for="startup" data-i18n="sStartup"></label>
           <input type="checkbox" class="switch" id="startup" />
+        </div>
+        <div class="row">
+          <div class="title"><label for="compact-flyout" data-i18n="compactFlyout"></label><small id="compact-flyout-hint"></small></div>
+          <input type="checkbox" class="switch" id="compact-flyout" />
+        </div>
+        <div class="row">
+          <div class="title"><label for="guide-reopen" data-i18n="guideReopen"></label><small data-i18n="guideReopenHint"></small></div>
+          <button class="btn" id="guide-reopen" data-i18n="guideReopenButton"></button>
         </div>
         <div class="row">
           <div class="title"><label for="hotkey" data-i18n="switcherShortcut"></label><small id="hotkey-hint"></small></div>

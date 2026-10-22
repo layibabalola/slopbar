@@ -1,3 +1,5 @@
+// The MCP settings schema is one large json! literal; the default macro recursion limit (128) is too low.
+#![recursion_limit = "256"]
 #![cfg_attr(not(feature = "desktop"), allow(dead_code))]
 mod accounts;
 mod login;

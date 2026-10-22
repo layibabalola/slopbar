@@ -22,6 +22,7 @@ body.switcher { padding: 0; }
   user-select: text;
 }
 #query:focus { border-bottom-color: var(--ok); }
+#query:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
 #results { list-style: none; padding: 0 6px; margin: 0; overflow-y: auto; flex: 1; }
 #results li {
   display: flex;

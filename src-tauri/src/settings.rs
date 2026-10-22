@@ -160,6 +160,13 @@ pub struct Settings {
     pub burn: Burn,
     /// Forwarding a few notifications to the user's phone (see `phone`). Off by default.
     pub phone: Phone,
+    /// The flyout lists one line per account (provider mark, name, %, sparkline).
+    pub compact_flyout: bool,
+    /// The flyout offered the compact layout (it does above 8 accounts) and the user answered;
+    /// it is not offered again.
+    pub compact_suggested: bool,
+    /// The first-run guide in Settings was closed; General opens it again.
+    pub onboarding_dismissed: bool,
 }
 
 /// Phone alerts through a push service (ntfy). The access token is not here: it is kept with
@@ -259,6 +266,9 @@ impl Default for Settings {
             spend: SpendDisplay::default(),
             burn: Burn::default(),
             phone: Phone::default(),
+            compact_flyout: false,
+            compact_suggested: false,
+            onboarding_dismissed: false,
         }
     }
 }
@@ -300,7 +310,7 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
 /// `project_pins` has its own operations (see `pins`).
-const PATCHABLE: [&str; 20] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "spend", "burn", "phone"];
+const PATCHABLE: [&str; 23] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed"];
 
 /// Modifier names a shortcut may use, as the Settings window writes them.
 const HOTKEY_MODIFIERS: [&str; 4] = ["Ctrl", "Alt", "Shift", "Win"];

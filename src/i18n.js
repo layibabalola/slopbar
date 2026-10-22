@@ -2,6 +2,44 @@
 // Missing languages and keys fall back to English.
 const MESSAGES = {
   en: {
+    sparkText: "Weekly usage, last 7 days: {from}% to {to}%, peak {peak}%",
+    sparkNone: "No weekly usage readings in the last 7 days yet",
+    compactOffer: "{n} accounts make a long list. The compact layout shows each on one line.",
+    compactOfferYes: "Use compact layout",
+    compactOfferNo: "Not now",
+    compactFlyout: "Compact flyout",
+    compactFlyoutHint: "One line per account: provider, name, % used and a 7-day sparkline.",
+    compactFlyoutSuggested: "One line per account: provider, name, % used and a 7-day sparkline. Suggested for your {n} accounts.",
+    guideTitle: "Set up SlopBar",
+    guideIntro: "A few steps to see every account's usage. SlopBar never signs in for you: each sign-in opens the provider's own page or CLI, and you finish it yourself.",
+    guideClose: "Close the guide",
+    guideDone: "Done",
+    guideReopen: "Setup guide",
+    guideReopenHint: "The first-run steps: accounts, monitoring, sharing and notifications.",
+    guideReopenButton: "Show guide",
+    guideStepDone: "Done",
+    guideStepTodo: "To do",
+    guideStepOptional: "Optional",
+    guideFindTitle: "Accounts found",
+    guideFound: "Found {claude} Claude and {codex} Codex accounts signed in on this PC.",
+    guideFoundNone: "No accounts yet. Sign in once with the official CLI (claude /login or codex login) in a terminal, or use Add account below: SlopBar opens the CLI's sign-in and saves the account when you finish.",
+    guideMonitorTitle: "Connect monitoring",
+    guideMonitorBody: "Monitoring reads each account's usage through its own sign-in, which you approve once in the browser.",
+    guideMonitorCount: "{n} of {total} accounts monitored.",
+    guideMonitorAll: "Every account is monitored.",
+    guideAutoOn: "Connect automatically is on: once an account without monitoring has been in use for 3 minutes, SlopBar starts its sign-in and shows a notification. You still approve it in the browser.",
+    guideAutoOff: "Connect automatically is off (Data). Turn it on to have SlopBar start each account's monitoring sign-in once it has been in use for 3 minutes.",
+    guideShareTitle: "Share in-use status",
+    guideShareBody: "Pick a folder your computers sync (OneDrive, Dropbox, Google Drive…) or an rclone remote, so each PC sees which account the others use. Only hashes are shared.",
+    guideShareLabel: "Sharing location",
+    guideShareOther: "Another folder… (Data)",
+    guideNotifyTitle: "Turn on key notifications",
+    guideNotifyBody: "These matter most; the rest are under Notifications.",
+    onAccount: "{action}: {name}",
+    removeAccountNamed: "Remove {name}",
+    resetsHeld: "{n} usage-limit resets held",
+    healthOk: "OK", healthWarning: "Warning", healthProblem: "Problem",
+    settingsPages: "Settings pages",
     openSwitcher: "Quick switcher",
     switcherPlaceholder: "Switch to… type an email, nickname or provider",
     switcherHint: "↑↓ choose · Enter switch · Esc close",
@@ -852,5 +890,10 @@ export function time(iso) {
 /** Fills static markup: elements with data-i18n get text, data-i18n-title get a tooltip. */
 export function translateDom(root = document) {
   root.querySelectorAll("[data-i18n]").forEach((el) => (el.textContent = t(el.dataset.i18n)));
-  root.querySelectorAll("[data-i18n-title]").forEach((el) => (el.title = t(el.dataset.i18nTitle)));
+  // A title is also the accessible name of an icon-only button.
+  root.querySelectorAll("[data-i18n-title]").forEach((el) => {
+    el.title = t(el.dataset.i18nTitle);
+    if (!el.dataset.i18n) el.setAttribute("aria-label", el.title);
+  });
+  root.querySelectorAll("[data-i18n-aria]").forEach((el) => el.setAttribute("aria-label", t(el.dataset.i18nAria)));
 }
