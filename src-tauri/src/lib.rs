@@ -10,6 +10,8 @@ mod monitoring;
 mod private_store;
 mod diagnostics;
 mod subscriptions;
+mod headroom;
+mod plan_alerts;
 mod codex_local;
 mod presence;
 mod rclone;

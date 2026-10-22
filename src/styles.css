@@ -168,6 +168,7 @@ body.panel #accounts { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollba
 .bar { height: 4px; border-radius: 2px; background: var(--track); overflow: hidden; margin: 5px 0 3px; }
 .bar > div { height: 100%; border-radius: 2px; }
 .reset { font-size: 11px; color: var(--text-2); }
+.reset.runs-out { color: var(--warn); margin-top: 2px; }
 .error { color: var(--warn); font-size: 12px; margin-top: 4px; }
 .empty { color: var(--text-2); padding: 4px 0 2px; }
 

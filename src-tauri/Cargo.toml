@@ -56,5 +56,5 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphic
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_UI_Accessibility", "Win32_UI_Shell"] }
 # The webview Tauri already uses, to read and capture a window for agents without showing it.
 webview2-com = { version = "0.38", optional = true }
-# Toasts with buttons (the notification plugin has none on desktop); already in the plugin's tree.
+# The toast the notification plugin shows, used directly where a click must open Settings.
 tauri-winrt-notification = { version = "0.8", optional = true }

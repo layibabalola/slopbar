@@ -485,7 +485,8 @@ mod tests {
             monitor_connected: true,
             billing: Default::default(),
             remote: vec![],
-            used_outside: false, unexpected: None,
+            used_outside: false,
+            runs_out_at: None, unexpected: None,
         }
     }
 

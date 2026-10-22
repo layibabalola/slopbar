@@ -51,6 +51,10 @@ pub struct AccountUsage {
     /// machine, the web or the desktop app.
     #[serde(default)]
     pub used_outside: bool,
+    /// When the weekly limit runs out at the current rate, when that is before it resets
+    /// (`subscriptions::forecast`). Never set from a stale reading.
+    #[serde(default)]
+    pub runs_out_at: Option<DateTime<Utc>>,
     /// Use seen while none of the user's computers had it signed in (see `unexpected`), when
     /// there was any this week.
     #[serde(default)]
