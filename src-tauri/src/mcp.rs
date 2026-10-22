@@ -15,9 +15,9 @@ const LIST_LIMIT: usize = 20;
 /// Longest string passed back to the agent; provider-set text (organization names) can be long.
 const MAX_TEXT: usize = 512;
 
-const INSTRUCTIONS: &str = "SlopBar shows Claude and Codex account usage and switches accounts. These tools \
-act on the running SlopBar app exactly like its Settings window. Read-only tools (get_usage, get_settings, \
-get_subscription_report, inspect_window, list_sharing_locations, get_app_info, list_diagnostic_exports) are always fine. To see SlopBar's \
+const INSTRUCTIONS: &str = "SlopBar Ultra shows Claude and Codex account usage and switches accounts. These tools \
+act on the running SlopBar Ultra app exactly like its Settings window. Read-only tools (get_usage, get_settings, \
+get_subscription_report, inspect_window, list_sharing_locations, get_app_info, list_diagnostic_exports) are always fine. To see SlopBar Ultra's \
 windows use inspect_window, never screenshots or control of the user's desktop. Call any tool that changes something (update_settings, \
 switch_account, add_account, connect_monitoring, disconnect_monitoring, remove_account, refresh_usage, \
 install_update, export_diagnostics, open_settings, quit_app, restart_app) only when the user asked for that action in this \
@@ -27,7 +27,7 @@ account tools. add_account and connect_monitoring open the official CLI sign-in 
 sign in, type credentials or approve prompts yourself. switch_account changes which account the CLI uses, \
 which affects running agent sessions, including possibly your own. remove_account and disconnect_monitoring \
 revoke saved sign-ins. Diagnostics exports exclude emails, tokens and raw provider bodies; they are for local \
-analysis and manual sharing only, never upload them on your own. SlopBar cannot cancel or change a paid plan \
+analysis and manual sharing only, never upload them on your own. SlopBar Ultra cannot cancel or change a paid plan \
 and no tool does: get_subscription_report only says which plans look unneeded, and the user cancels on the \
 provider's own billing page.";
 
@@ -61,7 +61,7 @@ fn settings_patch_schema() -> Value {
         "aliases": { "type": "object", "description": "Display names keyed \"provider:id\" (ids from get_usage); null removes one.", "additionalProperties": { "type": ["string", "null"] } },
         "balancer": both(rule),
         "notifications": { "type": "object", "properties": { "usage": { "type": "boolean" }, "resets": { "type": "boolean" }, "switches": { "type": "boolean" } } },
-        "presence_folder": { "type": ["string", "null"], "description": "An existing folder the user syncs between machines (OneDrive, Dropbox, Google Drive, iCloud Drive, Box) where SlopBar shares which accounts are in use, as hashes only; null turns sharing off. Change it only when the user asks." },
+        "presence_folder": { "type": ["string", "null"], "description": "An existing folder the user syncs between machines (OneDrive, Dropbox, Google Drive, iCloud Drive, Box) where SlopBar Ultra shares which accounts are in use, as hashes only; null turns sharing off. Change it only when the user asks." },
         "presence_remote": { "type": ["string", "null"], "description": "An rclone remote name (from `rclone listremotes`, no colon) to share in-use status through instead of a folder; it takes precedence over presence_folder. null turns it off. Change it only when the user asks." },
         "subscriptions": { "type": "object", "description": "Plan details keyed \"provider:id\" (ids from get_usage); null removes one. cancel_after is the last paid day of a plan the user is letting lapse: after it, automatic switching skips the account.",
             "additionalProperties": { "type": ["object", "null"], "additionalProperties": false, "properties": {
@@ -89,9 +89,9 @@ fn catalog() -> Vec<Tool> {
     let none = || schema(json!({}), &[]);
     let tool = |name, title, description, input, read_only, destructive, idempotent, open_world| Tool { name, title, description, input, read_only, destructive, idempotent, open_world };
     vec![
-        tool("get_usage", "Get account usage", "Every Claude and Codex account SlopBar knows: provider, id, email, plan, which one is in use on this machine (active, sources), on the user's other machines (remote: machine, where, seen_at, live — shared through presence_folder or presence_remote) and whether usage is rising outside this PC (used_outside), usage windows (percent used, reset time), banked resets, monitoring state and errors, as last refreshed.", none(), true, false, true, false),
+        tool("get_usage", "Get account usage", "Every Claude and Codex account SlopBar Ultra knows: provider, id, email, plan, which one is in use on this machine (active, sources), on the user's other machines (remote: machine, where, seen_at, live — shared through presence_folder or presence_remote) and whether usage is rising outside this PC (used_outside), usage windows (percent used, reset time), banked resets, monitoring state and errors, as last refreshed.", none(), true, false, true, false),
         tool("refresh_usage", "Refresh usage", "Poll every account's usage now (as the tray's Refresh does) and return the new snapshot. If automatic switching is on and a threshold is reached, this can switch accounts.", none(), false, true, false, true),
-        tool("get_settings", "Get settings", "SlopBar's settings: refresh interval, providers, language, launch at login, updates, account aliases, automatic switching rules and notifications.", none(), true, false, true, false),
+        tool("get_settings", "Get settings", "SlopBar Ultra's settings: refresh interval, providers, language, launch at login, updates, account aliases, automatic switching rules and notifications.", none(), true, false, true, false),
         tool("get_subscription_report", "Get subscription report", "Per account: plan, this week's usage and pace, the last four completed weeks (how many reached the limit, average and median peak), a verdict (insufficient_data, exhausted_weekly, healthy, underused or unused), whether renewing looks unneeded, the next renewal with its source (entered, provider or estimated) and the monthly cost; plus totals per provider. A verdict needs at least two well-observed weeks. Codex accounts also carry idle_now (no use anywhere in the past seven days) and local: what the Codex CLI on this PC shows (last_local_activity, days_idle, never_seen, attributed_since, threads and tokens over 7 and 28 days and per ISO week, backfilled_weeks). A long-idle Codex plan can be judged unused from that local history; such verdicts have basis local_codex, and use in WSL, on other machines or in the cloud is not seen locally.", none(), true, false, true, false),
         tool("update_settings", "Update settings", "Change settings with a JSON merge patch over get_settings' shape, e.g. {\"refresh_minutes\": 15, \"balancer\": {\"claude\": {\"auto\": true, \"threshold\": 85}}}. Only values the Settings window offers are accepted. Returns the saved settings.", settings_patch_schema(), false, true, true, false),
         tool("switch_account", "Switch account", "Make this saved account the one the provider's CLI uses (as Use in Settings). Running agent sessions on that CLI are affected. Returns the new snapshot and switched_to_requested (false if automatic switching moved away again).", account_schema(), false, true, true, true),
@@ -100,23 +100,23 @@ fn catalog() -> Vec<Tool> {
         tool("connect_monitoring", "Connect monitoring", "Start a separate monitoring sign-in for this account (the user completes it) so its usage stays visible while it is not in use. Returns at once; check get_usage afterwards.", account_schema(), false, false, false, true),
         tool("disconnect_monitoring", "Disconnect monitoring", "Stop independent monitoring for this account and revoke its monitoring sign-in. Returns the new snapshot and whether the provider confirmed the revocation.", account_schema(), false, true, true, true),
         tool("remove_account", "Remove account", "Remove a saved account that is not in use, revoking its monitoring sign-in. Returns the new usage snapshot.", account_schema(), false, true, true, true),
-        tool("check_for_updates", "Check for updates", "Check for a newer SlopBar release (only builds with automatic updates).", none(), true, false, true, true),
-        tool("install_update", "Install update", "Download and install the available SlopBar update; SlopBar restarts shortly after replying.", none(), false, true, false, true),
-        tool("get_app_info", "Get app info", "SlopBar's version, build (commit, dirty flag) and whether automatic updates are available.", none(), true, false, true, false),
-        tool("inspect_window", "Inspect a SlopBar window", "The visible text of the Settings window (optionally on one page) or the taskbar flyout, and the local path of a PNG of it that you can read. A closed window is drawn off-screen without focus or a taskbar button and hidden again, and a page chosen for the look is switched back, so the user sees nothing change. The PNG shows account emails; it stays on this machine (the last 10 are kept).",
+        tool("check_for_updates", "Check for updates", "Check for a newer SlopBar Ultra release (only builds with automatic updates).", none(), true, false, true, true),
+        tool("install_update", "Install update", "Download and install the available SlopBar Ultra update; SlopBar Ultra restarts shortly after replying.", none(), false, true, false, true),
+        tool("get_app_info", "Get app info", "SlopBar Ultra's version, build (commit, dirty flag) and whether automatic updates are available.", none(), true, false, true, false),
+        tool("inspect_window", "Inspect a SlopBar Ultra window", "The visible text of the Settings window (optionally on one page) or the taskbar flyout, and the local path of a PNG of it that you can read. A closed window is drawn off-screen without focus or a taskbar button and hidden again, and a page chosen for the look is switched back, so the user sees nothing change. The PNG shows account emails; it stays on this machine (the last 10 are kept).",
             schema(json!({
                 "window": { "type": "string", "enum": ["settings", "flyout"] },
                 "page": { "type": "string", "enum": crate::door::SETTINGS_PAGES, "description": "Settings only: the page to show." },
                 "screenshot": { "type": "boolean", "description": "Also write a PNG (default true)." },
             }), &["window"]), true, false, true, false),
-        tool("list_sharing_locations", "List sharing locations", "Where SlopBar can share which accounts are in use with the user's other computers: sync folders it detected (OneDrive, Dropbox, Google Drive, iCloud Drive, Box) and the user's rclone remotes (name and type), plus the current choice. Turn sharing on with update_settings: presence_remote for an rclone remote, or presence_folder for a folder.", none(), true, false, true, false),
-        tool("open_billing_page", "Open billing page", "Open the provider's own billing page (where a plan is managed or cancelled) in the user's browser. SlopBar cannot cancel a plan; the user does it on that page. Use only when the user asks.",
+        tool("list_sharing_locations", "List sharing locations", "Where SlopBar Ultra can share which accounts are in use with the user's other computers: sync folders it detected (OneDrive, Dropbox, Google Drive, iCloud Drive, Box) and the user's rclone remotes (name and type), plus the current choice. Turn sharing on with update_settings: presence_remote for an rclone remote, or presence_folder for a folder.", none(), true, false, true, false),
+        tool("open_billing_page", "Open billing page", "Open the provider's own billing page (where a plan is managed or cancelled) in the user's browser. SlopBar Ultra cannot cancel a plan; the user does it on that page. Use only when the user asks.",
             schema(json!({ "provider": { "type": "string", "enum": ["claude", "codex"] } }), &["provider"]), false, false, true, true),
-        tool("open_settings", "Open Settings window", "Show SlopBar's Settings window on the user's screen.", none(), false, false, true, false),
-        tool("quit_app", "Quit SlopBar", "Quit SlopBar as its tray menu's Quit does. Monitoring stops until SlopBar is started again; these tools cannot start it.", none(), false, true, false, false),
-        tool("restart_app", "Restart SlopBar", "Quit SlopBar cleanly and start the installed executable again, e.g. to pick up a newly installed build. The tools are unavailable for a few seconds.", none(), false, false, false, false),
+        tool("open_settings", "Open Settings window", "Show SlopBar Ultra's Settings window on the user's screen.", none(), false, false, true, false),
+        tool("quit_app", "Quit SlopBar Ultra", "Quit SlopBar Ultra as its tray menu's Quit does. Monitoring stops until SlopBar Ultra is started again; these tools cannot start it.", none(), false, true, false, false),
+        tool("restart_app", "Restart SlopBar Ultra", "Quit SlopBar Ultra cleanly and start the installed executable again, e.g. to pick up a newly installed build. The tools are unavailable for a few seconds.", none(), false, false, false, false),
         tool("export_diagnostics", "Export diagnostics", "Write a diagnostics export (as Settings > Data > Export, without opening a folder) and return its local path and size; a repeat within 30 seconds returns the same export. Read the file to analyze it.", none(), false, false, false, false),
-        tool("list_diagnostic_exports", "List diagnostics exports", "The most recent diagnostics exports, newest first, with paths, sizes and times. Works while SlopBar is closed.", none(), true, false, true, false),
+        tool("list_diagnostic_exports", "List diagnostics exports", "The most recent diagnostics exports, newest first, with paths, sizes and times. Works while SlopBar Ultra is closed.", none(), true, false, true, false),
     ]
 }
 
@@ -206,15 +206,15 @@ fn sanitize(value: Value) -> Value {
 /// Plain-language text for door and app error codes; anything else is passed on, sanitized.
 fn explain(error: &str) -> String {
     match error {
-        "not_running" => "SlopBar is not running, or the running copy predates this agent door. Start (or restart) SlopBar, then try again; these tools never start it.".into(),
-        "door_untrusted" => "The process answering on SlopBar's door is not SlopBar running as this Windows user, so it was not trusted. Restart SlopBar.".into(),
-        "door_unavailable" => "SlopBar's door could not be reached (if SlopBar runs as administrator, its tools need an elevated agent). Try again shortly.".into(),
-        "unsupported_request" => "The running SlopBar is a different version that does not understand this request. Restart SlopBar after updating.".into(),
-        "bad_door_reply" => "SlopBar gave an unusable answer. Restart SlopBar and try again.".into(),
-        "timeout" => "SlopBar has not finished yet (it keeps going). Check get_usage shortly instead of repeating the action.".into(),
-        "diagnostic_storage" => "SlopBar could not write the export (disk or file access problem).".into(),
-        "unsupported_platform" => "These tools need SlopBar on Windows.".into(),
-        "no_config_directory" => "The SlopBar data folder could not be located.".into(),
+        "not_running" => "SlopBar Ultra is not running, or the running copy predates this agent door. Start (or restart) SlopBar Ultra, then try again; these tools never start it.".into(),
+        "door_untrusted" => "The process answering on SlopBar Ultra's door is not SlopBar Ultra running as this Windows user, so it was not trusted. Restart SlopBar.".into(),
+        "door_unavailable" => "SlopBar Ultra's door could not be reached (if SlopBar Ultra runs as administrator, its tools need an elevated agent). Try again shortly.".into(),
+        "unsupported_request" => "The running SlopBar Ultra is a different version that does not understand this request. Restart SlopBar Ultra after updating.".into(),
+        "bad_door_reply" => "SlopBar Ultra gave an unusable answer. Restart SlopBar Ultra and try again.".into(),
+        "timeout" => "SlopBar Ultra has not finished yet (it keeps going). Check get_usage shortly instead of repeating the action.".into(),
+        "diagnostic_storage" => "SlopBar Ultra could not write the export (disk or file access problem).".into(),
+        "unsupported_platform" => "These tools need SlopBar Ultra on Windows.".into(),
+        "no_config_directory" => "The SlopBar Ultra data folder could not be located.".into(),
         "export_folder_unreadable" => "The diagnostics export folder could not be read.".into(),
         "active" => "That account is in use; switch to another account before removing it.".into(),
         "monitor_busy" => "Another operation on that account (or a sign-in for that provider) is in progress. Try again when it finishes.".into(),
@@ -278,7 +278,7 @@ fn step(message: &Value, exports: &dyn Fn() -> Option<std::path::PathBuf>, cance
             Ok(json!({
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": "slopbar", "title": "SlopBar", "version": env!("CARGO_PKG_VERSION") },
+                "serverInfo": { "name": "slopbar", "title": "SlopBar Ultra", "version": env!("CARGO_PKG_VERSION") },
                 "instructions": INSTRUCTIONS,
             }))
         }

@@ -431,7 +431,7 @@ listen("usage-updated", loadSubscriptions);
 async function render() {
   setLanguage(settings.language);
   translateDom();
-  document.title = `SlopBar · ${t("settings")}`;
+  document.title = `SlopBar Ultra · ${t("settings")}`;
 
   $("refresh").innerHTML = REFRESH_OPTIONS.map((n) => `<option value="${n}">${t("minutes", { n })}</option>`).join("");
   $("refresh").value = String(settings.refresh_minutes);

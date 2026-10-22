@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "dock",
-        "title": "SlopBar",
+        "title": "SlopBar Ultra",
         "url": "index.html",
         "width": 160,
         "height": 48,
@@ -26,7 +26,7 @@
       },
       {
         "label": "panel",
-        "title": "SlopBar",
+        "title": "SlopBar Ultra",
         "url": "index.html",
         "width": 380,
         "height": 320,
@@ -45,7 +45,7 @@
       },
       {
         "label": "settings",
-        "title": "SlopBar",
+        "title": "SlopBar Ultra",
         "url": "settings.html",
         "width": 1000,
         "height": 700,

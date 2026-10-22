@@ -2,13 +2,16 @@
 
 <img src="design/icon.png" width="112" alt="SlopBar icon" />
 
-# SlopBar
+# SlopBar Ultra
 
 Your Claude Code and Codex plan limits, right in the Windows taskbar, next to the clock.
 
 <!-- TODO: screenshot of the taskbar widget and its flyout -->
 
 </div>
+
+> [!NOTE]
+> SlopBar Ultra is a fork of [SlopBar](https://github.com/thelioo/slopbar). It adds subscription value tracking, Codex inspection, accounts in use on other computers and agent doors. Its features are offered upstream as pull requests.
 
 ## Features
 

@@ -149,7 +149,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::InstallUpdate => {
             let latest = check_for_updates(app.clone()).await?.latest;
             if latest.is_none() {
-                return Ok(serde_json::json!({ "installing": false, "reason": "SlopBar is up to date" }));
+                return Ok(serde_json::json!({ "installing": false, "reason": "SlopBar Ultra is up to date" }));
             }
             // Installing restarts SlopBar: reply first, then install.
             let h = app.clone();
@@ -157,7 +157,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let _ = updates::install(&h).await;
             });
-            Ok(serde_json::json!({ "installing": true, "version": latest, "next": "SlopBar restarts into the new version shortly." }))
+            Ok(serde_json::json!({ "installing": true, "version": latest, "next": "SlopBar Ultra restarts into the new version shortly." }))
         }
         R::GetAppInfo => Ok(serde_json::json!({
             "version": app_version(app.clone()),

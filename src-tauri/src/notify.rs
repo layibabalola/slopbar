@@ -22,7 +22,7 @@ pub fn register_app_id(identifier: &str) {
     }
     let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
     let key = wide(&format!(r"Software\Classes\AppUserModelId\{identifier}"));
-    for (name, value) in [("DisplayName", "SlopBar".to_string()), ("IconUri", icon.display().to_string())] {
+    for (name, value) in [("DisplayName", "SlopBar Ultra".to_string()), ("IconUri", icon.display().to_string())] {
         let data = wide(&value);
         unsafe {
             RegSetKeyValueW(
