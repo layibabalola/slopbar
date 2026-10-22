@@ -39,7 +39,7 @@ upstream PR.
 | 15 | **Self-check panel.** Monitoring sign-ins about to expire, reconnects needed, stale accounts, door and rclone health, each with its one-click fix. | done (ed8d1f6) |
 | 16 | **Telemetry policy.** Local only by default; at most an opt-in crash report inside the existing diagnostics export. Recorded in SECURITY.md and built with item 15. | done (ed8d1f6) |
 
-## Wave 3: queued
+## Wave 3: running
 
 | # | Item |
 |---|---|
@@ -51,6 +51,7 @@ upstream PR.
 | 13 | **Monday digest.** One notification with spend, waste, renewals this week, and accounts that ran out. |
 | 14 | **CSV export** of weekly history. |
 | 21 | **Usage by project and model, per account.** Which repos each account worked in, which models it used and how many tokens each, from local Claude Code and Codex logs; attributed to accounts by the thread record (Codex) or by which account was active at the time (Claude). Added by the owner on 2026-10-21. |
+| 22 | **Auto-connect monitoring.** When an unmonitored account is the one in use, start its monitoring sign-in automatically (one browser approval), with backoff and a setting. Added by the owner on 2026-10-21. |
 | 19 | **Claude Code status line.** The active account's headroom and time-to-limit in the status line. |
 
 ## Done before this roadmap (branch `claude/subscription-value`; upstream thelioo/slopbar#8–#11, stacked on #6)
