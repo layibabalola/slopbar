@@ -8,11 +8,11 @@
 </head>
 <body class="switcher">
   <!-- The quick switcher: type to filter, arrows to move, Enter to switch, Esc to close. -->
-  <div id="palette" role="dialog" aria-labelledby="query">
+  <div id="palette" role="dialog" aria-label="SlopBar Ultra" aria-describedby="switcher-hint">
     <input id="query" type="text" spellcheck="false" autocomplete="off" data-i18n-placeholder="switcherPlaceholder"
       role="combobox" aria-controls="results" aria-expanded="true" />
-    <ul id="results" role="listbox"></ul>
-    <footer id="switcher-hint" class="dim" data-i18n="switcherHint"></footer>
+    <ul id="results" role="listbox" aria-label="SlopBar Ultra"></ul>
+    <footer id="switcher-hint" class="dim" data-i18n="switcherHint" aria-live="polite"></footer>
   </div>
   <script type="module" src="switcher.js"></script>
 </body>

@@ -67,6 +67,10 @@ pub struct AccountUsage {
     /// reported it (see `providers::claude::extra_usage`).
     #[serde(default)]
     pub extra_usage: Option<ExtraUsage>,
+    /// The purpose of the lease reserving this account for a job (see `leases`), set on the
+    /// snapshot the app publishes.
+    #[serde(default)]
+    pub leased: Option<String>,
 }
 
 /// Claude's extra usage: what the account may spend beyond its plan each month, and what it has.

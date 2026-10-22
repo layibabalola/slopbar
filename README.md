@@ -101,6 +101,7 @@ command = 'C:\Users\<you>\AppData\Local\SlopBar\slopbar-mcp.exe'
 | `export_csv` | Write the weekly history, the usage breakdown and the subscription report as CSV files (default `Documents\SlopBar Exports`) and return their paths. |
 | `export_diagnostics`, `list_diagnostic_exports` | Write a diagnostics export (a repeat within 30 seconds returns the same file) or list earlier ones; listing works while SlopBar is closed. |
 | `export_calendar` | Write the plan-renewal calendar (below) now and return its path. |
+| `lease_account`, `release_lease`, `list_leases` | Reserve an account for a job (`purpose`, `minutes`, optionally `expected_percent` or a given `id`): until the lease ends, `recommend_account` lists it as excluded ("leased: …") for everyone else, automatic switching never moves to it and the flyout shows the purpose on its row. A lease switches nothing; it returns the `config_dir` to run the job with. Leases expire (default 2 hours, at most a day) and end when SlopBar quits. |
 
 The server never starts SlopBar, reads credentials or contacts a provider itself: each tool asks the running app, which performs the same action as the matching Settings control. They talk over a named pipe that only the signed-in user and SYSTEM can open and that rejects remote clients. The server checks that the process answering runs as the same Windows user, connects so that process cannot act as the agent's, bounds every reply in size and time, and only passes on an export path inside the export folder. Sign-ins always happen in the CLI's own login, completed by the user. Usage results include account emails, so treat them like the Settings window. `slopbar-mcp.exe` is a separate executable so that app updates, which stop `slopbar.exe`, do not cut agents off mid-session.
 
@@ -116,6 +117,39 @@ The server never starts SlopBar, reads credentials or contacts a provider itself
   }
 }
 ```
+
+### Exact Claude attribution
+
+Claude Code's transcripts do not name the account they ran on, so the usage breakdown otherwise attributes Claude use to the account SlopBar saw signed in at the time (`inferred_from_active_account`), and use from times SlopBar was not watching stays unattributed. `slopbar-mcp.exe --session-hook` is a [SessionStart hook](https://docs.claude.com/en/docs/claude-code/hooks): when a session starts it tells the running app the session id, working folder and `CLAUDE_CONFIG_DIR` (unset means the default login), and the app records which account that config dir is signed in to. The breakdown then attributes that session's transcript, subagents included, to that account (`exact`) ahead of any inference. It prints nothing, waits at most 1.5 seconds for SlopBar and always exits 0, so a closed SlopBar never holds up Claude Code. Only the session id, folder and account id are kept (in `active-accounts.json`, 90 days); no emails. Add this to `~/.claude/settings.json` yourself (SlopBar never edits it):
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "C:/Users/<you>/AppData/Local/SlopBar/slopbar-mcp.exe --session-hook" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Merge it into an existing `hooks` object if you have one. `SLOPBAR_HOOK_DEBUG=1` makes the hook say on stderr what happened.
+
+### Smart launcher (`slopbar-run`)
+
+SlopBar keeps a launcher at `%APPDATA%\dev.thelio.slopbar\bin\slopbar-run.cmd` (Settings > Accounts > Projects shows the exact path). Put that folder on your `PATH`, then:
+
+```
+slopbar-run [claude|codex] [--provider <claude|codex>] [--lease <purpose>] [--percent <n>] [-- <command> [args...]]
+```
+
+- Inside a folder pinned to an account, the command runs on that account's project profile (as before).
+- Anywhere else it asks SlopBar for the account `recommend_account` would pick among those nobody else leased (`--percent`: the share of a week the job needs). When that is not the CLI's current sign-in, it leases the account for as long as the command runs, so the account's project profile stays signed in and other agents keep off it, and sets `CLAUDE_CONFIG_DIR` or `CODEX_HOME` for that one command. `--lease <purpose>` names the job and leases the account even when it is the current sign-in. The lease is released when the command exits (and ends by itself if the launcher is killed).
+- The provider defaults to the command's (`codex` runs Codex, anything else Claude Code); the command defaults to the provider's CLI. Examples: `slopbar-run claude`, `slopbar-run --lease "nightly refactor" -- claude -p "…"`, `slopbar-run -- codex exec "…"`.
+- Without SlopBar running, the command runs on the CLI's current sign-in. `SLOPBAR_RUN_DEBUG=1` says why on stderr.
 
 ### Renewal calendar and Monday digest
 

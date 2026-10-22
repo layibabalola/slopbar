@@ -17,7 +17,7 @@ use std::time::Duration;
 use crate::accounts::Provider;
 
 /// Bumped when the request or reply shape changes.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 /// Requests are one JSON line (a settings patch with aliases is the largest).
 const MAX_REQUEST: u64 = 16 * 1024;
 /// Replies are one JSON line (a usage snapshot is the largest).
@@ -39,6 +39,8 @@ pub enum Request {
     GetSubscriptions,
     /// Plan changes per provider: cancels and downgrades with savings (see `advisor`).
     GetPlanAdvice,
+    /// Accounts seen burning through their week abnormally fast in the past day (see `burn`).
+    GetBurnAlerts,
     /// Tokens by account and repository, model or day from the CLIs' files here (see `usage_index`).
     GetUsageBreakdown {
         #[serde(default)]
@@ -54,6 +56,20 @@ pub enum Request {
     ExportCsv {
         #[serde(default)]
         folder: Option<String>,
+    },
+    /// Settings, usage history and the spend ledger in one file encrypted with the user's
+    /// passphrase (see `backup`). No sign-ins.
+    ExportBackup {
+        #[serde(default)]
+        path: Option<String>,
+        passphrase: crate::backup::Passphrase,
+    },
+    /// Merge a backup file in; with `dry_run` (the default) only says what would change.
+    RestoreBackup {
+        path: String,
+        passphrase: crate::backup::Passphrase,
+        #[serde(default = "yes")]
+        dry_run: bool,
     },
     /// An RFC 7386 merge patch over the current settings (see `settings::patched`).
     UpdateSettings { patch: Value },
@@ -75,6 +91,43 @@ pub enum Request {
         hours: Option<f64>,
         #[serde(default)]
         switch: bool,
+        /// The caller's own lease: its account is not excluded as leased (see `leases`).
+        #[serde(default)]
+        lease_id: Option<String>,
+    },
+    /// Reserve an account of the provider for a job (see `leases`): `id`, else the account
+    /// recommend_account names among those nobody else leased.
+    LeaseAccount {
+        provider: Provider,
+        purpose: String,
+        #[serde(default)]
+        minutes: Option<u32>,
+        #[serde(default)]
+        expected_percent: Option<f64>,
+        #[serde(default)]
+        id: Option<String>,
+    },
+    ReleaseLease { lease_id: String },
+    ListLeases,
+    /// The launcher's pick (`slopbar-run`): the account to run a command on and the config dir
+    /// that uses it. Leases the account for the life of process `pid` when it is not the CLI's
+    /// current sign-in (its project profile must stay signed in) or when `purpose` is given.
+    PickAccount {
+        provider: Provider,
+        pid: u32,
+        #[serde(default)]
+        purpose: Option<String>,
+        #[serde(default)]
+        expected_percent: Option<f64>,
+    },
+    /// Claude Code's SessionStart hook (see `session_hook`): record which account the session's
+    /// config dir (None: the default login) is signed in to.
+    RecordSession {
+        session_id: String,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        config_dir: Option<String>,
     },
     SwitchAccount { provider: Provider, id: String },
     AddAccount { provider: Provider },
@@ -602,6 +655,9 @@ mod vet_tests {
         assert!(parse(r#"{"op":"switch_account","provider":"gemini","id":"x"}"#).is_err());
         assert!(parse(r#"{"op":"remove_account","provider":"claude","id":"x","force":true}"#).is_err());
         assert!(parse(r#"{"op":"read_vault"}"#).is_err());
+        assert!(matches!(parse(r#"{"op":"restore_backup","path":"C:\\b.slopbar-backup","passphrase":"correct horse"}"#), Ok(Request::RestoreBackup { dry_run: true, .. })), "restoring previews by default");
+        let export = parse(r#"{"op":"export_backup","passphrase":"correct horse"}"#).unwrap();
+        assert!(!format!("{export:?}").contains("correct horse"), "a passphrase never reaches debug output");
     }
 }
 

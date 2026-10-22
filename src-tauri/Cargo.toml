@@ -56,12 +56,23 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 zstd = { version = "0.13", default-features = false }
 # Fast substring search over long transcript lines (already in the tree through serde_json).
 memchr = "2"
+# Backups: an AEAD and a password KDF from RustCrypto, never anything home-grown.
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+# Already in the tree through reqwest; named here to check phone-alert URLs.
+url = "2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_RemoteDesktop"] }
 # UI Automation, to find taskbar items that have no window of their own (the Widgets button).
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_UI_Accessibility", "Win32_UI_Shell"] }
 # The webview Tauri already uses, to read and capture a window for agents without showing it.
 webview2-com = { version = "0.38", optional = true }
 # The toast the notification plugin shows, used directly where a click must open Settings.
 tauri-winrt-notification = { version = "0.8", optional = true }
+
+# Argon2 is unusably slow unoptimised; backup tests use the real parameters.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

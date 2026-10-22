@@ -10,7 +10,7 @@
   --bg: #f3f3f3;                                 /* Mica, SolidBackgroundFillColorBase */
   --text: rgba(0, 0, 0, 0.896);
   --dim: rgba(0, 0, 0, 0.62);
-  --faint: rgba(0, 0, 0, 0.446);
+  --faint: rgba(0, 0, 0, 0.6);                   /* darker than WinUI's 0.446 for 4.5:1 (WCAG AA) */
   --card: rgba(255, 255, 255, 0.7);              /* CardBackgroundFillColorDefault */
   --card-stroke: rgba(0, 0, 0, 0.0578);          /* CardStrokeColorDefault */
   --line: rgba(0, 0, 0, 0.0803);                 /* DividerStrokeColorDefault */
@@ -69,6 +69,9 @@ body {
 button { font: inherit; color: inherit; }
 svg { display: block; }
 :focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+}
 /* ScrollBar: a thin rail that widens when hovered. */
 ::-webkit-scrollbar { width: 12px; }
 ::-webkit-scrollbar-thumb { border: 5px solid transparent; border-radius: 6px; background: var(--strong) padding-box; }
@@ -266,6 +269,45 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
 .window-resets { display: flex; flex-direction: column; gap: 4px; font-variant-numeric: tabular-nums; }
 .monitor-state .btn { align-self: flex-start; }
 .meter.stale { opacity: .65; }
+
+/* Sparklines: the weekly window over the last 7 days (sparkline.js). */
+.meter .spark { display: block; width: 100%; height: auto; margin-top: 6px; overflow: visible; }
+.spark-base { stroke: var(--track); stroke-width: 1; fill: none; }
+.spark-line { stroke: var(--dim); stroke-width: 1.3; fill: none; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.spark-dot { fill: var(--dim); }
+.spark-dot.ok { fill: var(--ok); }
+.spark-dot.warn { fill: var(--warn); }
+.spark-dot.bad { fill: var(--bad); }
+
+/* The first-run guide (Accounts) */
+.guide { margin: 0 0 28px; padding: 16px 20px 20px; background: var(--card); border: 1px solid var(--card-stroke); border-radius: 8px; }
+.guide[hidden] { display: none; }
+.guide-head { display: flex; align-items: center; gap: 12px; }
+.guide-head h2 { margin: 0; font-size: 20px; line-height: 28px; }
+.guide-head h2:focus:not(:focus-visible), .page h1:focus:not(:focus-visible) { outline: none; }
+.guide-head .guide-close { margin-left: auto; opacity: 1; }
+.guide-intro { margin: 4px 0 12px; }
+.guide-steps { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 12px; }
+.guide-step { padding: 12px 14px; border-radius: 4px; background: var(--control); border: 1px solid var(--control-stroke); }
+.guide-step-head { display: flex; align-items: center; gap: 10px; }
+.guide-step-head h3 { font-size: 14px; font-weight: 600; }
+.guide-step-head .chip { margin-left: auto; }
+.guide-num {
+  flex: none; display: grid; place-items: center; width: 22px; height: 22px; border-radius: 50%;
+  font-size: 12px; font-weight: 600; border: 1px solid var(--strong-stroke);
+}
+.guide-step.done .guide-num { background: var(--ok); border-color: var(--ok); color: var(--bg); }
+.guide-body { margin: 6px 0 0 32px; display: flex; flex-direction: column; gap: 8px; color: var(--dim); }
+.guide-body .hint { margin: 0; }
+.guide-accounts { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.guide-accounts li { display: flex; align-items: center; gap: 10px; color: var(--text); }
+.guide-accounts .logo { width: 20px; height: 20px; }
+.guide-accounts .logo svg { width: 12px; height: 12px; }
+.guide-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.guide-share { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; color: var(--text); }
+.guide-notify { display: flex; flex-direction: column; gap: 8px; color: var(--text); }
+.guide-notify label { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+.guide-foot { display: flex; justify-content: flex-end; margin-top: 12px; }
 #diagnostics-status { overflow-wrap: anywhere; }
 
 /* Subscriptions */

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::subscriptions::{DateSource, PlanKind, Report};
 
-const VERSION: u8 = 1;
+pub(crate) const VERSION: u8 = 1;
 const MAX_FILE: u64 = 4 << 20;
 /// Months kept: two years, enough for a trailing twelve months and last year's year-to-date.
 const KEEP_MONTHS: usize = 24;
