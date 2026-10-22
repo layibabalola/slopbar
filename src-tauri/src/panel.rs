@@ -3,8 +3,8 @@
 //!
 //! A click must open it at once, like the shell's own flyouts. Building a WebView2 takes
 //! seconds, so the flyout is built hidden shortly after startup (`prepare`) and is only ever
-//! hidden, never destroyed. While hidden, its webview is asked to use as little memory as it can
-//! (WebView2's low memory target), which gives most of the footprint back without the wait.
+//! hidden, never destroyed. (WebView2's low memory target while hidden was tried: the flyout then
+//! showed blank, so it is not used.)
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -44,8 +44,7 @@ pub fn prepare(app: &AppHandle) {
     });
 }
 
-/// Builds the flyout if it is not there, then shows it if a click asked for it meanwhile, or
-/// otherwise leaves it hidden with its memory trimmed.
+/// Builds the flyout if it is not there, then shows it if a click asked for it meanwhile.
 async fn build(app: &AppHandle) {
     if app.get_webview_window(LABEL).is_some() || BUILDING.swap(true, Ordering::AcqRel) {
         return;
@@ -60,10 +59,9 @@ async fn build(app: &AppHandle) {
     }
     BUILDING.store(false, Ordering::Release);
     let Some(win) = built else { return };
+    let _ = win;
     if SHOW_WHEN_BUILT.swap(false, Ordering::AcqRel) {
         show(app);
-    } else if !win.is_visible().unwrap_or(false) {
-        set_low_memory(&win, true);
     }
 }
 
@@ -147,7 +145,6 @@ pub fn toggle(app: &AppHandle) {
 
 fn show(app: &AppHandle) {
     let Some(win) = app.get_webview_window(LABEL) else { return };
-    set_low_memory(&win, false);
     // Flyouts follow the taskbar's theme ("Windows mode"), not the apps' one.
     let theme = if crate::dock::taskbar_is_light() { Theme::Light } else { Theme::Dark };
     let _ = win.set_theme(Some(theme));
@@ -160,7 +157,6 @@ fn show(app: &AppHandle) {
 fn hide(app: &AppHandle) {
     if let Some(win) = app.get_webview_window(LABEL) {
         let _ = win.hide();
-        set_low_memory(&win, true);
     }
     *app.state::<AppState>().panel_hidden_at.lock().unwrap() = Some(Instant::now());
     let _ = app.emit("panel-visible", false);
@@ -174,27 +170,6 @@ pub fn close(app: &AppHandle) {
 pub fn on_blur(app: &AppHandle) {
     hide(app);
 }
-
-/// Asks the flyout's webview to trim its memory while hidden (WebView2's low memory target),
-/// and to use it normally again before it shows. Older WebView2 runtimes ignore it.
-#[cfg(windows)]
-fn set_low_memory(win: &tauri::WebviewWindow, low: bool) {
-    use webview2_com::Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
-    };
-    use windows::core::Interface;
-    let level = if low { COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW } else { COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL };
-    let _ = win.with_webview(move |w| unsafe {
-        if let Ok(core) = w.controller().CoreWebView2() {
-            if let Ok(core) = core.cast::<ICoreWebView2_19>() {
-                let _ = core.SetMemoryUsageTargetLevel(level);
-            }
-        }
-    });
-}
-
-#[cfg(not(windows))]
-fn set_low_memory(_win: &tauri::WebviewWindow, _low: bool) {}
 
 /// Rounded corners like every Windows 11 flyout (undecorated windows are square by default).
 #[cfg(windows)]
