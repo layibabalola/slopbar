@@ -73,6 +73,7 @@ function accountRow(p, a) {
           ${a.active ? `<em class="chip live" title="${esc(places.inUse)}">${t("inUse")}</em>`
             : places.elsewhere ? `<em class="chip elsewhere" title="${esc(places.inUse)}">${esc(places.inUse)}</em>` : ""}
           ${a.used_outside ? `<em class="chip outside" title="${esc(t("usedOutsideHint"))}">${t("usedOutside")}</em>` : ""}
+          ${a.unexpected ? `<em class="chip unexpected" title="${esc(t("unexpectedHint", { t: duration(Math.max(1, Math.round((Date.now() - new Date(a.unexpected.last_seen)) / 60000))) }))}">${esc(t(a.unexpected.seen_week === 1 ? "unexpectedSeenOnce" : "unexpectedSeen", { n: a.unexpected.seen_week }))}</em>` : ""}
           ${a.plan ? `<em class="chip">${esc(a.plan)}</em>` : ""}
           ${resets}
           <span>${esc([a.active && places.elsewhere ? places.inUse : "", ...places.seen, settings.aliases[key] ? a.email ?? "" : a.org ?? ""].filter(Boolean).join(" · "))}</span>
@@ -86,6 +87,9 @@ function accountRow(p, a) {
           ? `<button class="btn" data-monitor="${p}" data-id="${esc(a.id)}">${t(a.monitor_connected ? "monitorReconnect" : "monitorConnect")}</button>`
           : ""}
         ${a.monitor_connected ? `<button class="btn" data-disconnect="${p}" data-id="${esc(a.id)}">${t("monitorDisconnect")}</button>` : ""}
+        ${a.monitor_connected && (settings.presence_folder || settings.presence_remote)
+          ? `<label class="web-use" title="${esc(t("webUseHint"))}"><input type="checkbox" data-web-use="${esc(key)}" ${settings.web_use?.[key] ? "checked" : ""} /> ${t("webUse")}</label>`
+          : ""}
       </div>
       ${meter}
       ${a.active
@@ -215,6 +219,11 @@ $("accounts").addEventListener("change", (e) => {
     if (value) aliases[el.dataset.alias] = value;
     else delete aliases[el.dataset.alias];
     update({ aliases });
+  } else if (el.dataset.webUse) {
+    const web_use = { ...settings.web_use };
+    if (el.checked) web_use[el.dataset.webUse] = true;
+    else delete web_use[el.dataset.webUse];
+    update({ web_use });
   } else if (el.dataset.auto) {
     const p = el.dataset.auto;
     update({ balancer: { ...settings.balancer, [p]: { ...settings.balancer[p], auto: el.checked } } });
@@ -242,7 +251,7 @@ listen("account-added", () => { $("add-hint").hidden = true; });
 // The verdicts come from the backend (subscriptions.rs); this page only words them.
 
 let report = null;
-const NOTIFY_KINDS = ["usage", "resets", "switches", "renewals"];
+const NOTIFY_KINDS = ["usage", "resets", "switches", "renewals", "unexpected_use"];
 const money = (v) => (v == null ? "" : `$${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`);
 const pct = (v) => `${Math.round(v)}%`;
 const VERDICT_TONE = { exhausted_weekly: "bad", unused: "warn", underused: "warn", healthy: "ok", insufficient_data: "" };

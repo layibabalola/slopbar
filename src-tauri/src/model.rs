@@ -55,6 +55,22 @@ pub struct AccountUsage {
     /// (`subscriptions::forecast`). Never set from a stale reading.
     #[serde(default)]
     pub runs_out_at: Option<DateTime<Utc>>,
+    /// Use seen while none of the user's computers had it signed in (see `unexpected`), when
+    /// there was any this week.
+    #[serde(default)]
+    pub unexpected: Option<UnexpectedUse>,
+}
+
+/// A monitored account's weekly usage jumped while every computer sharing its status said it
+/// was not signed in there: the web or mobile app, or someone else with the login.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct UnexpectedUse {
+    /// Separate occasions in the last seven days.
+    pub seen_week: u32,
+    pub last_seen: DateTime<Utc>,
+    /// When the user was last notified about it (at most once every six hours); a new value
+    /// means a new notification is due.
+    pub alert_at: Option<DateTime<Utc>>,
 }
 
 /// Where another machine has an account signed in.

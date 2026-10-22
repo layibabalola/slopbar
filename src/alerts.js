@@ -1,5 +1,5 @@
-// Windows notifications for usage milestones, limits coming back, new usage-limit resets and
-// automatic switches. Runs in the taskbar widget, which is always alive; what was already said is
+// Windows notifications for usage milestones, limits coming back, new usage-limit resets, automatic
+// switches, and use none of the user's computers accounts for. Runs in the taskbar widget, which is always alive; what was already said is
 // remembered across restarts so nothing is repeated, and the first look at an account only
 // records where it stands.
 import { t, resetsIn, windowLabel, resetText, groupResets, duration, dayTime } from "./i18n.js";
@@ -11,8 +11,9 @@ const STORE = "slopbar-alerts";
 const PROVIDER_NAME = { claude: "Claude", codex: "Codex" };
 /** A reset time that moves by more than this means a new window, not a clock adjustment. */
 const SAME_WINDOW_MS = 10 * 60 * 1000;
+const UNEXPECTED_FRESH_MS = 60 * 60 * 1000;
 
-let state = { windows: {}, grants: {} };
+let state = { windows: {}, grants: {}, unexpected: {} };
 try { state = { ...state, ...JSON.parse(localStorage.getItem(STORE) ?? "{}") }; } catch {}
 const save = () => { try { localStorage.setItem(STORE, JSON.stringify(state)); } catch {} };
 
@@ -49,6 +50,18 @@ export function checkUsage(snap, prefs) {
       }
     }
     const key = `${a.provider}:${a.id}`;
+    // The app decides when unexpected use is worth a notification (once per six hours); a new
+    // alert_at is that decision. One from long ago (SlopBar was closed) is not news any more.
+    const alertAt = a.unexpected?.alert_at;
+    if (alertAt && state.unexpected?.[key] !== alertAt) {
+      state.unexpected = { ...state.unexpected, [key]: alertAt };
+      if (prefs.unexpected_use && Date.now() - new Date(alertAt) < UNEXPECTED_FRESH_MS) {
+        invoke("notify_unexpected", {
+          provider: a.provider, title: t("nUnexpectedTitle", { provider: PROVIDER_NAME[a.provider] }),
+          body: t("nUnexpectedBody", { account: accountName(a) }), review: t("nUnexpectedReview"), security: t("nUnexpectedSecurity"),
+        }).catch(() => {});
+      }
+    }
     const total = (a.resets ?? []).reduce((n, r) => n + r.count, 0);
     const before = state.grants[key];
     state.grants[key] = total;

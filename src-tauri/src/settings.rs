@@ -50,13 +50,16 @@ pub struct Notifications {
     pub resets: bool,
     /// Automatic account switches.
     pub switches: bool,
+    /// A monitored account used where none of the user's computers is (see `unexpected`). It
+    /// can only fire while in-use sharing is on, so "on" here means on whenever sharing is.
+    pub unexpected_use: bool,
     /// A plan that looks unneeded renews within three days; any paid plan within a day.
     pub renewals: bool,
 }
 
 impl Default for Notifications {
     fn default() -> Self {
-        Self { usage: true, resets: true, switches: true, renewals: true }
+        Self { usage: true, resets: true, switches: true, renewals: true, unexpected_use: true }
     }
 }
 
@@ -115,6 +118,11 @@ pub struct Settings {
     /// An rclone remote (name without the colon) to share in-use status through instead of a
     /// folder, for clouds without a sync app here; it takes precedence over `presence_folder`.
     pub presence_remote: Option<String>,
+    /// Accounts the user also uses on the web or a phone, keyed like `aliases`: their use away
+    /// from every computer is expected, so it is never reported as unexpected.
+    pub web_use: HashMap<String, bool>,
+    /// Points the weekly window must rise between two readings to count as unexpected use.
+    pub unexpected_min_rise: u8,
 }
 
 impl Default for Settings {
@@ -132,6 +140,8 @@ impl Default for Settings {
             subscriptions: HashMap::new(),
             presence_folder: None,
             presence_remote: None,
+            web_use: HashMap::new(),
+            unexpected_min_rise: 2,
         }
     }
 }
@@ -172,7 +182,9 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 /// The interface languages (see `LANGUAGES` in i18n.js).
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
-const PATCHABLE: [&str; 11] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote"];
+const PATCHABLE: [&str; 13] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise"];
+/// The values `unexpected_min_rise` accepts.
+pub const UNEXPECTED_MIN_RISE: std::ops::RangeInclusive<u8> = 1..=20;
 
 /// Whether `folder` can hold presence files: an existing absolute folder.
 pub fn valid_presence_folder(folder: &str) -> bool {
@@ -200,7 +212,7 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
             match value {
                 Value::Null => { target.remove(key); }
                 // An account's existing plan details merge field by field, like everything else.
-                Value::Object(inner) if !open || target.get(key).is_some_and(Value::is_object) => merge(target.get_mut(key).unwrap(), inner, &here, here == "aliases" || here == "subscriptions")?,
+                Value::Object(inner) if !open || target.get(key).is_some_and(Value::is_object) => merge(target.get_mut(key).unwrap(), inner, &here, ["aliases", "subscriptions", "web_use"].contains(&here.as_str()))?,
                 _ => { target.insert(key.clone(), value.clone()); }
             }
         }
@@ -274,7 +286,16 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
             }
         }
     }
+    for key in next.web_use.keys().filter(|k| !current.web_use.contains_key(*k)) {
+        if !key.split_once(':').is_some_and(|(p, id)| ["claude", "codex"].contains(&p) && !id.is_empty()) {
+            return Err(format!("web_use is keyed \"provider:account id\" with true or false (got {key:?})"));
+        }
+    }
+    if next.unexpected_min_rise != current.unexpected_min_rise && !UNEXPECTED_MIN_RISE.contains(&next.unexpected_min_rise) {
+        return Err(format!("unexpected_min_rise must be {}–{} points", UNEXPECTED_MIN_RISE.start(), UNEXPECTED_MIN_RISE.end()));
+    }
     next.subscriptions.retain(|_, plan| *plan != Subscription::default());
+    next.web_use.retain(|_, on| *on);
     Ok(Settings { last_version: current.last_version.clone(), ..next })
 }
 
@@ -301,6 +322,11 @@ mod patch_tests {
         assert_eq!(next.aliases.get("codex:b").map(String::as_str), Some("Spare"));
         assert!(!next.aliases.contains_key("claude:a"), "null removes an alias");
         assert_eq!(next.last_version.as_deref(), Some("0.1.0"));
+        let web = patched(&next, &json!({ "web_use": { "claude:a": true, "codex:b": false }, "unexpected_min_rise": 5, "notifications": { "unexpected_use": false } }), false).unwrap();
+        assert_eq!(web.web_use.keys().collect::<Vec<_>>(), ["claude:a"], "false entries are dropped");
+        assert_eq!(web.unexpected_min_rise, 5);
+        assert!(!web.notifications.unexpected_use && web.notifications.switches);
+        assert!(patched(&web, &json!({ "web_use": { "claude:a": null } }), false).unwrap().web_use.is_empty());
         let planned = patched(&next, &json!({ "subscriptions": { "claude:a": { "billing_day": 3, "monthly_cost": 100, "cancel_after": "2026-11-02" } } }), false).unwrap();
         assert_eq!(planned.subscriptions["claude:a"], Subscription { billing_day: Some(3), monthly_cost: Some(100.0), cancel_after: chrono::NaiveDate::from_ymd_opt(2026, 11, 2), ..Default::default() });
         let corrected = patched(&planned, &json!({ "subscriptions": { "claude:a": { "next_billing": "2026-11-07" } } }), false).unwrap();
@@ -336,6 +362,11 @@ mod patch_tests {
             (json!([1]), "not an object"),
             (json!({ "presence_folder": "relative\\folder" }), "relative presence folder"),
             (json!({ "presence_remote": "--config" }), "remote read as a flag"),
+            (json!({ "web_use": { "gemini:x": true } }), "web_use provider"),
+            (json!({ "web_use": { "claude:x": "yes" } }), "web_use type"),
+            (json!({ "unexpected_min_rise": 0 }), "rise too small"),
+            (json!({ "unexpected_min_rise": 21 }), "rise too large"),
+            (json!({ "notifications": { "unexpected": true } }), "notification typo"),
             (json!({ "presence_remote": "a:b" }), "remote with a path"),
             (json!({ "presence_folder": "C:\\definitely\\not\\a\\slopbar\\folder" }), "missing presence folder"),
             (json!({ "aliases": { "claude:x": "ok

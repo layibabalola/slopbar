@@ -1,4 +1,4 @@
-use crate::{accounts, balancer, codex_local, diagnostics, dock, door, headroom, inspect, migrate, model, monitoring, notify, panel, plan_alerts, presence, providers, settings, sources, subscriptions, updates};
+use crate::{accounts, balancer, codex_local, diagnostics, dock, door, headroom, inspect, migrate, model, monitoring, notify, panel, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -47,6 +47,8 @@ pub struct AppState {
     pub(crate) sources: Mutex<Vec<sources::Source>>,
     /// Recent readings of unclaimed accounts, to notice use outside this PC.
     presence_tracks: Mutex<presence::Tracks>,
+    /// Use seen where none of the user's computers is, for a week (see `unexpected`).
+    unexpected_log: Mutex<unexpected::Log>,
     /// Plan notifications already shown (renewals, running out), so each is shown once.
     plan_alerts: Mutex<plan_alerts::Sent>,
 }
@@ -687,18 +689,34 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     // Other machines: what they share through the presence folder, then what rising usage implies.
     let now = chrono::Utc::now();
     let interval = settings.refresh_minutes.max(1) as u64 * 60;
+    // Whether every computer is covered: sharing is on and someone (this one or a peer) published.
+    let mut covered = false;
     if let Some(store) = presence::store(&settings) {
         let mine = list.clone();
-        let peers = tauri::async_runtime::spawn_blocking(move || {
-            let Some((id, name)) = presence::identity() else { return vec![] };
-            let _ = store.write(&presence::own(id, name, interval, &mine, now));
-            presence::read(store.as_ref(), id, now)
+        let (peers, wrote) = tauri::async_runtime::spawn_blocking(move || {
+            let Some((id, name)) = presence::identity() else { return (vec![], false) };
+            let wrote = store.write(&presence::own(id, name, interval, &mine, now)).is_ok();
+            (presence::read(store.as_ref(), id, now), wrote)
         }).await.unwrap_or_default();
+        covered = wrote || peers.iter().any(|p| p.live);
         presence::attach(&mut list, &peers, now);
     }
     // Two refresh intervals without a rise (readings are at least a minute apart), plus slack.
     let hold = chrono::Duration::seconds(2 * interval.max(60) as i64 + 30);
-    presence::infer(&mut state.presence_tracks.lock().unwrap(), &mut list, hold, now);
+    // Consecutive readings of a few refreshes at most (a missed one is fine; a night asleep is not).
+    let surge = presence::Surge {
+        min_rise: settings.unexpected_min_rise.max(1) as f64,
+        max_gap: chrono::Duration::seconds((3 * interval as i64 + 60).max(15 * 60)),
+    };
+    let surged = presence::infer(&mut state.presence_tracks.lock().unwrap(), &mut list, hold, surge, now);
+    let watch = unexpected::Watch { covered, notify: settings.notifications.unexpected_use, web_use: &settings.web_use };
+    let log = {
+        let mut log = state.unexpected_log.lock().unwrap();
+        unexpected::apply(&mut log, &mut list, &surged, &watch, now).then(|| log.clone())
+    };
+    if let Some(log) = log {
+        let _ = unexpected::save(&log);
+    }
 
     let mut snapshot = Snapshot { accounts: list, updated_at: Some(chrono::Utc::now()) };
     state.diagnostics.samples(&snapshot);
@@ -777,6 +795,7 @@ pub fn run() {
         recent: Mutex::default(),
         sources: Mutex::default(),
         presence_tracks: Mutex::default(),
+        unexpected_log: Mutex::new(unexpected::load()),
         plan_alerts: Mutex::new(plan_alerts::load()),
     };
     tauri::Builder::default()
@@ -820,6 +839,7 @@ pub fn run() {
             dock_menu,
             accent_colors,
             notify::notify,
+            notify::notify_unexpected,
             has_mica,
             taskbar_theme
         ])

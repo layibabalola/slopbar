@@ -702,7 +702,7 @@ mod tests {
             plan: Some("pro".into()), org: None, active: false, sources: vec![],
             windows: vec![UsageWindow { kind: kind.into(), window_seconds: None, used_percent: percent, resets_at: Some(resets_at) }],
             credits: None, resets: vec![], error: None, monitor_error: None, stale: false, fetched_at: None,
-            monitor_connected: true, billing: BillingHints::default(), remote: vec![], used_outside: false, runs_out_at: None,
+            monitor_connected: true, billing: BillingHints::default(), remote: vec![], used_outside: false, runs_out_at: None, unexpected: None,
         }
     }
 

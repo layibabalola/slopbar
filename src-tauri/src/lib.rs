@@ -15,6 +15,7 @@ mod plan_alerts;
 mod codex_local;
 mod presence;
 mod rclone;
+mod unexpected;
 pub use diagnostics::write_build_info;
 mod door;
 pub use door::wait_for_exit;

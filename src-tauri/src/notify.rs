@@ -15,6 +15,39 @@ pub fn notify(app: AppHandle, title: String, body: String, page: Option<String>)
     app.notification().builder().title(title).body(body).show().map_err(|e| e.to_string())
 }
 
+/// The unexpected-use notice (see `unexpected`), with two buttons: review the account in
+/// Settings > Accounts, or open the provider's own security page. Clicking the toast itself
+/// opens Settings too. Signing anything out is left to the user on that page.
+#[tauri::command]
+pub fn notify_unexpected(app: AppHandle, provider: crate::accounts::Provider, title: String, body: String, review: String, security: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let identifier = app.config().identifier.clone();
+        let url = crate::unexpected::security_page(provider);
+        tauri_winrt_notification::Toast::new(&identifier)
+            .title(&title)
+            .text1(&body)
+            .add_button(&review, "review")
+            .add_button(&security, "security")
+            .on_activated(move |action| {
+                if action.as_deref() == Some("security") {
+                    let _ = std::process::Command::new("explorer.exe").arg(url).spawn();
+                } else {
+                    let _ = app.emit_to(crate::app::SETTINGS_LABEL, "show-page", "accounts");
+                    crate::app::show_settings(&app);
+                }
+                Ok(())
+            })
+            .show()
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (provider, review, security);
+        notify(app, title, body, Some("accounts".into()))
+    }
+}
+
 /// The notification plugin cannot react to a click on Windows, so this one is shown directly,
 /// under the same app id. The click reaches SlopBar while it runs, which it always does.
 #[cfg(windows)]
