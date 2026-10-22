@@ -66,7 +66,7 @@ upstream PR.
 | 28 | **Spend ledger**: month-by-month cost per plan, year-to-date totals, optional tax rate and currency. | done (d4c2800) |
 | 29 | **SlopBar Ultra releases and updates**: signed installers from the fork; Ultra's updater follows the fork's releases. | done (ultra-releases ac7e652) |
 
-## Wave 5: next
+## Wave 5: running
 
 | # | Item |
 |---|---|
@@ -77,6 +77,19 @@ upstream PR.
 | 34 | **Sparklines and compact mode** in the flyout. |
 | 35 | **Onboarding** for first run. |
 | 36 | **Accessibility pass**: keyboard, screen reader, contrast. |
+
+## Wave 6: running (added by the owner on 2026-10-22)
+
+| # | Item | Status |
+|---|---|---|
+| 37 | **Install lock and strict single instance**: a machine-wide install lock; a second instance always hands over and exits; Health flags duplicates. Prompted by two instances running after racing installs on 2026-10-22. | running |
+| 38 | **MCP server cleanup**: slopbar-mcp exits when its agent disconnects; Health counts lingering servers. | running |
+| 39 | **Faster refresh**: per-phase timing; non-essential work off the refresh path; under 5 s for 15 accounts. | running |
+| 40 | **Runaway-agent alert**: abnormal burn per account, with the repo and model behind it. | running |
+| 41 | **Reset-credit advisor**: spend a banked Codex reset or switch; remind before resets expire. | running |
+| 42 | **Capacity-shortage advice**: the cheapest fix when the pool is short. | running |
+| 43 | **Encrypted backup and restore** of settings, plan details and history (never sign-ins). | running |
+| 44 | **Opt-in phone alerts** through a self-hostable push service (ntfy). | running |
 
 ## Done before this roadmap (branch `claude/subscription-value`; upstream thelioo/slopbar#8–#11, stacked on #6)
 
