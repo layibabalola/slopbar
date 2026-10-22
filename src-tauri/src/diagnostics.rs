@@ -238,6 +238,13 @@ pub enum Event {
         outcome: RevokeOutcome,
         elapsed_ms: u64,
     },
+    /// A panic, recorded only when the user turned crash records on (see `crash_event`): where in
+    /// SlopBar's own source it happened and on which kind of thread, never its message.
+    Crash {
+        file: String,
+        line: u32,
+        thread: CrashThread,
+    },
     Sample {
         active: bool,
         monitoring: bool,
@@ -340,6 +347,7 @@ struct State {
     urgent_through: u64,
     completed: u64,
     write_attempts: u64,
+    last_write_ok: Option<bool>,
     stop: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -600,6 +608,7 @@ impl Recorder {
                 .is_some_and(|b| save(&path, &b));
             let mut s = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             s.write_attempts = s.write_attempts.saturating_add(1);
+            s.last_write_ok = Some(ok);
             if !ok {
                 s.storage_errors = s.storage_errors.saturating_add(1);
             }
@@ -723,6 +732,7 @@ impl Recorder {
             refresh_minutes: u32,
             claude_enabled: bool,
             codex_enabled: bool,
+            crash_records: bool,
             current: Vec<Record>,
             events: VecDeque<Record>,
         }
@@ -743,6 +753,7 @@ impl Recorder {
             refresh_minutes: settings.refresh_minutes,
             claude_enabled: settings.providers.claude,
             codex_enabled: settings.providers.codex,
+            crash_records: settings.crash_records,
             current,
             events: s.history.events.clone(),
         };
@@ -826,6 +837,183 @@ pub fn write_build_info(path: &std::path::Path) -> std::io::Result<()> {
 }
 pub fn millis(start: std::time::Instant) -> u64 {
     start.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+// ---------------------------------------------------------------------------------------------
+// Crash records: off unless the user turns them on (General > Diagnostics, `crash_records`).
+
+/// The kind of thread a panic happened on; thread names are never recorded as such.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CrashThread {
+    Main,
+    Runtime,
+    Diagnostics,
+    Other,
+    Unnamed,
+}
+
+static CRASH_RECORDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Follows the setting; the hook stays installed and does nothing while it is off.
+pub fn set_crash_records(on: bool) {
+    CRASH_RECORDS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Where a panic happened, reduced to what cannot identify the user or carry data: a path inside
+/// SlopBar's own sources ("src/app.rs"), else only "dependency", "std" or "other". Panic messages
+/// can hold anything (tokens, emails, paths), so they are never passed in.
+pub fn crash_event(location: Option<(&str, u32)>, thread: Option<&str>) -> Event {
+    fn file(path: &str) -> String {
+        let path = path.replace('\\', "/");
+        let own = path.rsplit_once("/src-tauri/src/").map(|(_, rest)| rest).or_else(|| path.strip_prefix("src/"))
+            .filter(|rest| rest.len() <= 64 && rest.ends_with(".rs") && !rest.contains("..")
+                && rest.chars().all(|c| c.is_ascii_alphanumeric() || "_/.".contains(c)));
+        match own {
+            Some(rest) => format!("src/{rest}"),
+            None if path.contains("/.cargo/") || path.contains("/registry/") => "dependency".into(),
+            None if path.contains("/rustc/") || path.starts_with("library/") || path.contains("/rustlib/") => "std".into(),
+            None => "other".into(),
+        }
+    }
+    let thread = match thread {
+        None => CrashThread::Unnamed,
+        Some("main") => CrashThread::Main,
+        Some("diagnostic-writer") => CrashThread::Diagnostics,
+        Some(n) if n.starts_with("tokio-runtime-worker") || n.starts_with("tokio-") => CrashThread::Runtime,
+        Some(_) => CrashThread::Other,
+    };
+    match location {
+        Some((path, line)) => Event::Crash { file: file(path), line, thread },
+        None => Event::Crash { file: "other".into(), line: 0, thread },
+    }
+}
+
+/// Chains a panic hook that, while crash records are on, puts a `crash_event` into `recorder`'s
+/// journal (and so into exports) before the default hook runs.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+pub fn install_crash_hook(recorder: Arc<Recorder>) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if CRASH_RECORDS.load(std::sync::atomic::Ordering::Relaxed) {
+            let current = std::thread::current();
+            recorder.crash(crash_event(info.location().map(|l| (l.file(), l.line())), current.name()));
+        }
+        previous(info);
+    }));
+}
+
+impl Recorder {
+    /// Records a crash from inside a panic. The panic may have happened in the recorder itself, so
+    /// this never waits for its lock, and waits for the writer only briefly and never from it.
+    pub(crate) fn crash(&self, event: Event) {
+        // Another thread (the writer) holds the lock only briefly; this thread holding it means
+        // the panic came from inside the recorder, and then the record is given up.
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut s = loop {
+            match self.shared.state.try_lock() {
+                Ok(s) => break s,
+                Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(2)),
+                Err(std::sync::TryLockError::WouldBlock) => return,
+            }
+        };
+        if !s.started {
+            return;
+        }
+        Self::push(&mut s, None, None, event);
+        let target = s.generation;
+        s.urgent_through = target;
+        self.shared.wake.notify_all();
+        if self.worker.is_none() || std::thread::current().name() == Some("diagnostic-writer") {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while s.completed < target {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            s = self.shared.wake.wait_timeout(s, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+
+    /// The journal's counters, for Settings > Health.
+    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+    pub fn health(&self) -> crate::health::Journal {
+        let s = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        crate::health::Journal { started: s.started, write_attempts: s.write_attempts, storage_errors: s.storage_errors,
+            last_write_ok: s.last_write_ok.or((self.worker.is_none()).then_some(false)), history_unreadable: s.history_unreadable }
+    }
+}
+
+#[cfg(test)]
+mod crash_tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    #[test]
+    fn crash_locations_keep_only_slopbars_own_source_files() {
+        for (path, expected) in [
+            ("src\\app.rs", "src/app.rs"),
+            ("src/providers/claude.rs", "src/providers/claude.rs"),
+            ("C:\\Users\\alice.example\\code\\slopbar\\src-tauri\\src\\door.rs", "src/door.rs"),
+            ("C:\\Users\\alice.example\\.cargo\\registry\\src\\index.crates.io-6f17d22bba15001f\\tokio-1.40.0\\src\\runtime\\task.rs", "dependency"),
+            ("/rustc/90b35a6239c3d8bdabc530a6a0816f7ff89a0aaf/library/core/src/option.rs", "std"),
+            ("library/std/src/thread/mod.rs", "std"),
+            ("D:\\secret-client-name\\build.rs", "other"),
+            ("src/../../Users/alice/x.rs", "other"),
+            ("src/token=abc123\nleak.rs", "other"),
+        ] {
+            let Event::Crash { file, .. } = crash_event(Some((path, 7)), None) else { panic!() };
+            assert_eq!(file, expected, "{path}");
+        }
+        assert!(matches!(crash_event(None, Some("main")), Event::Crash { line: 0, thread: CrashThread::Main, .. }));
+        for (name, kind) in [(Some("tokio-runtime-worker"), CrashThread::Runtime), (Some("alice@example.invalid"), CrashThread::Other), (None, CrashThread::Unnamed)] {
+            let Event::Crash { thread, .. } = crash_event(Some(("src/app.rs", 1)), name) else { panic!() };
+            assert_eq!(thread, kind);
+        }
+    }
+
+    #[test]
+    fn a_crash_record_reaches_the_export_without_its_message_or_paths() {
+        let dir = TempDir::new();
+        let r = Recorder::with_writer(dir.0.join("history"), |_, _| true);
+        r.start();
+        let canary = "PRIVATE-panic-message-token-sk-ant-oat01-alice@example.invalid";
+        // What the hook does with a real panic: only the location and thread are passed on.
+        let user_path = "C:\\Users\\alice.example\\.cargo\\registry\\src\\x\\serde-1.0.0\\src\\de.rs";
+        r.crash(crash_event(Some(("src\\app.rs", 42)), Some("main")));
+        r.crash(crash_event(Some((user_path, 9)), Some(canary)));
+        let settings = Settings { crash_records: true, ..Settings::default() };
+        let path = r.export(&Snapshot::default(), &settings).unwrap();
+        let report = std::fs::read_to_string(path).unwrap();
+        assert!(!report.contains(canary) && !report.contains("alice") && !report.contains("Users"), "{report}");
+        let json: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(json["crash_records"], true);
+        let crashes: Vec<_> = json["events"].as_array().unwrap().iter().filter(|e| e["event"]["type"] == "crash").map(|e| e["event"].clone()).collect();
+        assert_eq!(crashes, [
+            serde_json::json!({ "type": "crash", "file": "src/app.rs", "line": 42, "thread": "main" }),
+            serde_json::json!({ "type": "crash", "file": "dependency", "line": 9, "thread": "other" }),
+        ]);
+    }
+
+    #[test]
+    fn crash_never_blocks_on_a_held_recorder_lock() {
+        let dir = TempDir::new();
+        let r = Recorder::with_writer(dir.0.join("history"), |_, _| true);
+        r.start();
+        let held = r.shared.state.lock().unwrap();
+        r.crash(crash_event(Some(("src/app.rs", 1)), None));
+        drop(held);
+        assert!(r.health().started);
+    }
+
+    #[test]
+    fn crash_records_are_off_by_default() {
+        assert!(!Settings::default().crash_records);
+        assert!(!CRASH_RECORDS.load(std::sync::atomic::Ordering::Relaxed));
+    }
 }
 
 #[cfg(test)]

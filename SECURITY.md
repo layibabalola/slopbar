@@ -28,6 +28,18 @@ These OAuth sessions are credentials, not read-only usage API keys. DPAPI protec
 
 Local builds have upstream updates disabled at compile time. Official release builds explicitly enable `upstream-updates`; those updates must match the signing key built into the app. Signatures authenticate a publisher, not the safety of a release.
 
+## What leaves this machine
+
+SlopBar has no telemetry: no analytics, crash reporting service, usage pings or server of its own. Only these connections are made, and each goes straight to the party named:
+
+- **Provider usage and billing endpoints, with your own tokens.** Claude: `api.anthropic.com` (usage, profile) and `platform.claude.com` (monitoring token renewal and revocation). Codex: `chatgpt.com` (usage, banked resets, account record) and `auth.openai.com` (monitoring token renewal and revocation). Sign-ins run the providers' own CLIs. Requests carry only what each endpoint needs to answer about your account.
+- **Optional in-use sharing.** When you choose a synced folder or an rclone remote under Settings > Data, SlopBar writes one small file per computer there: a random machine id, the computer's name, a timestamp and, for each account signed in, a hash of the provider and account id with where it is signed in (for example "Windows" or "WSL: Ubuntu"). No emails, tokens or usage numbers. The files go only where you pointed SlopBar; the sync client or rclone carries them to your other computers. Sharing is off by default.
+- **Update checks, only in builds with automatic updates.** Official release builds check the release manifest on GitHub (`github.com/thelioo/slopbar/releases`) and download signed updates from there. Local builds, including any you compile yourself, have updates disabled at compile time and make no update requests.
+
+Nothing else is sent. Opening a provider's billing or security page hands its fixed URL to your browser. Settings > Health is computed from what SlopBar already knows and adds no requests. Diagnostics exports and crash records stay on this machine until you share an export yourself.
+
+**Crash records** are off by default. Turned on (Settings > General > Diagnostics, or `crash_records` through `update_settings`), a panic adds one entry to the local diagnostics journal: the source file within SlopBar's own code (anything else is recorded only as "dependency", "std" or "other"), the line, and the kind of thread. The panic's message, paths outside the source tree and thread names are never recorded, since a message can contain anything. Entries follow the journal's retention and appear in exports.
+
 ## Reporting a vulnerability
 
 Please report upstream security issues privately through [GitHub's private vulnerability reporting](https://github.com/thelioo/slopbar/security/advisories/new) instead of opening a public issue.

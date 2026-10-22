@@ -458,6 +458,7 @@ async function render() {
   $("auto-update").checked = updatesEnabled && settings.auto_update;
   $("auto-update").disabled = !updatesEnabled;
   for (const kind of NOTIFY_KINDS) $(`notify-${kind}`).checked = settings.notifications[kind];
+  $("crash-records").checked = settings.crash_records;
   renderPresence();
   const version = await invoke("app_version");
   $("version").textContent = /^\d/.test(version) ? `v${version}` : version;
@@ -492,6 +493,69 @@ $("export-diagnostics").addEventListener("click", async () => {
   } catch { status.textContent = t("diagnosticsFailed"); }
   finally { button.disabled = false; }
 });
+$("crash-records").addEventListener("change", (e) => update({ crash_records: e.target.checked }));
+
+// ---------------------------------------------------------------------------------------------
+// Health: the backend's self-check (health.rs) with each check's fix wired to the matching action.
+
+let health = null;
+const FIX_PAGES = { data: "sData", notifications: "sNotifications", general: "sGeneral" };
+
+function fixButton(fix, i) {
+  if (!fix) return "";
+  const label = {
+    connect_monitoring: () => t("monitorConnect"),
+    refresh: () => t("healthFixRefresh"),
+    restart_app: () => t("healthFixRestart"),
+    open_settings: () => `${t("healthFixOpen")} ${t(FIX_PAGES[fix.page] ?? "settings")}`,
+  }[fix.action]?.();
+  return label ? `<button class="btn" data-fix="${i}">${esc(label)}</button>` : "";
+}
+
+function renderHealth() {
+  if (!health) return;
+  $("health").innerHTML = health.checks.map((c, i) => `
+    <div class="row health-check" data-key="${esc(c.id)}">
+      <div class="title"><label><span class="health-dot ${c.status}"></span>${esc(c.title)}</label><small>${esc(c.reason)}</small></div>
+      ${c.status === "ok" ? "" : fixButton(c.fix, i)}
+    </div>`).join("");
+  const badge = $("health-nav-badge");
+  badge.hidden = !health.problems;
+  badge.textContent = String(health.problems);
+}
+
+async function loadHealth() {
+  try { health = await invoke("get_health"); } catch { return; }
+  renderHealth();
+}
+
+$("health").addEventListener("click", async (e) => {
+  const button = e.target.closest("[data-fix]");
+  const fix = button && health?.checks[Number(button.dataset.fix)]?.fix;
+  if (!fix) return;
+  const status = $("health-status");
+  button.disabled = true;
+  try {
+    if (fix.action === "connect_monitoring") {
+      await invoke("connect_monitoring", { provider: fix.provider, id: fix.id });
+      status.textContent = t("monitorPending"); status.hidden = false;
+    } else if (fix.action === "refresh") {
+      snapshot = await invoke("refresh");
+      renderAccounts();
+    } else if (fix.action === "restart_app") {
+      status.textContent = t("healthRestarting"); status.hidden = false;
+      await invoke("restart_app");
+    } else if (fix.action === "open_settings") {
+      document.querySelector(`.nav[data-page="${fix.page}"]`)?.click();
+    }
+  } catch (err) { status.textContent = errorText("", String(err)); status.hidden = false; }
+  finally { button.disabled = false; }
+  loadHealth();
+});
+listen("usage-updated", loadHealth);
+listen("monitoring-login", loadHealth);
+document.querySelector('.nav[data-page="health"]').addEventListener("click", loadHealth);
+
 // Sharing in-use status: off, a detected sync folder (OneDrive, Dropbox, Google Drive…), an rclone
 // remote (any cloud, no sync app needed) or a typed folder.
 let syncFolders = [];
@@ -598,6 +662,7 @@ updatesEnabled = await invoke("updates_enabled");
 snapshot = await invoke("get_usage");
 await render();
 await loadSubscriptions();
+await loadHealth();
 let page = "accounts";
 try { page = localStorage.getItem("settings-page") || page; } catch {}
 showPage(page);

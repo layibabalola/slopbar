@@ -123,6 +123,9 @@ pub struct Settings {
     pub web_use: HashMap<String, bool>,
     /// Points the weekly window must rise between two readings to count as unexpected use.
     pub unexpected_min_rise: u8,
+    /// Keep a redacted record of crashes (where in SlopBar's code, never the message) in the local
+    /// diagnostics journal, so exports include them. Off unless the user turns it on.
+    pub crash_records: bool,
 }
 
 impl Default for Settings {
@@ -142,6 +145,7 @@ impl Default for Settings {
             presence_remote: None,
             web_use: HashMap::new(),
             unexpected_min_rise: 2,
+            crash_records: false,
         }
     }
 }
@@ -182,7 +186,7 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 /// The interface languages (see `LANGUAGES` in i18n.js).
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
-const PATCHABLE: [&str; 13] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise"];
+const PATCHABLE: [&str; 14] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records"];
 /// The values `unexpected_min_rise` accepts.
 pub const UNEXPECTED_MIN_RISE: std::ops::RangeInclusive<u8> = 1..=20;
 
@@ -325,6 +329,10 @@ mod patch_tests {
         let web = patched(&next, &json!({ "web_use": { "claude:a": true, "codex:b": false }, "unexpected_min_rise": 5, "notifications": { "unexpected_use": false } }), false).unwrap();
         assert_eq!(web.web_use.keys().collect::<Vec<_>>(), ["claude:a"], "false entries are dropped");
         assert_eq!(web.unexpected_min_rise, 5);
+        assert!(!next.crash_records, "crash records are off by default");
+        let crash = patched(&next, &json!({ "crash_records": true }), false).unwrap();
+        assert!(crash.crash_records && crash.refresh_minutes == 15);
+        assert!(patched(&crash, &json!({ "crash_records": "yes" }), false).is_err());
         assert!(!web.notifications.unexpected_use && web.notifications.switches);
         assert!(patched(&web, &json!({ "web_use": { "claude:a": null } }), false).unwrap().web_use.is_empty());
         let planned = patched(&next, &json!({ "subscriptions": { "claude:a": { "billing_day": 3, "monthly_cost": 100, "cancel_after": "2026-11-02" } } }), false).unwrap();

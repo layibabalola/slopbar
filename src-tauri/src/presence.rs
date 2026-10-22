@@ -314,7 +314,9 @@ pub struct Peer {
     pub seats: Vec<Seat>,
 }
 
-/// Every other machine in `store` that wrote within the last week.
+/// Every other machine in `store` that wrote within the last week (the refresh lists the store
+/// itself, to tell a failed read apart from an empty folder).
+#[cfg(test)]
 pub fn read(store: &dyn PresenceStore, own_id: &str, now: DateTime<Utc>) -> Vec<Peer> {
     peers(store.list().unwrap_or_default(), own_id, now)
 }

@@ -3,6 +3,14 @@
 const MESSAGES = {
   en: {
     sDiagnostics: "Diagnostics",
+    crashRecords: "Record crashes",
+    crashRecordsHint: "Off by default. Keeps where in SlopBar's code a crash happened (file and line, never its message) in the local history above, so exports include it. Nothing is sent anywhere.",
+    sHealth: "Health",
+    descHealth: "SlopBar checks its own sign-ins, readings, sharing and services. Each problem comes with the fix.",
+    healthHow: "Checked from what SlopBar already knows; nothing extra is sent to any provider.",
+    healthFixRefresh: "Refresh", healthFixRestart: "Restart SlopBar", healthFixOpen: "Open",
+    healthIssues: "Health: {n} to fix",
+    healthRestarting: "Restarting SlopBar…",
     exportDiagnostics: "Export diagnostics",
     diagnosticsHint: "Local history: up to 7 days or 10,000 events. Reports include anonymous account numbers and usage, but no credentials or account identities. Nothing is uploaded automatically.",
     diagnosticsExporting: "Exporting diagnostics…",
