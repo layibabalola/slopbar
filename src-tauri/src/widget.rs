@@ -149,11 +149,18 @@ pub struct View {
     pub health_problems: usize,
     /// The window's accessible name (`aria-label` on the web widget).
     pub label: String,
+    /// What each item's tooltip says below its headline (`account_detail`), one per item; empty
+    /// for text items.
+    pub details: Vec<String>,
 }
 
 /// Strings the view needs, already translated (see `crate::i18n`).
 pub trait Texts {
     fn t(&self, key: &str, vars: &[(&str, &str)]) -> String;
+    /// The language code, for dates and durations (`i18n_format`).
+    fn lang(&self) -> &str {
+        "en"
+    }
 }
 
 pub struct Lang(pub String);
@@ -161,6 +168,9 @@ pub struct Lang(pub String);
 impl Texts for Lang {
     fn t(&self, key: &str, vars: &[(&str, &str)]) -> String {
         crate::i18n::t(&self.0, key, vars)
+    }
+    fn lang(&self) -> &str {
+        &self.0
     }
 }
 
@@ -182,6 +192,68 @@ pub fn chip_tip(texts: &dyn Texts, provider: Provider, percent: Option<f64>) -> 
         Some(p) => format!("{} {}%", provider_name(provider), p.round() as i64),
         None => format!("{} — {}", provider_name(provider), texts.t("usageUnknown", &[])),
     }
+}
+
+/// Everything the flyout's full card says about an account, for the ring's tooltip below its
+/// headline (as `accountTip` in accounttext.js, without the plan details the widget doesn't
+/// load): who it is, where it is in use, each window with its reset, the forecast, how current
+/// the reading is, monitoring, credits and resets held, and a lease. Groups are separated by a
+/// blank line; empty fields are left out.
+pub fn account_detail(texts: &dyn Texts, a: &AccountUsage, now: chrono::DateTime<chrono::Utc>) -> String {
+    use crate::i18n_format as f;
+    let lang = texts.lang();
+    let provider = provider_name(a.provider);
+    let name = a.alias.clone().or_else(|| a.email.clone()).unwrap_or_else(|| texts.t("unknownAccount", &[]));
+    let machine = |r: &crate::model::RemoteSeat| {
+        if r.where_.is_empty() || (r.where_.len() == 1 && r.where_[0] == "Windows") { r.machine.clone() } else { format!("{} ({})", r.machine, r.where_.join(", ")) }
+    };
+    let live: Vec<String> = a.remote.iter().filter(|r| r.live).map(machine).collect();
+    let in_use = if a.active && !a.sources.is_empty() {
+        format!("{}: {}", texts.t("inUse", &[]), [a.sources.clone(), live.clone()].concat().join(", "))
+    } else if !live.is_empty() {
+        texts.t("inUseOn", &[("list", &live.join(", "))])
+    } else {
+        String::new()
+    };
+    let ago = |at: chrono::DateTime<chrono::Utc>| f::duration(lang, ((now - at).num_minutes()).max(1));
+    let mut who = vec![
+        match (&a.alias, &a.email) { (Some(_), Some(email)) => format!("{name} ({email})"), _ => name.clone() },
+        [Some(provider.to_string()), a.plan.clone(), a.org.clone()].into_iter().flatten().collect::<Vec<_>>().join(" · "),
+        in_use,
+    ];
+    who.extend(a.remote.iter().filter(|r| !r.live).map(|r| texts.t("seenOn", &[("machine", &machine(r)), ("t", &ago(r.seen_at))])));
+    if a.used_outside { who.push(texts.t("usedOutside", &[])); }
+    if let Some(purpose) = &a.leased { who.push(texts.t("leased", &[("purpose", purpose)])); }
+
+    let used = texts.t("used", &[]);
+    let mut usage: Vec<String> = a.windows.iter().map(|w| {
+        let line = format!("{}: {}% {used}", f::window_label(lang, &w.kind, w.window_seconds), f::js_round(w.used_percent) as i64);
+        if f::shows_reset(&a.windows, w) { format!("{line} · {}", f::window_reset_text(lang, w, a.stale, a.fetched_at, now)) } else { line }
+    }).collect();
+    if let (Some(at), false) = (a.runs_out_at, a.stale) { usage.push(texts.t("runsOut", &[("at", &f::day_time(lang, at))])); }
+
+    let mut state = vec![];
+    if let Some(at) = a.fetched_at {
+        let mut line = texts.t("lastObserved", &[("t", &ago(at))]);
+        if a.stale { line = format!("{line} · {}", texts.t("lastReading", &[])); }
+        state.push(line);
+    }
+    if let Some(code) = a.error.as_deref().or(a.monitor_error.as_deref()) { state.push(error_text(texts, provider, code)); }
+    state.push(texts.t(if a.monitor_connected { "tipMonitorOn" } else { "tipMonitorOff" }, &[]));
+
+    let mut held = vec![];
+    if let Some(c) = &a.credits {
+        let v = if c == "unlimited" { texts.t("unlimited", &[]) } else { c.clone() };
+        held.push(texts.t("credits", &[("v", &v)]));
+    }
+    held.extend(f::group_resets(&a.resets).iter().map(|r| f::reset_text(lang, r, now)));
+
+    [who, usage, state, held].into_iter()
+        .map(|g| g.into_iter().filter(|l| !l.is_empty()).collect::<Vec<_>>())
+        .filter(|g| !g.is_empty())
+        .map(|g| g.join("\n"))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// An error code in words (`errorText` in i18n.js), for notices such as a failed monitoring
@@ -215,6 +287,7 @@ pub fn health_tip(texts: &dyn Texts, problems: usize) -> String {
 /// account in use, else its first one), or a line of text while loading, without accounts, or
 /// while a notice (`toast`) is up.
 pub fn view(snap: &Snapshot, toast: Option<&str>, health_problems: usize, texts: &dyn Texts) -> View {
+    let mut details = vec![];
     let items = if snap.updated_at.is_none() {
         vec![Item::Text { text: texts.t("loading", &[]), dim: true }]
     } else if snap.accounts.is_empty() {
@@ -232,11 +305,13 @@ pub fn view(snap: &Snapshot, toast: Option<&str>, health_problems: usize, texts:
             })
             .map(|a| {
                 let percent = if a.stale || a.error.is_some() { None } else { peak(a) };
+                details.push(account_detail(texts, a, chrono::Utc::now()));
                 Item::Chip { provider: a.provider, percent, tip: chip_tip(texts, a.provider, percent) }
             })
             .collect()
     };
-    View { items, health_problems, label: texts.t("title", &[]) }
+    details.resize(items.len(), String::new());
+    View { items, health_problems, label: texts.t("title", &[]), details }
 }
 
 /// A box in DIPs.
@@ -306,14 +381,23 @@ pub fn physical(dips: f32, dpi: u32) -> i32 {
     (dips * scale(dpi) - 0.001).ceil() as i32
 }
 
+/// A ring's whole tooltip: its headline ("Claude 42%"), then the account's details.
+fn full_tip(tip: &str, detail: Option<&String>) -> String {
+    match detail.filter(|d| !d.is_empty()) {
+        Some(d) => format!("{tip}\n\n{d}"),
+        None => tip.to_string(),
+    }
+}
+
 /// Tooltip regions: each ring with its text, then the health dot.
 pub fn tips(view: &View, layout: &Layout, texts: &dyn Texts) -> Vec<(Box2, String)> {
     let mut out: Vec<_> = view
         .items
         .iter()
         .zip(&layout.items)
-        .filter_map(|(item, b)| match item {
-            Item::Chip { tip, .. } => Some((*b, tip.clone())),
+        .enumerate()
+        .filter_map(|(i, (item, b))| match item {
+            Item::Chip { tip, .. } => Some((*b, full_tip(tip, view.details.get(i)))),
             Item::Text { .. } => None,
         })
         .collect();
@@ -331,8 +415,9 @@ pub fn text(view: &View, texts: &dyn Texts) -> String {
     let mut lines: Vec<String> = view
         .items
         .iter()
-        .map(|i| match i {
-            Item::Chip { tip, .. } => tip.clone(),
+        .enumerate()
+        .map(|(n, i)| match i {
+            Item::Chip { tip, .. } => full_tip(tip, view.details.get(n)),
             Item::Text { text, .. } => text.clone(),
         })
         .collect();
@@ -683,10 +768,60 @@ mod tests {
         assert!(dot.x + dot.w <= l.width - BORDER && dot.y >= INSET_Y);
         let tips = tips(&v, &l, &En);
         assert_eq!(tips.len(), 2);
-        assert_eq!(tips[0], (l.items[0], "Claude 50%".into()));
+        // The ring's tooltip: its headline, then the account's details.
+        assert_eq!(tips[0].0, l.items[0]);
+        assert_eq!(tips[0].1, format!("Claude 50%\n\n{}", v.details[0]));
         assert_eq!(tips[1].1, crate::i18n::t("en", "healthIssues", &[("n", "2")]));
         assert!(tips[1].0.contains(dot.x + 3.0, dot.y + 3.0));
-        assert_eq!(text(&v, &En), format!("Claude 50%\n{}", tips[1].1));
+        assert_eq!(text(&v, &En), format!("{}\n{}", tips[0].1, tips[1].1));
+    }
+
+    #[test]
+    fn the_ring_tooltip_says_what_the_full_card_says() {
+        use chrono::TimeZone;
+        let en = |k: &str, v: &[(&str, &str)]| crate::i18n::t("en", k, v);
+        let now = chrono::Utc.with_ymd_and_hms(2026, 10, 22, 12, 0, 0).unwrap();
+        let mut a: AccountUsage = serde_json::from_value(serde_json::json!({
+            "id": "a1", "provider": "claude", "active": true, "email": "max@example.invalid", "alias": "Work",
+            "plan": "Max 20x", "org": null, "sources": ["Windows"], "credits": null, "error": null, "stale": false,
+            "fetched_at": now - chrono::Duration::minutes(3), "monitor_connected": true, "leased": "nightly build",
+            "remote": [{ "machine": "LAPTOP-2", "where": ["WSL: Ubuntu"], "seen_at": now, "live": true }],
+            "resets": [{ "kind": "weekly", "count": 1, "usable": true, "title": null, "expires_at": null, "next_available_at": null }],
+            "windows": [
+                { "kind": "weekly", "used_percent": 77.0, "window_seconds": 604800, "resets_at": now + chrono::Duration::hours(52) },
+                { "kind": "weekly_opus", "used_percent": 40.0, "window_seconds": 604800, "resets_at": null },
+            ],
+        })).unwrap();
+        a.runs_out_at = Some(now + chrono::Duration::hours(30));
+        let d = account_detail(&En, &a, now);
+        let groups: Vec<&str> = d.split("\n\n").collect();
+        assert_eq!(groups.len(), 4, "{d}");
+        assert_eq!(groups[0].lines().collect::<Vec<_>>(), [
+            "Work (max@example.invalid)".to_string(),
+            "Claude · Max 20x".into(),
+            format!("{}: Windows, LAPTOP-2 (WSL: Ubuntu)", en("inUse", &[])),
+            en("leased", &[("purpose", "nightly build")]),
+        ]);
+        let reset = crate::i18n_format::window_reset_text("en", &a.windows[0], false, a.fetched_at, now);
+        assert!(reset.starts_with(&en("resetsIn", &[("t", "2d 4h")])) && reset.contains(" · "), "relative and absolute: {reset}");
+        assert!(groups[1].starts_with(&format!("{}: 77% {} · {reset}", en("weekly", &[]), en("used", &[]))), "{}", groups[1]);
+        assert!(groups[1].contains(&format!("{}: 40%", en("weekly_opus", &[]))), "model windows too: {}", groups[1]);
+        assert!(groups[1].contains(&en("runsOut", &[("at", &crate::i18n_format::day_time("en", now + chrono::Duration::hours(30)))])));
+        assert_eq!(groups[2], format!("{}\n{}", en("lastObserved", &[("t", "3m")]), en("tipMonitorOn", &[])));
+        assert!(groups[3].contains(&en("resetUsableNow", &[])));
+        // A failing, unmonitored account says why, and leaves out what it doesn't have.
+        let mut b = a.clone();
+        b.alias = None;
+        b.leased = None;
+        b.remote.clear();
+        b.resets.clear();
+        b.active = false;
+        b.monitor_connected = false;
+        b.error = Some("token_expired".into());
+        let d = account_detail(&En, &b, now);
+        assert!(d.starts_with("max@example.invalid\nClaude · Max 20x\n\n"), "{d}");
+        assert!(d.contains(&en("token_expired", &[("provider", "Claude Code")])) && d.contains(&en("tipMonitorOff", &[])));
+        assert!(!d.ends_with('\n') && !d.contains("\n\n\n"));
     }
 
     #[test]

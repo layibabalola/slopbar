@@ -390,6 +390,8 @@ unsafe fn tooltip(owner: HWND, instance: windows_sys::Win32::Foundation::HINSTAN
     );
     if !tip.is_null() {
         wm::SendMessageW(tip, cc::TTM_SETMAXTIPWIDTH, 0, 400);
+        // The tooltips run to a dozen lines: leave them up long enough to read (30 s).
+        wm::SendMessageW(tip, cc::TTM_SETDELAYTIME, cc::TTDT_AUTOPOP as usize, 30_000);
     }
     tip
 }
@@ -408,7 +410,8 @@ unsafe fn set_tools(l: &mut Local, owner: HWND, tips: &[(widget::Box2, String)],
     }
     let k = widget::scale(dpi);
     for (id, (b, text)) in tips.iter().enumerate() {
-        let mut text = wide(text);
+        // A tooltip breaks lines at CR LF (with a maximum width set).
+        let mut text = wide(&text.replace('\n', "\r\n"));
         info.uFlags = cc::TTF_SUBCLASS;
         info.uId = id;
         info.rect = RECT {

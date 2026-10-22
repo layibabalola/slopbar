@@ -3,6 +3,7 @@ import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { creditAdviceText } from "./alerts.js";
 import { sparkline } from "./sparkline.js";
+import { accountTip } from "./accounttext.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -24,6 +25,8 @@ let lastSnap = { accounts: [], updated_at: null };
 let current = null;
 /** Each account's weekly usage over the last 7 days, keyed `provider:id` (get_sparklines). */
 let trails = {};
+/** Each account's get_subscriptions entry, keyed `provider:id`, for the compact tooltips. */
+let subs = {};
 /** The compact layout is offered above this many accounts. */
 const COMPACT_OFFER_ABOVE = 8;
 
@@ -170,21 +173,26 @@ function renderDetails(snap) {
     </section>`).join(""));
 }
 
-/** One line per account: provider mark, name, the binding window's %, the sparkline, and Use. */
+/** One line per account: provider mark, name, the binding window's %, the sparkline, and Use.
+ * The row's tooltip says everything the full card would (accountTip), and screen readers get
+ * the same text as the row's description. */
 function renderCompactList(snap) {
   const list = ["claude", "codex"].flatMap((p) => snap.accounts.filter((a) => a.provider === p));
-  patch($accounts, `<div class="compact-list" role="list" aria-label="${esc(t("title"))}">${list.map((a) => {
+  patch($accounts, `<div class="compact-list" role="list" aria-label="${esc(t("title"))}">${list.map((a, i) => {
+    const key = `${a.provider}:${a.id}`;
     const w = a.stale || a.error ? null : peak(a);
     const problem = a.error || a.monitor_error ? errorText(PROVIDER_NAME[a.provider], a.error ?? a.monitor_error) : "";
     const used = w ? `${Math.round(w.used_percent)}%` : "—";
     const usedText = w ? `${windowLabel(w)}: ${used} ${t("used")}` : t("usageUnknown");
+    const tip = accountTip(a, { sub: subs[key], trail: trails[key], creditAdvice: creditAdvice[key] });
     return `
-      <div class="acct line ${a.active ? "active" : ""}" role="listitem" data-key="${a.provider}:${esc(a.id)}">
-        <span class="provider-mark ${a.provider}" role="img" aria-label="${PROVIDER_NAME[a.provider]}" title="${PROVIDER_NAME[a.provider]}">${MARK[a.provider]}</span>
-        <span class="who" title="${esc([accountName(a), a.alias ? a.email : "", a.plan].filter(Boolean).join(" · "))}">${esc(accountName(a))}</span>
-        ${problem ? `<span class="problem" role="img" aria-label="${esc(problem)}" title="${esc(problem)}">!</span>` : ""}
-        ${sparkline(trails[`${a.provider}:${a.id}`])}
-        <b class="pct" style="color:${w ? color(w.used_percent) : "var(--text-2)"}" title="${esc(usedText)}" aria-label="${esc(usedText)}">${used}</b>
+      <div class="acct line ${a.active ? "active" : ""}" role="listitem" data-key="${a.provider}:${esc(a.id)}" title="${esc(tip)}" aria-describedby="tip-${i}">
+        <span class="sr-only" id="tip-${i}">${esc(tip)}</span>
+        <span class="provider-mark ${a.provider}" role="img" aria-label="${PROVIDER_NAME[a.provider]}">${MARK[a.provider]}</span>
+        <span class="who">${esc(accountName(a))}</span>
+        ${problem ? `<span class="problem" role="img" aria-label="${esc(problem)}">!</span>` : ""}
+        ${sparkline(trails[key], { tooltip: false })}
+        <b class="pct" style="color:${w ? color(w.used_percent) : "var(--text-2)"}" aria-label="${esc(usedText)}">${used}</b>
         ${a.active
           ? `<span class="in-use ${a.pending ? "pending" : ""}">${t("inUse")}</span>`
           : `<button class="use" data-provider="${a.provider}" data-id="${esc(a.id)}" aria-label="${esc(`${t("use")} ${accountName(a)}`)}">${t("use")}</button>`}
@@ -303,6 +311,7 @@ function applySettings(settings) {
   current = settings;
   setLanguage(settings.language);
   translateDom();
+  loadSubs();
   if (IS_DOCK) {
     const labels = Object.fromEntries(["refresh", "settings", "quit"].map((k) => [k, t(k)]));
     invoke("set_menu_labels", { labels });
@@ -329,6 +338,17 @@ function loadTrails() {
 }
 listen("usage-updated", loadTrails);
 loadTrails();
+// Each account's plan, renewal and verdict (get_subscriptions), keyed `provider:id`, for the
+// compact rows' tooltips.
+function loadSubs() {
+  if (IS_DOCK || !current?.compact_flyout) return;
+  invoke("get_subscriptions").then((report) => {
+    subs = Object.fromEntries((report?.accounts ?? []).map((e) => [`${e.provider}:${e.id}`, e]));
+    if (current?.compact_flyout) render(lastSnap);
+  }, () => {});
+}
+listen("usage-updated", loadSubs);
+loadSubs();
 invoke("get_usage").then(render);
 // Times ("resets in 2 h") move on between refreshes. The widget redraws every minute; the
 // flyout only while it is open, and as it opens.

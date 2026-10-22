@@ -128,6 +128,7 @@ pub(crate) async fn health_report(app: &AppHandle) -> health::Report {
         vault_plaintext: accounts::plaintext_slots(),
         processes: tauri::async_runtime::spawn_blocking(crate::instance::processes).await.ok().flatten(),
         disk: tauri::async_runtime::spawn_blocking(disk_use).await.ok().flatten(),
+        wsl: sources::wsl_status(),
     }, chrono::Utc::now())
 }
 
@@ -608,6 +609,13 @@ fn record_frontend_error(state: tauri::State<AppState>, surface: diagnostics::Su
 
 #[tauri::command]
 async fn refresh(app: AppHandle) -> Snapshot {
+    do_refresh(&app).await
+}
+
+/// Settings > Data, "Rescan WSL": reads every distro once, starting stopped ones, then refreshes.
+#[tauri::command]
+async fn rescan_wsl(app: AppHandle) -> Snapshot {
+    sources::request_wsl_rescan();
     do_refresh(&app).await
 }
 
@@ -1495,6 +1503,7 @@ pub(crate) fn apply_settings(app: &AppHandle) {
         let _ = if settings.launch_at_login { autolaunch.enable() } else { autolaunch.disable() };
     }
     dock::apply_mode(app, settings.native_widget);
+    sources::set_wsl_mode(settings.wsl_accounts);
     let _ = app.emit("settings-changed", &settings);
 }
 
@@ -2081,6 +2090,7 @@ pub fn run() {
             restart_app,
             get_subscriptions,
             get_sparklines,
+            rescan_wsl,
             hide_panel,
             get_usage_breakdown,
             export_csv,

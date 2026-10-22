@@ -1,6 +1,7 @@
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { sparkline } from "./sparkline.js";
+import { money, pct, amount, renewalText, adviceText, creditsLine, extraUsageLine } from "./accounttext.js";
 import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetText, errorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
@@ -312,8 +313,6 @@ listen("account-added", () => { $("add-hint").hidden = true; });
 
 let report = null;
 const NOTIFY_KINDS = ["usage", "resets", "switches", "renewals", "extra_usage", "burn", "reset_credits", "unexpected_use", "digest"];
-const money = (v) => (v == null ? "" : `$${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`);
-const pct = (v) => `${Math.round(v)}%`;
 const VERDICT_TONE = { exhausted_weekly: "bad", unused: "warn", underused: "warn", healthy: "ok", insufficient_data: "" };
 
 function verdictLines(e) {
@@ -344,31 +343,6 @@ function localText(e) {
   return parts.join(" · ");
 }
 
-function renewalText(e) {
-  if (e.ends_at) return t("subEnds", { d: shortDate(e.ends_at) });
-  if (!e.renewal) return e.plan_kind === "personal" ? t("subRenewUnknown") : "";
-  // An entered billing day is a calendar day; the others are moments.
-  const when = e.renewal.source === "entered" ? shortDay(e.renewal.at) : shortDate(e.renewal.at);
-  // Calendar days, as people count them: tomorrow is 1 day away whatever the hour.
-  const midnight = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; };
-  const days = Math.max(0, Math.round((midnight(e.renewal.at) - midnight(Date.now())) / 86400000));
-  const source = t({ entered: "subSourceEntered", provider: "subSourceProvider", estimated: "subSourceEstimated" }[e.renewal.source]);
-  return t(days === 0 ? "subRenewsToday" : days === 1 ? "subRenewsTomorrow" : "subRenews", { d: when, n: days, source });
-}
-
-function adviceText(e) {
-  const a = e.assessment;
-  if (e.ends_at) return t("subAdviceEnding", { d: shortDate(e.ends_at) });
-  if (e.cancel_after) return t("subLapsing", { d: shortDay(e.cancel_after) });
-  if (e.plan_kind !== "personal") return "";
-  if (a.verdict === "unused") return t(e.renewal ? "subAdviceUnused" : "subAdviceUnusedNoDate", { d: e.renewal ? (e.renewal.source === "entered" ? shortDay : shortDate)(e.renewal.at) : "" });
-  if (a.verdict === "underused") return t(a.renew_wasteful ? "subAdviceUnderused" : "subAdviceUnderusedMaybe");
-  if (a.verdict === "exhausted_weekly") return t("subAdviceExhausted");
-  return "";
-}
-
-const amount = (v) => Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
-
 // What the plan costs for the use it gets: "$0.92 per 1% of the weekly limit used · $12.50 per thread (this PC only)".
 function costPerUseText(e) {
   const c = e.cost_per_use;
@@ -377,25 +351,6 @@ function costPerUseText(e) {
   if (c.per_percent != null) parts.push(t("subPerPercent", { v: money(c.per_percent) }));
   if (c.per_local_thread != null) parts.push(t("subPerThread", { v: money(c.per_local_thread) }));
   return parts.join(" · ");
-}
-
-// Purchased Codex credits, never priced: OpenAI does not publish one credit price.
-function creditsLine(c) {
-  if (!c) return "";
-  if (c.unlimited) return t("subCreditsUnlimited");
-  const parts = [];
-  if (c.balance != null) parts.push(t("subCredits", { v: amount(c.balance) }));
-  if (c.spent && c.since) parts.push(t("subCreditsSpent", { n: amount(c.spent), d: shortDate(c.since) }));
-  return parts.join(" · ");
-}
-
-// Claude extra usage this month, when turned on: "Extra usage: $73.47 of $400 (18%)".
-function extraUsageLine(x) {
-  if (!x || x.enabled !== true) return "";
-  const used = x.used != null ? money(x.used) : "—";
-  return x.monthly_limit != null
-    ? t("subExtraUsage", { v: used, limit: money(x.monthly_limit), p: x.utilization != null ? pct(x.utilization) : "—" })
-    : t("subExtraUsageNoLimit", { v: used });
 }
 
 function subscriptionRow(e) {
@@ -917,6 +872,8 @@ async function render() {
 
   $("claude").checked = settings.providers.claude;
   $("codex").checked = settings.providers.codex;
+  $("wsl-accounts").innerHTML = ["auto", "on", "off"].map((v) => `<option value="${v}">${t(`wsl_${v}`)}</option>`).join("");
+  $("wsl-accounts").value = settings.wsl_accounts ?? "auto";
   $("startup").checked = settings.launch_at_login;
   $("auto-update").checked = updatesEnabled && settings.auto_update;
   $("auto-update").disabled = !updatesEnabled;
@@ -969,6 +926,15 @@ $("export-diagnostics").addEventListener("click", async () => {
 });
 $("crash-records").addEventListener("change", (e) => update({ crash_records: e.target.checked }));
 $("auto-monitoring").addEventListener("change", (e) => update({ auto_connect_monitoring: e.target.checked }));
+$("wsl-accounts").addEventListener("change", (e) => update({ wsl_accounts: e.target.value }));
+// Reads every WSL distro once, starting stopped ones, then refreshes.
+$("wsl-rescan").addEventListener("click", async () => {
+  const button = $("wsl-rescan");
+  button.disabled = true;
+  $("wsl-rescan-hint").textContent = t("wslRescanning");
+  try { snapshot = await invoke("rescan_wsl"); renderAccounts(); await loadHealth(); }
+  finally { button.disabled = false; $("wsl-rescan-hint").textContent = t("wslRescanHint"); }
+});
 $("compact-flyout").addEventListener("change", (e) => update({ compact_flyout: e.target.checked, compact_suggested: true }));
 
 // ---------------------------------------------------------------------------------------------

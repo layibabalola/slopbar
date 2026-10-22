@@ -205,6 +205,40 @@ pub fn window_label(lang: &str, kind: &str, window_seconds: Option<i64>) -> Stri
     }
 }
 
+/// A window not started yet (i18n.js `notStarted`): Codex reports an unused window as resetting
+/// one full window after the request, a time that moves with every poll.
+pub fn not_started(w: &crate::model::UsageWindow, fetched_at: Option<DateTime<Utc>>) -> bool {
+    match (w.resets_at, fetched_at, w.window_seconds) {
+        (Some(at), Some(fetched), Some(secs)) if w.used_percent == 0.0 && secs > 0 =>
+            ((at - fetched).num_milliseconds() - secs * 1000).abs() <= 120_000,
+        _ => false,
+    }
+}
+
+/// When a window resets, relative and absolute ("Resets in 2d 4h · Oct 24, 3:14 PM GMT+2"), or
+/// its unknown, not-started, stale or elapsed state (i18n.js `windowResetText`).
+pub fn window_reset_text(lang: &str, w: &crate::model::UsageWindow, stale: bool, fetched_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    let Some(at) = w.resets_at else { return t(lang, "resetTimeUnavailable", &[]) };
+    if not_started(w, fetched_at) {
+        return t(lang, "windowNotStarted", &[]);
+    }
+    let date = reset_date(lang, at);
+    if stale {
+        return t(lang, "lastResetAt", &[("d", &date)]);
+    }
+    if at <= now {
+        return t(lang, "resetAwaitingRefresh", &[("d", &date)]);
+    }
+    format!("{} · {date}", resets_in(lang, Some(at), now))
+}
+
+/// The windows whose reset is worth showing (i18n.js `visibleResetWindows`): a session reset
+/// restores nothing while the overall week is used up.
+pub fn shows_reset(windows: &[crate::model::UsageWindow], w: &crate::model::UsageWindow) -> bool {
+    let week_out = windows.iter().any(|x| x.kind == "weekly" && x.used_percent >= 100.0);
+    w.resets_at.is_some() && !(week_out && w.kind == "session")
+}
+
 /// Identical resets merged (i18n.js `groupResets`): a total count, the soonest expiry, and how
 /// many entries were merged.
 #[derive(Debug, Clone, PartialEq)]
