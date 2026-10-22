@@ -39,20 +39,20 @@ upstream PR.
 | 15 | **Self-check panel.** Monitoring sign-ins about to expire, reconnects needed, stale accounts, door and rclone health, each with its one-click fix. | done (ed8d1f6) |
 | 16 | **Telemetry policy.** Local only by default; at most an opt-in crash report inside the existing diagnostics export. Recorded in SECURITY.md and built with item 15. | done (ed8d1f6) |
 
-## Wave 3: running
+## Wave 3: done (merged at a153ddc on claude/subscription-value)
 
-| # | Item |
-|---|---|
-| 6 | **An account per project.** Pin a repo to an account through the CLIs' config-folder environment variables, so projects stop fighting over the global login. |
-| 7 | **Quick switcher.** A global hotkey opens a type-to-filter list of accounts by email, with headroom. |
-| 8 | **Bulk actions.** Connect monitoring for all; remove lapsed accounts once their paid period ends. |
-| 9 | **Renewal calendar.** Export renewal dates as an `.ics` feed for Outlook or Google Calendar. |
-| 12 | **When you work.** A heatmap of usage by hour and weekday from local Codex and Claude logs, to size accounts for peak hours. |
-| 13 | **Monday digest.** One notification with spend, waste, renewals this week, and accounts that ran out. |
-| 14 | **CSV export** of weekly history. |
-| 21 | **Usage by project and model, per account.** Which repos each account worked in, which models it used and how many tokens each, from local Claude Code and Codex logs; attributed to accounts by the thread record (Codex) or by which account was active at the time (Claude). Added by the owner on 2026-10-21. |
-| 22 | **Auto-connect monitoring.** When an unmonitored account is the one in use, start its monitoring sign-in automatically (one browser approval), with backoff and a setting. Added by the owner on 2026-10-21. |
-| 19 | **Claude Code status line.** The active account's headroom and time-to-limit in the status line. |
+| # | Item | Status |
+|---|---|---|
+| 6 | **An account per project.** Pin a repo to an account through the CLIs' config-folder environment variables, so projects stop fighting over the global login. | done (a153ddc) |
+| 7 | **Quick switcher.** A global hotkey opens a type-to-filter list of accounts by email, with headroom. | done (a153ddc) |
+| 8 | **Bulk actions.** Connect monitoring for all; remove lapsed accounts once their paid period ends. | done (a153ddc) |
+| 9 | **Renewal calendar.** Export renewal dates as an `.ics` feed for Outlook or Google Calendar. | done (520049a) |
+| 12 | **When you work.** A heatmap of usage by hour and weekday from local Codex and Claude logs, to size accounts for peak hours. | done (5cabf91) |
+| 13 | **Monday digest.** One notification with spend, waste, renewals this week, and accounts that ran out. | done (520049a) |
+| 14 | **CSV export** of weekly history. | done (5cabf91) |
+| 21 | **Usage by project and model, per account.** Which repos each account worked in, which models it used and how many tokens each, from local Claude Code and Codex logs; attributed to accounts by the thread record (Codex) or by which account was active at the time (Claude). Added by the owner on 2026-10-21. | done (5cabf91) |
+| 22 | **Auto-connect monitoring.** When an unmonitored account is the one in use, start its monitoring sign-in automatically (one browser approval), with backoff and a setting. Added by the owner on 2026-10-21. | done (7e7ba16) |
+| 19 | **Claude Code status line.** The active account's headroom and time-to-limit in the status line. | done (520049a) |
 
 ## Done before this roadmap (branch `claude/subscription-value`; upstream thelioo/slopbar#8–#11, stacked on #6)
 
