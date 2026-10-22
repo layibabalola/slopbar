@@ -66,30 +66,38 @@ upstream PR.
 | 28 | **Spend ledger**: month-by-month cost per plan, year-to-date totals, optional tax rate and currency. | done (d4c2800) |
 | 29 | **SlopBar Ultra releases and updates**: signed installers from the fork; Ultra's updater follows the fork's releases. | done (ultra-releases ac7e652) |
 
-## Wave 5: running
-
-| # | Item |
-|---|---|
-| 30 | **Translations** of every new string into the nine other supported languages. |
-| 31 | **Exact Claude attribution**: a Claude Code SessionStart hook recording which account each session started on. |
-| 32 | **Account leases**: agents claim and release an account for a job through the door. |
-| 33 | **Smart launcher**: slopbar-run combines project pins with recommend_account. |
-| 34 | **Sparklines and compact mode** in the flyout. |
-| 35 | **Onboarding** for first run. |
-| 36 | **Accessibility pass**: keyboard, screen reader, contrast. |
-
-## Wave 6: running (added by the owner on 2026-10-22)
+## Wave 5: done (merged at 40439db)
 
 | # | Item | Status |
 |---|---|---|
-| 37 | **Install lock and strict single instance**: a machine-wide install lock; a second instance always hands over and exits; Health flags duplicates. Prompted by two instances running after racing installs on 2026-10-22. | running |
-| 38 | **MCP server cleanup**: slopbar-mcp exits when its agent disconnects; Health counts lingering servers. | running |
-| 39 | **Faster refresh**: per-phase timing; non-essential work off the refresh path; under 5 s for 15 accounts. | running |
-| 40 | **Runaway-agent alert**: abnormal burn per account, with the repo and model behind it. | running |
-| 41 | **Reset-credit advisor**: spend a banked Codex reset or switch; remind before resets expire. | running |
-| 42 | **Capacity-shortage advice**: the cheapest fix when the pool is short. | running |
-| 43 | **Encrypted backup and restore** of settings, plan details and history (never sign-ins). | running |
-| 44 | **Opt-in phone alerts** through a self-hostable push service (ntfy). | running |
+| 30 | **Translations** of every new string into the nine other supported languages. | done (40439db) |
+| 31 | **Exact Claude attribution**: a Claude Code SessionStart hook recording which account each session started on. | done (40439db) |
+| 32 | **Account leases**: agents claim and release an account for a job through the door. | done (40439db) |
+| 33 | **Smart launcher**: slopbar-run combines project pins with recommend_account. | done (40439db) |
+| 34 | **Sparklines and compact mode** in the flyout. | done (40439db) |
+| 35 | **Onboarding** for first run. | done (40439db) |
+| 36 | **Accessibility pass**: keyboard, screen reader, contrast. | done (40439db) |
+
+## Wave 6: done (added by the owner on 2026-10-22; merged at 40439db)
+
+| # | Item | Status |
+|---|---|---|
+| 37 | **Install lock and strict single instance**: a machine-wide install lock; a second instance always hands over and exits; Health flags duplicates. Prompted by two instances running after racing installs on 2026-10-22. | done (40439db) |
+| 38 | **MCP server cleanup**: slopbar-mcp exits when its agent disconnects; Health counts lingering servers. | done (40439db) |
+| 39 | **Faster refresh**: per-phase timing; non-essential work off the refresh path; under 5 s for 15 accounts. | done (40439db) |
+| 40 | **Runaway-agent alert**: abnormal burn per account, with the repo and model behind it. | done (40439db) |
+| 41 | **Reset-credit advisor**: spend a banked Codex reset or switch; remind before resets expire. | done (40439db) |
+| 42 | **Capacity-shortage advice**: the cheapest fix when the pool is short. | done (40439db) |
+| 43 | **Encrypted backup and restore** of settings, plan details and history (never sign-ins). | done (40439db) |
+| 44 | **Opt-in phone alerts** through a self-hostable push service (ntfy). | done (40439db) |
+
+## Wave 7: running (added by the owner on 2026-10-22)
+
+| # | Item | Status |
+|---|---|---|
+| 45 | **Smaller footprint without losing features**: Settings, switcher and flyout built on demand; one shared WebView2 process group; quiet idle timers; capped diagnostics exports and install rollbacks. Measured before: 452 MB private, ~6.5% of a core, 1 GB of exports and rollbacks. | running |
+| 46 | **Native taskbar widget**: draw the always-visible widget with Windows' own drawing instead of a web view, for a small (~80-100 MB) idle footprint. Starts after #45 is measured. | queued |
+| 30b | **Translate the 130 strings added in waves 5 and 6.** | running |
 
 ## Done before this roadmap (branch `claude/subscription-value`; upstream thelioo/slopbar#8–#11, stacked on #6)
 
