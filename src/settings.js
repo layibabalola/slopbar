@@ -368,15 +368,6 @@ function extraUsageLine(x) {
     : t("subExtraUsageNoLimit", { v: used });
 }
 
-// Claude extra usage this month, when turned on: "Extra usage: $73.47 of $400 (18%)".
-function extraUsageLine(x) {
-  if (!x || x.enabled !== true) return "";
-  const used = x.used != null ? money(x.used) : "—";
-  return x.monthly_limit != null
-    ? t("subExtraUsage", { v: used, limit: money(x.monthly_limit), p: x.utilization != null ? pct(x.utilization) : "—" })
-    : t("subExtraUsageNoLimit", { v: used });
-}
-
 function subscriptionRow(e) {
   const key = `${e.provider}:${e.id}`;
   const prefs = settings.subscriptions?.[key] ?? {};
