@@ -9,6 +9,12 @@ through `inspect_window`, never through the user's desktop.
 
 Status: `running` (a session has it), `queued`, `done` (merged; the commit is noted).
 
+**Upstream PRs.** Every item also goes to the official product as its own pull request on
+thelioo/slopbar. Its branch is cut at the item's merge commit, it targets `main`, and its
+description names the PRs it stacks on. The work before this roadmap is #6, then #8, #9, #10 and
+#11, merged in that order. This roadmap file itself stays on the fork and is never part of an
+upstream PR.
+
 ## Wave 1: running
 
 | # | Item | Status |
@@ -44,7 +50,7 @@ Status: `running` (a session has it), `queued`, `done` (merged; the commit is no
 | 14 | **CSV export** of weekly history. |
 | 19 | **Claude Code status line.** The active account's headroom and time-to-limit in the status line. |
 
-## Done before this roadmap (branch `claude/subscription-value`, PR thelioo/slopbar#7)
+## Done before this roadmap (branch `claude/subscription-value`; upstream thelioo/slopbar#8–#11, stacked on #6)
 
 Subscriptions page with verdicts and renewal dates; Codex inspection from local history;
 renewal dates from the providers and user corrections; ChatGPT Pro tier detection
