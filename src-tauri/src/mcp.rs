@@ -128,7 +128,7 @@ fn catalog() -> Vec<Tool> {
             }), &[]), true, false, true, false),
         tool("export_csv", "Export CSV", "Write three CSV files (weekly usage history per account, the usage breakdown by local day, account, repository and model for 63 days, and the subscription report) into folder (an absolute path, created if missing; default Documents\\SlopBar Exports) and return their paths, row counts and sizes. The files hold account emails and repository names; they stay on this machine unless the user shares them.",
             schema(json!({ "folder": { "type": "string", "description": "Absolute folder path; default Documents\\SlopBar Exports." } }), &[]), false, false, false, false),
-        tool("get_health", "Get health", "SlopBar's self-check, as Settings > Health shows it: overall status (ok, warning or problem), counts, and each check with id, status, title, a one-line reason and its fix (connect_monitoring with provider and id, refresh, restart_app, or open_settings with a page). Checks: monitoring sign-ins needing reconnecting, expiring within three days, failing or not connected; usage readings older than two refresh intervals; the last refresh that read usage; the agent door; in-use sharing writing and reading; rclone when a remote is chosen; the diagnostics journal; notification registration and the Windows notification switches. Computed from what SlopBar already knows, no network. Apply a fix only when the user asks.", none(), true, false, true, false),
+        tool("get_health", "Get health", "SlopBar's self-check, as Settings > Health shows it: overall status (ok, warning or problem), counts, and each check with id, status, title, a one-line reason and its fix (connect_monitoring with provider and id, refresh, restart_app, or open_settings with a page). Checks: monitoring sign-ins needing reconnecting, expiring within three days, failing or not connected; CLI sign-ins the provider rejected (cli:<provider>:<id>; the CLI signs in again on its own); saved sign-ins still stored as plaintext (vault); usage readings older than two refresh intervals; the last refresh that read usage; the agent door; in-use sharing writing and reading; rclone when a remote is chosen; the diagnostics journal; notification registration and the Windows notification switches. Computed from what SlopBar already knows, no network. Apply a fix only when the user asks.", none(), true, false, true, false),
         tool("update_settings", "Update settings", "Change settings with a JSON merge patch over get_settings' shape, e.g. {\"refresh_minutes\": 15, \"balancer\": {\"claude\": {\"auto\": true, \"threshold\": 85}}}. Only values the Settings window offers are accepted. Returns the saved settings.", settings_patch_schema(), false, true, true, false),
         tool("switch_account", "Switch account", "Make this saved account the one the provider's CLI uses (as Use in Settings). Running agent sessions on that CLI are affected. Returns the new snapshot and switched_to_requested (false if automatic switching moved away again).", account_schema(), false, true, true, true),
         tool("add_account", "Add account", "Open the provider CLI's own sign-in in a terminal for the user to complete; the account appears in get_usage once they finish. Returns at once; only one can be pending per provider.",
@@ -136,6 +136,13 @@ fn catalog() -> Vec<Tool> {
         tool("connect_monitoring", "Connect monitoring", "Start a separate monitoring sign-in for this account (the user completes it) so its usage stays visible while it is not in use. Returns at once; check get_usage afterwards.", account_schema(), false, false, false, true),
         tool("disconnect_monitoring", "Disconnect monitoring", "Stop independent monitoring for this account and revoke its monitoring sign-in. Returns the new snapshot and whether the provider confirmed the revocation.", account_schema(), false, true, true, true),
         tool("remove_account", "Remove account", "Remove a saved account that is not in use, revoking its monitoring sign-in. Returns the new usage snapshot.", account_schema(), false, true, true, true),
+        tool("revoke_account_sessions", "Revoke all SlopBar sessions", "Revoke every sign-in SlopBar itself holds for this account: its monitoring session is revoked at the provider and forgotten here. The CLI's own sign-in is managed by the CLI and is not revoked (sign out there: claude /logout, codex logout); remove_slot: true also removes SlopBar's saved copy of it, as remove_account does (never while in use). Without confirm: true it only reports what it would do (monitoring_connected, in_use); with it, it returns monitoring (revoked, unconfirmed or none), slot_removed and the new snapshot. Only when the user asked.",
+            schema(json!({
+                "provider": { "type": "string", "enum": ["claude", "codex"] },
+                "id": { "type": "string", "description": "The account id from get_usage." },
+                "confirm": { "type": "boolean", "description": "Revoke (default false: only report)." },
+                "remove_slot": { "type": "boolean", "description": "Also remove the saved CLI login from SlopBar (default false)." },
+            }), &["provider", "id"]), false, true, true, true),
         tool("connect_monitoring_all", "Connect monitoring for all", "Monitoring sign-ins for every account without monitoring, queued one after another (one terminal at a time, never in parallel); each waits for the user to sign in as the account named in Settings and the queue stops at the first that fails. Without confirm: true it only returns the accounts it would queue (to_connect); with it, it starts the queue and returns at once. Only when the user asked.",
             schema(json!({ "confirm": { "type": "boolean", "description": "Start the queue (default false: only list the accounts)." } }), &[]), false, false, false, true),
         tool("remove_lapsed_accounts", "Remove lapsed accounts", "Remove every saved account whose plan has ended: its last paid day (subscriptions cancel_after) has passed, or the provider said it would not renew and its end has passed. Accounts in use are never removed (in_use). Without confirm: true it only returns what it would remove (to_remove, each with the day it ended); with it, it removes them as remove_account does, revoking their monitoring sign-ins. Only when the user asked.",
@@ -203,7 +210,7 @@ fn request(name: &str, args: &Value) -> Option<Result<Request, String>> {
         "export_csv" => with("export_csv"),
         "update_settings" => with("update_settings"),
         "switch_account" | "add_account" | "connect_monitoring" | "disconnect_monitoring" | "remove_account" => with(name),
-        "connect_monitoring_all" | "remove_lapsed_accounts" | "set_project_pin" => with(name),
+        "connect_monitoring_all" | "remove_lapsed_accounts" | "set_project_pin" | "revoke_account_sessions" => with(name),
         "list_project_pins" => simple("list_project_pins"),
         "check_for_updates" => simple("check_for_updates"),
         "install_update" => simple("install_update"),
@@ -463,7 +470,7 @@ mod tests {
     fn every_listed_tool_maps_to_a_door_operation() {
         let listed = rpc(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).unwrap();
         let tools = listed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 31);
+        assert_eq!(tools.len(), 32);
         let account = json!({ "provider": "claude", "id": "a1" });
         for t in tools {
             let name = t["name"].as_str().unwrap();
@@ -475,7 +482,7 @@ mod tests {
                 "inspect_window" => json!({ "window": "settings", "page": "subscriptions" }),
                 "open_billing_page" => json!({ "provider": "codex" }),
                 "recommend_account" => json!({ "provider": "claude", "expected_percent": 30, "hours": 6 }),
-                "switch_account" | "connect_monitoring" | "disconnect_monitoring" | "remove_account" => account.clone(),
+                "switch_account" | "connect_monitoring" | "disconnect_monitoring" | "remove_account" | "revoke_account_sessions" => account.clone(),
                 "set_project_pin" => json!({ "folder": "C:/code/repo", "provider": "claude", "id": "a1" }),
                 _ => json!({}),
             };
@@ -487,9 +494,11 @@ mod tests {
         let rec = tool("recommend_account", json!({ "provider": "codex" }), None);
         assert_eq!(rec["result"]["structuredContent"]["switch"], false, "recommend_account only reports by default");
         let marked = |hint: &str| -> Vec<&str> { tools.iter().filter(|t| t["annotations"][hint] == true).map(|t| t["name"].as_str().unwrap()).collect() };
-        assert_eq!(marked("destructiveHint"), ["recommend_account", "refresh_usage", "update_settings", "switch_account", "disconnect_monitoring", "remove_account", "remove_lapsed_accounts", "set_project_pin", "install_update", "quit_app"]);
+        assert_eq!(marked("destructiveHint"), ["recommend_account", "refresh_usage", "update_settings", "switch_account", "disconnect_monitoring", "remove_account", "revoke_account_sessions", "remove_lapsed_accounts", "set_project_pin", "install_update", "quit_app"]);
         assert_eq!(tool("remove_lapsed_accounts", json!({}), None)["result"]["structuredContent"], json!({ "op": "remove_lapsed_accounts", "confirm": false }), "bulk tools only report by default");
         assert_eq!(tool("connect_monitoring_all", json!({}), None)["result"]["structuredContent"], json!({ "op": "connect_monitoring_all", "confirm": false }));
+        assert_eq!(tool("revoke_account_sessions", json!({ "provider": "codex", "id": "a1" }), None)["result"]["structuredContent"],
+            json!({ "op": "revoke_account_sessions", "provider": "codex", "id": "a1", "confirm": false, "remove_slot": false }), "revoking only reports by default");
         assert_eq!(tool("set_project_pin", json!({ "folder": "C:/a", "provider": "codex", "id": null }), None)["result"]["structuredContent"]["id"], Value::Null);
         assert_eq!(marked("readOnlyHint"), ["get_usage", "get_headroom", "get_settings", "get_subscription_report", "get_usage_breakdown", "get_health", "list_project_pins", "check_for_updates", "get_app_info", "inspect_window", "list_sharing_locations", "list_diagnostic_exports"]);
     }
@@ -508,6 +517,8 @@ mod tests {
             ("get_headroom", json!({ "provider": "claude", "window": "weekly" })),
             ("set_project_pin", json!({ "folder": "C:/a" })),
             ("remove_lapsed_accounts", json!({ "confirm": "yes" })),
+            ("revoke_account_sessions", json!({ "provider": "claude" })),
+            ("revoke_account_sessions", json!({ "provider": "claude", "id": "a", "confirm": 1 })),
             ("list_project_pins", json!({ "folder": "C:/a" })),
             ("get_usage_breakdown", json!({ "group_by": "hour" })),
             ("export_csv", json!({ "path": "C:\\x" })),

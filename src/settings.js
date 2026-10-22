@@ -75,6 +75,7 @@ function accountRow(p, a) {
           ${a.used_outside ? `<em class="chip outside" title="${esc(t("usedOutsideHint"))}">${t("usedOutside")}</em>` : ""}
           ${a.unexpected ? `<em class="chip unexpected" title="${esc(t("unexpectedHint", { t: duration(Math.max(1, Math.round((Date.now() - new Date(a.unexpected.last_seen)) / 60000))) }))}">${esc(t(a.unexpected.seen_week === 1 ? "unexpectedSeenOnce" : "unexpectedSeen", { n: a.unexpected.seen_week }))}</em>` : ""}
           ${a.plan ? `<em class="chip">${esc(a.plan)}</em>` : ""}
+          ${signInChips(p, a)}
           ${resets}
           <span>${esc([a.active && places.elsewhere ? places.inUse : "", ...places.seen, settings.aliases[key] ? a.email ?? "" : a.org ?? ""].filter(Boolean).join(" · "))}</span>
         </small>
@@ -87,6 +88,7 @@ function accountRow(p, a) {
           ? `<button class="btn" data-monitor="${p}" data-id="${esc(a.id)}">${t(a.monitor_connected ? "monitorReconnect" : "monitorConnect")}</button>`
           : ""}
         ${a.monitor_connected ? `<button class="btn" data-disconnect="${p}" data-id="${esc(a.id)}">${t("monitorDisconnect")}</button>` : ""}
+        <button class="btn" data-revoke-all="${p}" data-id="${esc(a.id)}" data-active="${a.active ? "1" : ""}" title="${esc(t("revokeAllHint"))}">${t("revokeAll")}</button>
         ${a.monitor_connected && (settings.presence_folder || settings.presence_remote)
           ? `<label class="web-use" title="${esc(t("webUseHint"))}"><input type="checkbox" data-web-use="${esc(key)}" ${settings.web_use?.[key] ? "checked" : ""} /> ${t("webUse")}</label>`
           : ""}
@@ -100,6 +102,16 @@ function accountRow(p, a) {
         <svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>
       </button>
     </div>`;
+}
+
+/** Sign-in health: the provider rejected the monitoring sign-in, or the CLI's own saved login. */
+function signInChips(p, a) {
+  const monitoring = a.monitor_connected && ["monitor_reconnect", "monitor_wrong_account", "monitor_uncertain"].includes(a.monitor_error ?? a.error);
+  const cli = p === "claude" ? "claude /login" : "codex login";
+  return [
+    monitoring ? `<em class="chip unexpected" title="${esc(t("monitorRejectedHint"))}">${t("monitorRejected")}</em>` : "",
+    a.cli_rejected ? `<em class="chip unexpected" title="${esc(t("cliRejectedHint", { cli }))}">${t("cliRejected")}</em>` : "",
+  ].join("");
 }
 
 /** Replaces only the account rows that changed (see main.js), so buttons don't flicker. */
@@ -165,6 +177,24 @@ $("accounts").addEventListener("click", async (e) => {
       $("add-hint").textContent = t(result.revoked ? "monitorDisconnected" : "monitorRevokeFailed"); $("add-hint").hidden = false;
     } catch (err) { alert(errorText("", String(err))); }
     finally { disconnect.disabled = false; }
+    return;
+  }
+  const revokeAll = e.target.closest("[data-revoke-all]");
+  if (revokeAll) {
+    const { revokeAll: provider, id, active } = revokeAll.dataset;
+    const cli = provider === "claude" ? "claude /logout" : "codex logout";
+    if (!confirm(t("revokeAllConfirm", { cli }))) return;
+    // The saved CLI login is only offered for removal when the account is not in use.
+    const removeSlot = !active && confirm(t("revokeAllRemoveSlot"));
+    revokeAll.disabled = true;
+    try {
+      const result = await invoke("revoke_account_sessions", { provider, id, removeSlot });
+      snapshot = result.snapshot; renderAccounts();
+      const done = { revoked: "revokeAllRevoked", unconfirmed: "monitorRevokeFailed", none: "revokeAllNone" }[result.monitoring];
+      $("add-hint").textContent = [t(done), result.slot_removed ? t("revokeAllSlotRemoved") : t("revokeAllCliManaged", { cli })].join(" ");
+      $("add-hint").hidden = false;
+    } catch (err) { alert(err === "active" ? t("activeCantRemove") : errorText("", String(err))); }
+    finally { revokeAll.disabled = false; }
     return;
   }
   const monitor = e.target.closest("[data-monitor]");

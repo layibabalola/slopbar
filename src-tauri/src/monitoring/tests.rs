@@ -1036,14 +1036,16 @@ mod http {
     async fn http_diagnostics_keep_status_and_timeout_but_never_requests_or_bodies() {
         let dir = TempDir::new();
         let recorder = crate::diagnostics::Recorder::new(dir.0.join("journal")); recorder.start();
-        let mut slow = response(200, "PRIVATE-provider-body"); slow.delay = Duration::from_millis(60);
+        // Only the last request may time out. The first two get a generous timeout, so a machine
+        // loaded by parallel tests cannot turn them into timeouts as well (they used to share 20ms).
+        let mut slow = response(200, "PRIVATE-provider-body"); slow.delay = Duration::from_millis(1500);
         let server = Server::new(vec![response(503, "PRIVATE-provider-body"), response(200, "PRIVATE-revoke-body"), slow]);
-        let http = client(20);
+        let (http, fast) = (client(10_000), client(100));
         let api = Api(&http, Some(&recorder));
         let mut s = session(Provider::Claude); s.id = "PRIVATE-account-id".into(); s.refresh_token = "PRIVATE-refresh-token".into();
         assert!(matches!(api.refresh_at(&s, &server.url, "PRIVATE-client-id").await, Err(Failure::Transient)));
         assert!(api.revoke_at(&s, &server.url, "PRIVATE-client-id").await);
-        assert!(matches!(api.refresh_at(&s, &server.url, "PRIVATE-client-id").await, Err(Failure::Ambiguous)));
+        assert!(matches!(Api(&fast, Some(&recorder)).refresh_at(&s, &server.url, "PRIVATE-client-id").await, Err(Failure::Ambiguous)));
         let report = String::from_utf8(recorder.report(&crate::model::Snapshot::default(), &crate::settings::Settings::default()).unwrap()).unwrap();
         assert!(!report.contains("PRIVATE")); assert!(!report.contains(&server.url));
         let data: Value = serde_json::from_str(&report).unwrap();

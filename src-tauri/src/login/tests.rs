@@ -325,7 +325,10 @@ fn native_login_script_handles_profile_path_shell_metacharacters() {
         "unused",
         true,
     );
+    // Claude Code sets NoDefaultCurrentDirectoryInExePath for its child processes, and cmd then
+    // skips the current directory for bare names. Set it so the result never depends on the runner.
     cmd.env("SLOPBAR_PATH_TEST", "wrong-path")
+        .env("NoDefaultCurrentDirectoryInExePath", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
