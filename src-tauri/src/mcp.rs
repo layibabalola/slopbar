@@ -17,7 +17,7 @@ const MAX_TEXT: usize = 512;
 
 const INSTRUCTIONS: &str = "SlopBar shows Claude and Codex account usage and switches accounts. These tools \
 act on the running SlopBar app exactly like its Settings window. Read-only tools (get_usage, get_headroom, get_settings, \
-get_subscription_report, get_plan_advice, get_burn_alerts, get_usage_breakdown, get_health, list_project_pins, inspect_window, list_sharing_locations, get_app_info, list_diagnostic_exports) are always fine. To see SlopBar's \
+get_subscription_report, get_plan_advice, get_burn_alerts, get_usage_breakdown, get_health, list_project_pins, inspect_window, list_sharing_locations, get_app_info, list_diagnostic_exports, list_leases) are always fine. To see SlopBar's \
 windows use inspect_window, never screenshots or control of the user's desktop. Call any tool that changes something (update_settings, \
 switch_account, add_account, connect_monitoring, disconnect_monitoring, remove_account, connect_monitoring_all, remove_lapsed_accounts, set_project_pin, refresh_usage, \
 install_update, export_diagnostics, export_calendar, export_csv, export_backup, restore_backup, open_settings, quit_app, restart_app) only when the user asked for that action in this \
@@ -35,7 +35,7 @@ until its limits reset at the current pace, and recommend_account (with expected
 needs, and hours) to see which account suits it; both read the last snapshot and are always fine. recommend_account \
 only reports unless switch is true, and switch: true changes the account the CLI uses exactly as switch_account does: \
 pass it, or call switch_account, only when the user allowed switching accounts in this conversation. Otherwise tell \
-the user what it recommends.";
+the user what it recommends. For a job of your own, lease_account reserves an account (it switches nothing) so other agents and automatic switching keep off it; release_lease when the job ends.";
 
 fn schema(properties: Value, required: &[&str]) -> Value {
     let mut schema = json!({ "type": "object", "properties": properties, "additionalProperties": false });
@@ -130,13 +130,25 @@ fn catalog() -> Vec<Tool> {
                 "expected_percent": { "type": "number", "minimum": 0, "maximum": 100, "description": "How much of a week's limit the job needs, in percent." },
                 "hours": { "type": "number", "minimum": 0, "maximum": 168, "description": "How long the job runs; a weekly reset inside it refills the limit." },
                 "switch": { "type": "boolean", "description": "Switch to the recommended account (default false). Only when the user allowed switching." },
+                "lease_id": { "type": "string", "description": "Your own lease from lease_account: its account is ranked instead of excluded as leased." },
             }), &["provider"]), false, true, true, true),
+        tool("lease_account", "Lease account", "Reserve one of the provider's accounts for a job: id, or else the account recommend_account names among those nobody else leased (expected_percent as there). While leased, recommend_account lists it as excluded (\"leased: <purpose>\") for everyone else, automatic switching never moves to it, and the flyout shows the purpose on its row. The lease does not switch the CLI: run the job with config_dir (set env_var to it for that job only; null means the account is the CLI's current sign-in) or switch only if the user allowed it. Leases expire after minutes (default 120, at most 1440), end when SlopBar quits, and should be released with release_lease when the job ends. Returns lease_id, the account (id, label), expires_at, env_var and config_dir.",
+            schema(json!({
+                "provider": { "type": "string", "enum": ["claude", "codex"] },
+                "purpose": { "type": "string", "maxLength": 80, "description": "What the job is, shown to the user and other agents." },
+                "minutes": { "type": "integer", "minimum": 1, "maximum": 1440, "description": "How long the lease lasts (default 120)." },
+                "expected_percent": { "type": "number", "minimum": 0, "maximum": 100, "description": "How much of a week's limit the job needs, in percent." },
+                "id": { "type": "string", "description": "Lease this account (from get_usage) instead of the recommended one." },
+            }), &["provider", "purpose"]), false, false, false, false),
+        tool("release_lease", "Release lease", "End a lease taken with lease_account (or by the slopbar-run launcher) so the account is free for others again.",
+            schema(json!({ "lease_id": { "type": "string" } }), &["lease_id"]), false, false, true, false),
+        tool("list_leases", "List leases", "Accounts reserved right now: lease_id, provider, id, purpose, created_at, expires_at and pid (a launcher's lease lasts while that process runs).", none(), true, false, true, false),
         tool("refresh_usage", "Refresh usage", "Poll every account's usage now (as the tray's Refresh does) and return the new snapshot. If automatic switching is on and a threshold is reached, this can switch accounts.", none(), false, true, false, true),
         tool("get_settings", "Get settings", "SlopBar's settings: refresh interval, providers, language, launch at login, updates, account aliases, automatic switching rules and notifications.", none(), true, false, true, false),
         tool("get_subscription_report", "Get subscription report", "Per account: plan, this week's usage, pace and runs_out_at (when the week runs out before its reset at the current rate), the last four completed weeks (how many reached the limit, average and median peak), a verdict (insufficient_data, exhausted_weekly, healthy, underused or unused), whether renewing looks unneeded, the next renewal with its source (entered, provider or estimated), renewal_warning (wasteful: renews within three days while unused or underused; soon: renews within a day) and the monthly cost; plus totals per provider. A verdict needs at least two well-observed weeks. Codex accounts also carry idle_now (no use anywhere in the past seven days) and local: what the Codex CLI on this PC shows (last_local_activity, days_idle, never_seen, attributed_since, threads and tokens over 7 and 28 days and per ISO week, backfilled_weeks). A long-idle Codex plan can be judged unused from that local history; such verdicts have basis local_codex, and use in WSL, on other machines or in the cloud is not seen locally. Each account has plan_weight (its weekly allowance in plans of the provider's reference tier: Max 20x for Claude, Pro 200 for Codex), cost_per_use (per_percent: dollars per 1% of its weekly limit used; per_local_thread: Codex dollars per thread on this PC only) and, for Codex, credits (purchased balance, unlimited, spent since a date; never priced in dollars). Each provider has pool: plans_needed to cover the 90th-percentile week of combined use (demand_p90, in plans) plus 20%, plans_held, weeks_used, confidence and basis (local_codex when a week came from this PC's Codex rollouts); plans_needed is null with fewer than two weeks of history. Codex Pro 200 accounts carry allowance_change until the plan's Codex allowance is cut after last_day (2026-10-29, estimated to about half): peak_percent (highest weekly use in recent weeks), projected_percent (that against the new allowance) and would_hit_limit.", none(), true, false, true, false),
-        tool("get_plan_advice", "Get plan advice", "Concrete plan changes per provider, read-only: moves (cancel a plan judged unused; downgrade an underused one to the cheapest smaller tier that still fits its busiest recent week plus 20%, e.g. Pro 200 to Pro 100 or Max 20x to Max 5x or Pro), each with the account (id, email, alias), from and to, monthly_saving in dollars, verdict, basis, peak_percent, before (the next renewal) and manage_url (the provider's billing page). No move leaves less capacity than floor: the pool's 90th-percentile week of combined use (demand_p90) plus 20%, in plans of unit (Max 20x or Pro 200), and a provider always keeps at least one plan. Per provider: evidence (pool, or clear_only when there are fewer than weeks_needed weeks of history: then only plans judged unused, such as Codex plans idle for weeks on this PC's history, and no downgrades), capacity_now and capacity_after, monthly_saving, spare_after and spare_after_percent (capacity left over the busiest weeks after every move) and kept_for_capacity. When the plans fall short (cause over_capacity: demand_p90 plus 20% exceeds capacity_now; or hitting_limits: plans keep reaching their weekly limit with under 40% spare) and no move is advised, shortage gives shortfall (in unit), exhausted and the cheapest fix: action upgrade (one plan, id/email/alias, from and to) or add (count plans of to), with monthly_cost in dollars, capacity_after and manage_url; a provider never gets a cut and an addition together. reset_credits lists Codex accounts at or within 3 h of their limit that hold a reset credit: choice spend (reason expires_soon: within 2 days or before the limit resets; or no_other_account), switch (other_has_headroom, with switch_to: the account with the most left, at least 20%) or wait (resets_soon: within 2 h), with credits, usable_now, expires_at, resets_at and limit_at. SlopBar cannot change a plan or spend a credit; the user does it on the billing page or in Codex.", none(), true, false, true, false),
+        tool("get_plan_advice", "Get plan advice", "Concrete plan changes per provider, read-only: moves (cancel a plan judged unused; downgrade an underused one to the cheapest smaller tier that still fits its busiest recent week plus 20%, e.g. Pro 200 to Pro 100 or Max 20x to Max 5x or Pro), each with the account (id, email, alias), from and to, monthly_saving in dollars, verdict, basis, peak_percent, before (the next renewal) and manage_url (the provider's billing page). No move leaves less capacity than floor: the pool's 90th-percentile week of combined use (demand_p90) plus 20%, in plans of unit (Max 20x or Pro 200), and a provider always keeps at least one plan. Per provider: evidence (pool, or clear_only when there are fewer than weeks_needed weeks of history: then only plans judged unused, such as Codex plans idle for weeks on this PC's history, and no downgrades), capacity_now and capacity_after, monthly_saving, spare_after and spare_after_percent (capacity left over the busiest weeks after every move) and kept_for_capacity. SlopBar cannot change a plan; the user does it on the billing page.", none(), true, false, true, false),
         tool("get_burn_alerts", "Get burn alerts", "Runaway agents, read-only: accounts seen in the past day burning through their week abnormally fast, newest first. trigger is weekly_rise (the weekly window rose at least burn.points within burn.minutes; rise_points and rise_minutes) or local_rate (a repository and model on this PC used at least burn.token_factor times its usual tokens per window over the past 7 days). Each has the account (provider, id, email, alias), detected_at, used_percent, pace_per_hour, limit_at (when the week runs out at that pace, if before resets_at) and this_pc: the busiest repository and model behind it on this PC only (repo, model, tokens, baseline), never other machines. Also the thresholds in use and whether the notification is on (at most one per account every 3 h).", none(), true, false, true, false),
-        tool("get_usage_breakdown", "Get usage breakdown", "Tokens used on this PC by account, read from Claude Code's transcripts and the Codex CLI's rollouts (model names, token counts, times and working folders only; never prompt or reply text). For the last `days` local days (default 7, at most 63): per provider the totals, unattributed tokens, model mix, groups and heatmap; per account (email, alias) its tokens split into input, cache_write, cached and output, groups by group_by (repo: the git repository name of the working folder, model, or day) with each group's share in percent, and heatmap (tokens by local weekday, Monday first, and hour; utc_offset_minutes gives the zone). attribution says how tokens were tied to the account: session (the Codex session names it), inferred_from_active_account (the account SlopBar saw signed in to the CLI then; all Claude use), mixed, or unattributed (a time SlopBar was not watching). Use elsewhere (WSL, other machines, web) is not included. Repository names stay on this machine.",
+        tool("get_usage_breakdown", "Get usage breakdown", "Tokens used on this PC by account, read from Claude Code's transcripts and the Codex CLI's rollouts (model names, token counts, times and working folders only; never prompt or reply text). For the last `days` local days (default 7, at most 63): per provider the totals, unattributed tokens, model mix, groups and heatmap; per account (email, alias) its tokens split into input, cache_write, cached and output, groups by group_by (repo: the git repository name of the working folder, model, or day) with each group's share in percent, and heatmap (tokens by local weekday, Monday first, and hour; utc_offset_minutes gives the zone). attribution says how tokens were tied to the account: session (the Codex session names it), exact (Claude Code's session hook reported the account the session started on), inferred_from_active_account (the account SlopBar saw signed in to the CLI then; Claude sessions the hook did not report), mixed, or unattributed (a time SlopBar was not watching). Use elsewhere (WSL, other machines, web) is not included. Repository names stay on this machine.",
             schema(json!({
                 "provider": { "type": "string", "enum": ["claude", "codex"] },
                 "account": { "type": "string", "description": "An account id from get_usage; default: every account." },
@@ -230,6 +242,8 @@ fn request(name: &str, args: &Value) -> Option<Result<Request, String>> {
         "get_usage" => simple("get_usage"),
         "get_headroom" => with("get_headroom"),
         "recommend_account" => with("recommend_account"),
+        "lease_account" | "release_lease" => with(name),
+        "list_leases" => simple("list_leases"),
         "refresh_usage" => simple("refresh"),
         "get_settings" => simple("get_settings"),
         "get_subscription_report" => simple("get_subscriptions"),
@@ -554,7 +568,7 @@ mod tests {
     fn every_listed_tool_maps_to_a_door_operation() {
         let listed = rpc(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).unwrap();
         let tools = listed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 36);
+        assert_eq!(tools.len(), 39);
         let account = json!({ "provider": "claude", "id": "a1" });
         for t in tools {
             let name = t["name"].as_str().unwrap();
@@ -570,6 +584,8 @@ mod tests {
                 "set_project_pin" => json!({ "folder": "C:/code/repo", "provider": "claude", "id": "a1" }),
                 "export_backup" => json!({ "passphrase": "correct horse battery" }),
                 "restore_backup" => json!({ "path": "C:/b.slopbar-backup", "passphrase": "correct horse battery" }),
+                "lease_account" => json!({ "provider": "codex", "purpose": "nightly tests", "minutes": 60, "expected_percent": 5 }),
+                "release_lease" => json!({ "lease_id": "lease-1" }),
                 _ => json!({}),
             };
             assert_eq!(tool(name, args, None)["result"]["isError"], false, "{name}");
@@ -579,6 +595,10 @@ mod tests {
         assert_eq!(tool("get_headroom", json!({}), None)["result"]["structuredContent"], json!({ "op": "get_headroom", "provider": null, "id": null }));
         let rec = tool("recommend_account", json!({ "provider": "codex" }), None);
         assert_eq!(rec["result"]["structuredContent"]["switch"], false, "recommend_account only reports by default");
+        assert_eq!(tool("lease_account", json!({ "provider": "claude", "purpose": "job" }), None)["result"]["structuredContent"],
+            json!({ "op": "lease_account", "provider": "claude", "purpose": "job", "minutes": null, "expected_percent": null, "id": null }));
+        assert_eq!(tool("lease_account", json!({ "provider": "claude" }), None)["result"]["isError"], true, "a purpose is required");
+        assert_eq!(tool("release_lease", json!({}), None)["result"]["isError"], true);
         let marked = |hint: &str| -> Vec<&str> { tools.iter().filter(|t| t["annotations"][hint] == true).map(|t| t["name"].as_str().unwrap()).collect() };
         assert_eq!(marked("destructiveHint"), ["recommend_account", "refresh_usage", "update_settings", "switch_account", "disconnect_monitoring", "remove_account", "revoke_account_sessions", "remove_lapsed_accounts", "set_project_pin", "install_update", "quit_app", "restore_backup"]);
         assert_eq!(tool("restore_backup", json!({ "path": "C:/b.slopbar-backup", "passphrase": "correct horse battery" }), None)["result"]["structuredContent"]["dry_run"], true, "restoring only previews by default");
@@ -587,7 +607,7 @@ mod tests {
         assert_eq!(tool("revoke_account_sessions", json!({ "provider": "codex", "id": "a1" }), None)["result"]["structuredContent"],
             json!({ "op": "revoke_account_sessions", "provider": "codex", "id": "a1", "confirm": false, "remove_slot": false }), "revoking only reports by default");
         assert_eq!(tool("set_project_pin", json!({ "folder": "C:/a", "provider": "codex", "id": null }), None)["result"]["structuredContent"]["id"], Value::Null);
-        assert_eq!(marked("readOnlyHint"), ["get_usage", "get_headroom", "get_settings", "get_subscription_report", "get_plan_advice", "get_burn_alerts", "get_usage_breakdown", "get_health", "list_project_pins", "check_for_updates", "get_app_info", "inspect_window", "list_sharing_locations", "list_diagnostic_exports"]);
+        assert_eq!(marked("readOnlyHint"), ["get_usage", "get_headroom", "list_leases", "get_settings", "get_subscription_report", "get_plan_advice", "get_burn_alerts", "get_usage_breakdown", "get_health", "list_project_pins", "check_for_updates", "get_app_info", "inspect_window", "list_sharing_locations", "list_diagnostic_exports"]);
     }
 
     #[test]

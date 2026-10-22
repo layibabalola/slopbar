@@ -17,7 +17,7 @@ use std::time::Duration;
 use crate::accounts::Provider;
 
 /// Bumped when the request or reply shape changes.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 /// Requests are one JSON line (a settings patch with aliases is the largest).
 const MAX_REQUEST: u64 = 16 * 1024;
 /// Replies are one JSON line (a usage snapshot is the largest).
@@ -91,6 +91,43 @@ pub enum Request {
         hours: Option<f64>,
         #[serde(default)]
         switch: bool,
+        /// The caller's own lease: its account is not excluded as leased (see `leases`).
+        #[serde(default)]
+        lease_id: Option<String>,
+    },
+    /// Reserve an account of the provider for a job (see `leases`): `id`, else the account
+    /// recommend_account names among those nobody else leased.
+    LeaseAccount {
+        provider: Provider,
+        purpose: String,
+        #[serde(default)]
+        minutes: Option<u32>,
+        #[serde(default)]
+        expected_percent: Option<f64>,
+        #[serde(default)]
+        id: Option<String>,
+    },
+    ReleaseLease { lease_id: String },
+    ListLeases,
+    /// The launcher's pick (`slopbar-run`): the account to run a command on and the config dir
+    /// that uses it. Leases the account for the life of process `pid` when it is not the CLI's
+    /// current sign-in (its project profile must stay signed in) or when `purpose` is given.
+    PickAccount {
+        provider: Provider,
+        pid: u32,
+        #[serde(default)]
+        purpose: Option<String>,
+        #[serde(default)]
+        expected_percent: Option<f64>,
+    },
+    /// Claude Code's SessionStart hook (see `session_hook`): record which account the session's
+    /// config dir (None: the default login) is signed in to.
+    RecordSession {
+        session_id: String,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        config_dir: Option<String>,
     },
     SwitchAccount { provider: Provider, id: String },
     AddAccount { provider: Provider },

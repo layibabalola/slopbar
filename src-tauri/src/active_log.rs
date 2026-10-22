@@ -3,7 +3,11 @@
 //! a Claude message to the account that was active when it was written. Time SlopBar did not
 //! see (the app closed, the PC asleep) is a gap: nothing in it is attributed.
 //!
-//! Only slot ids and times are kept, never emails.
+//! Claude Code sessions that report their start through the session hook (`slopbar-mcp
+//! --session-hook`, see `session_hook`) are kept here too, with the account they started on:
+//! their messages are attributed exactly, ahead of the inference from intervals.
+//!
+//! Only slot ids, session ids, working folders and times are kept, never emails.
 
 use std::collections::HashMap;
 
@@ -15,7 +19,9 @@ use crate::accounts::Provider;
 const VERSION: u8 = 1;
 /// Intervals older than this are dropped.
 const KEEP_DAYS: i64 = 90;
-const MAX_FILE: u64 = 4 << 20;
+const MAX_FILE: u64 = 8 << 20;
+/// Sessions kept at most; the oldest go first.
+pub const MAX_SESSIONS: usize = 20_000;
 /// An interval is extended by a reading at most this long after its end; a longer silence
 /// starts a new one (see `max_gap`).
 pub const MIN_GAP_SECONDS: i64 = 15 * 60;
@@ -28,6 +34,17 @@ pub struct Interval {
     pub to: DateTime<Utc>,
 }
 
+/// A Claude Code session as its SessionStart hook reported it: the account it started on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionStart {
+    /// Vault slot id.
+    pub id: String,
+    /// The session's working folder, as Claude Code reported it.
+    #[serde(default)]
+    pub cwd: String,
+    pub started_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Log {
@@ -36,6 +53,8 @@ pub struct Log {
     pub providers: HashMap<String, Vec<Interval>>,
     /// The diagnostics journal was folded in once (see `backfill`).
     pub backfilled: bool,
+    /// Claude Code sessions by session id (see `record_session`).
+    pub sessions: HashMap<String, SessionStart>,
 }
 
 /// The longest silence that still counts as the same stretch of use: three refreshes, at least
@@ -70,6 +89,29 @@ impl Log {
     pub fn prune(&mut self, now: DateTime<Utc>) {
         let cutoff = now - Duration::days(KEEP_DAYS);
         for list in self.providers.values_mut() { list.retain(|v| v.to >= cutoff); }
+        self.sessions.retain(|_, s| s.started_at >= cutoff);
+    }
+
+    /// Records that Claude Code session `session` (re)started on account `id`. A resumed session
+    /// reports again; the latest report wins, since a session runs on the login it is resumed
+    /// under. Returns whether anything changed.
+    pub fn record_session(&mut self, session: &str, id: &str, cwd: &str, now: DateTime<Utc>) -> bool {
+        if self.sessions.get(session).is_some_and(|old| old.id == id) {
+            return false;
+        }
+        if self.sessions.len() >= MAX_SESSIONS && !self.sessions.contains_key(session) {
+            if let Some(oldest) = self.sessions.iter().min_by_key(|(_, s)| s.started_at).map(|(k, _)| k.clone()) {
+                self.sessions.remove(&oldest);
+            }
+        }
+        let cwd: String = cwd.chars().filter(|c| !c.is_control()).take(512).collect();
+        self.sessions.insert(session.to_string(), SessionStart { id: id.to_string(), cwd, started_at: now });
+        true
+    }
+
+    /// The account Claude Code session `session` runs on, when its hook reported it.
+    pub fn session(&self, session: &str) -> Option<&str> {
+        self.sessions.get(session).map(|s| s.id.as_str())
     }
 
     /// Folds in readings from before this log existed (the diagnostics journal keeps about a
@@ -193,17 +235,47 @@ mod tests {
     }
 
     #[test]
+    fn sessions_keep_the_account_their_hook_reported() {
+        let mut log = Log::default();
+        let s = "0b5e7c1a-2f3d-4e5f-8a9b-0c1d2e3f4a5b";
+        assert!(log.record_session(s, "slot-a", "C:\\code\\app\u{7}", at("2026-10-20T10:00:00Z")));
+        assert!(!log.record_session(s, "slot-a", "C:\\code\\app", at("2026-10-20T11:00:00Z")), "a repeat changes nothing");
+        assert_eq!(log.sessions[s].cwd, "C:\\code\\app", "control characters dropped");
+        assert_eq!(log.session(s), Some("slot-a"));
+        assert!(log.record_session(s, "slot-b", "", at("2026-10-20T12:00:00Z")), "resumed under another account");
+        assert_eq!(log.session(s), Some("slot-b"));
+        assert_eq!(log.session("other"), None);
+        log.record_session("old-session-id", "slot-a", "", at("2026-06-01T00:00:00Z"));
+        log.prune(at("2026-10-21T00:00:00Z"));
+        assert_eq!((log.sessions.len(), log.session("old-session-id")), (1, None));
+    }
+
+    #[test]
+    fn the_session_count_is_bounded() {
+        let mut log = Log::default();
+        let start = at("2026-10-01T00:00:00Z");
+        for i in 0..MAX_SESSIONS + 5 {
+            log.record_session(&format!("session-{i:08}"), "slot", "", start + Duration::seconds(i as i64));
+        }
+        assert_eq!(log.sessions.len(), MAX_SESSIONS);
+        assert!(log.session("session-00000000").is_none(), "the oldest went first");
+        assert!(log.session(&format!("session-{:08}", MAX_SESSIONS + 4)).is_some());
+    }
+
+    #[test]
     fn survives_a_restart_and_prunes_old_intervals() {
         let dir = crate::test_support::TempDir::new();
         let path = dir.0.join("active-accounts.json");
         let mut log = Log { version: VERSION, ..Default::default() };
         log.note(Provider::Codex, "user:acct", at("2026-06-01T00:00:00Z"), max_gap(5));
         log.note(Provider::Codex, "user:other", at("2026-10-01T00:00:00Z"), max_gap(5));
+        log.record_session("persisted-session", "user:claude", "C:\\code",at("2026-10-01T00:00:00Z"));
         log.prune(at("2026-10-02T00:00:00Z"));
         save_to(&path, &log).unwrap();
         let back = load_from(&path);
         assert_eq!(back.providers["codex"].len(), 1);
         assert_eq!(back.at(Provider::Codex, at("2026-10-01T00:00:00Z")), Some("user:other"));
+        assert_eq!(back.session("persisted-session"), Some("user:claude"));
         std::fs::write(&path, b"{broken").unwrap();
         assert!(load_from(&path).providers.is_empty());
     }

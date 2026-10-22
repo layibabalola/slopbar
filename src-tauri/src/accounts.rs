@@ -557,6 +557,14 @@ pub fn profile_sources(wanted: &[(Provider, String)]) -> Vec<Source> {
     wanted.iter().map(|(p, id)| profile_source(&root.join(profile_name(*p, id)))).collect()
 }
 
+/// The saved account signed in to the CLI config dir `dir` (a project profile or any other
+/// CLAUDE_CONFIG_DIR / CODEX_HOME), when it is one SlopBar knows. Reads the dir; saves nothing.
+pub fn login_at(provider: Provider, dir: &Path) -> Option<String> {
+    let known = load_slots();
+    let slot = read_login(provider, &profile_source(dir), &known)?;
+    known.iter().any(|k| k.provider == provider && k.id == slot.id).then_some(slot.id)
+}
+
 /// The file in a profile that holds its login.
 pub fn profile_login_file(provider: Provider, dir: &Path) -> PathBuf {
     dir.join(match provider {

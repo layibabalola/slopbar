@@ -16,11 +16,22 @@ const COOLDOWN: Duration = Duration::from_secs(5 * 60);
 /// A candidate must be this far below the threshold, so it doesn't bounce straight back.
 const HYSTERESIS: f64 = 10.0;
 
-/// The account to switch to for each provider that needs it.
+/// The account to switch to for each provider that needs it (the app uses `decide_avoiding`).
+#[cfg(test)]
 pub fn decide(
     accounts: &[AccountUsage],
     settings: &Settings,
     last_switch: &HashMap<Provider, Instant>,
+) -> Vec<(Provider, String)> {
+    decide_avoiding(accounts, settings, last_switch, &[])
+}
+
+/// `decide`, never moving to an account in `leased` (reserved for a job, see `leases`).
+pub fn decide_avoiding(
+    accounts: &[AccountUsage],
+    settings: &Settings,
+    last_switch: &HashMap<Provider, Instant>,
+    leased: &[(Provider, String)],
 ) -> Vec<(Provider, String)> {
     let mut out = Vec::new();
     for provider in Provider::ALL {
@@ -37,7 +48,7 @@ pub fn decide(
         // The recommendation's ranking, limited to measured, current headroom well below the threshold.
         let rec = crate::headroom::recommend(accounts, settings, provider, None, None, chrono::Utc::now());
         let best = rec.ranking.iter()
-            .filter(|c| c.fits && !c.active)
+            .filter(|c| c.fits && !c.active && !leased.iter().any(|(p, id)| *p == provider && *id == c.id))
             .find(|c| of_provider.iter().any(|a| a.id == c.id && a.peak().is_some_and(|p| p < threshold - HYSTERESIS)));
         if let Some(target) = best {
             out.push((provider, target.id.clone()));
@@ -57,8 +68,20 @@ mod tests {
             active, sources: vec![], windows: percent.map(|used_percent| UsageWindow {
                 kind: "session".into(), window_seconds: None, used_percent, resets_at: None,
             }).into_iter().collect(), credits: None, resets: vec![], error: None, monitor_error: None, stale: false,
-            fetched_at: Some(chrono::Utc::now()), monitor_connected: true, billing: Default::default(), remote: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None,
+            fetched_at: Some(chrono::Utc::now()), monitor_connected: true, billing: Default::default(), remote: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None,
         }
+    }
+
+    #[test]
+    fn automatic_switching_never_moves_to_a_leased_account() {
+        let mut settings = Settings::default();
+        settings.balancer.claude.auto = true;
+        let accounts = [account("active", true, Some(95.0)), account("leased", false, Some(5.0)), account("free", false, Some(20.0))];
+        let leased = [(Provider::Claude, "leased".to_string())];
+        assert_eq!(decide_avoiding(&accounts, &settings, &HashMap::new(), &leased), [(Provider::Claude, "free".into())]);
+        let both = [(Provider::Claude, "leased".to_string()), (Provider::Claude, "free".to_string())];
+        assert!(decide_avoiding(&accounts, &settings, &HashMap::new(), &both).is_empty());
+        assert_eq!(decide_avoiding(&accounts, &settings, &HashMap::new(), &[(Provider::Codex, "leased".to_string())]).len(), 1, "another provider's lease");
     }
 
     #[test]
