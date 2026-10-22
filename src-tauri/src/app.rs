@@ -1,4 +1,4 @@
-use crate::{accounts, active_log, auto_monitor, balancer, ledger, bulk, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, migrate, model, monitoring, notify, panel, pins, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates, usage_index};
+use crate::{accounts, active_log, auto_monitor, balancer, ledger, bulk, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, leases, migrate, model, monitoring, notify, panel, pins, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates, usage_index};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -68,6 +68,8 @@ pub struct AppState {
     bulk_connect: Mutex<Option<BulkConnect>>,
     /// Why the switcher's shortcut could not be registered (taken by another app, say).
     hotkey_error: Mutex<Option<String>>,
+    /// Accounts reserved for jobs (see `leases`); in memory only.
+    pub(crate) leases: Mutex<leases::Leases>,
 }
 
 pub(crate) const SWITCHER_LABEL: &str = "switcher";
@@ -337,16 +339,11 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             };
             Ok(serde_json::json!({ "accounts": value(accounts)?, "updated_at": snapshot.updated_at }))
         }
-        R::RecommendAccount { provider, expected_percent, hours, switch } => {
+        R::RecommendAccount { provider, expected_percent, hours, switch, lease_id } => {
             if expected_percent.is_some_and(|p| !(0.0..=100.0).contains(&p)) || hours.is_some_and(|h| !(0.0..=168.0).contains(&h)) {
                 return Err("expected_percent must be 0-100 and hours 0-168".into());
             }
-            let rec = {
-                let state = app.state::<AppState>();
-                let snapshot = state.snapshot.lock().unwrap().clone();
-                let settings = state.settings.lock().unwrap().clone();
-                headroom::recommend(&snapshot.accounts, &settings, provider, expected_percent, hours, chrono::Utc::now())
-            };
+            let rec = recommend_unleased(&app, provider, expected_percent, hours, lease_id.as_deref());
             let mut result = value(&rec)?;
             result["switched"] = false.into();
             if let (true, headroom::Action::Switch, Some(id)) = (switch, rec.action, rec.recommended.clone()) {
@@ -356,6 +353,47 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             }
             Ok(result)
         }
+        R::LeaseAccount { provider, purpose, minutes, expected_percent, id } => {
+            if expected_percent.is_some_and(|p| !(0.0..=100.0).contains(&p)) {
+                return Err("expected_percent must be 0-100".into());
+            }
+            lease_account(&app, provider, &purpose, minutes, expected_percent, id, None).await
+        }
+        R::ReleaseLease { lease_id } => {
+            let released = app.state::<AppState>().leases.lock().unwrap().release(&lease_id).ok_or("no_such_lease")?;
+            leases_changed(&app).await;
+            Ok(serde_json::json!({ "released": true, "lease": value(released)? }))
+        }
+        R::ListLeases => {
+            prune_leases(&app).await;
+            Ok(serde_json::json!({ "leases": value(app.state::<AppState>().leases.lock().unwrap().list())? }))
+        }
+        R::PickAccount { provider, pid, purpose, expected_percent } => {
+            if expected_percent.is_some_and(|p| !(0.0..=100.0).contains(&p)) {
+                return Err("expected_percent must be 0-100".into());
+            }
+            if !leases::process_alive(pid) {
+                return Err("pid_not_running".into());
+            }
+            prune_leases(&app).await;
+            let rec = recommend_unleased(&app, provider, expected_percent, None, None);
+            let Some(id) = rec.recommended.clone() else { return Err(format!("no_account_free: {}", rec.summary)) };
+            let label = rec.recommended_label.clone();
+            let at_default = rec.ranking.iter().any(|c| c.id == id && c.active);
+            if at_default && purpose.is_none() {
+                return Ok(serde_json::json!({ "id": id, "label": label, "dir": null, "env_var": pins::env_var(provider), "lease_id": null, "note": null }));
+            }
+            let mut leased = lease_account(&app, provider, purpose.as_deref().unwrap_or("slopbar-run"), None, expected_percent, Some(id), Some(pid)).await?;
+            leased["dir"] = leased["config_dir"].clone();
+            leased["lease_id"] = leased["lease"]["lease_id"].clone();
+            leased["note"] = if !at_default && leased["dir"].is_null() {
+                "the recommended account's profile is not signed in yet, so this runs on the CLI's current sign-in".into()
+            } else {
+                serde_json::Value::Null
+            };
+            Ok(leased)
+        }
+        R::RecordSession { session_id, cwd, config_dir } => record_session(&app, session_id, cwd, config_dir).await,
         R::AddAccount { provider } => {
             // One pending sign-in per provider, so a retrying agent cannot flood the desktop.
             let pending = app.state::<AppState>().account_operations.begin(provider, "add-account")?;
@@ -782,18 +820,128 @@ async fn remove_one(app: &AppHandle, provider: Provider, id: &str) -> Result<(),
 async fn sync_pins(app: &AppHandle, active: Option<accounts::Active>) {
     let state = app.state::<AppState>();
     let pins = state.settings.lock().unwrap().project_pins.clone();
+    let wanted = profile_accounts(&state);
     let found = state.sources.lock().unwrap().clone();
     let states = tauri::async_runtime::spawn_blocking(move || {
         // Never decide what is signed in by default from an empty source list.
         let found = if found.is_empty() { sources::discover() } else { found };
         let active = active.unwrap_or_else(|| accounts::capture(&found));
-        let states = accounts::sync_profiles(&pins::wanted(&pins), &active);
-        if !pins.is_empty() || pins::bin_dir().is_some_and(|d| d.exists()) {
-            let _ = pins::write_launcher(&pins);
-        }
+        let states = accounts::sync_profiles(&wanted, &active);
+        // The launcher also serves folders without pins (see `launcher`).
+        let _ = pins::write_launcher(&pins);
         states
     }).await.unwrap_or_default();
     *state.profile_states.lock().unwrap() = states;
+}
+
+/// The accounts whose project profiles stay signed in: pinned ones and leased ones (a leased
+/// account's job may run with its profile, see `leases`).
+fn profile_accounts(state: &AppState) -> Vec<(Provider, String)> {
+    let mut wanted = pins::wanted(&state.settings.lock().unwrap().project_pins);
+    for account in state.leases.lock().unwrap().accounts() {
+        if !wanted.contains(&account) { wanted.push(account); }
+    }
+    wanted
+}
+
+// ---------------------------------------------------------------------------------------------
+// Leases (see `leases`)
+
+/// recommend_account's answer without the accounts leased by anyone but `mine`.
+fn recommend_unleased(app: &AppHandle, provider: Provider, expected_percent: Option<f64>, hours: Option<f64>, mine: Option<&str>) -> headroom::Recommendation {
+    let state = app.state::<AppState>();
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    let settings = state.settings.lock().unwrap().clone();
+    let rec = headroom::recommend(&snapshot.accounts, &settings, provider, expected_percent, hours, chrono::Utc::now());
+    let leased = state.leases.lock().unwrap().others(provider, mine);
+    headroom::without_leased(rec, &leased)
+}
+
+/// Shows each account's lease on the snapshot (the flyout's "leased: <purpose>").
+fn mark_leases(state: &AppState, snapshot: &mut Snapshot) {
+    let leases = state.leases.lock().unwrap();
+    for a in &mut snapshot.accounts {
+        a.leased = leases.holder(a.provider, &a.id).map(|l| l.purpose.clone());
+    }
+}
+
+/// After leases change: the windows show them and leased accounts' profiles are signed in or out.
+async fn leases_changed(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let snapshot = {
+        let mut snapshot = state.snapshot.lock().unwrap().clone();
+        mark_leases(&state, &mut snapshot);
+        *state.snapshot.lock().unwrap() = snapshot.clone();
+        snapshot
+    };
+    let _ = app.emit("usage-updated", &snapshot);
+    sync_pins(app, None).await;
+}
+
+/// Ends expired leases and those whose process exited.
+async fn prune_leases(app: &AppHandle) {
+    let ended = app.state::<AppState>().leases.lock().unwrap().prune(chrono::Utc::now(), leases::process_alive);
+    if ended { leases_changed(app).await; }
+}
+
+/// Leases account `id` (else the recommended one among those nobody leased) for `purpose`, and
+/// says how to run on it: `config_dir` is its project profile, or null while it is the CLI's
+/// current sign-in.
+async fn lease_account(app: &AppHandle, provider: Provider, purpose: &str, minutes: Option<u32>, expected_percent: Option<f64>, id: Option<String>, pid: Option<u32>) -> Result<serde_json::Value, String> {
+    prune_leases(app).await;
+    let state = app.state::<AppState>();
+    let (id, label, active) = match id {
+        Some(id) => {
+            let snapshot = state.snapshot.lock().unwrap();
+            let account = snapshot.accounts.iter().find(|a| a.provider == provider && a.id == id).ok_or("monitor_wrong_account")?;
+            (id, account.alias.clone().or(account.email.clone()), account.active)
+        }
+        None => {
+            let rec = recommend_unleased(app, provider, expected_percent, None, None);
+            let id = rec.recommended.clone().ok_or_else(|| format!("no_account_free: {}", rec.summary))?;
+            let active = rec.ranking.iter().any(|c| c.id == id && c.active);
+            (id, rec.recommended_label.clone(), active)
+        }
+    };
+    let lease = state.leases.lock().unwrap().take(provider, &id, purpose, minutes, pid, chrono::Utc::now())?;
+    leases_changed(app).await;
+    let profile = accounts::profiles_root().map(|r| r.join(accounts::profile_name(provider, &id)));
+    let ready = state.profile_states.lock().unwrap().get(&(provider, id.clone())) == Some(&accounts::ProfileState::Ready);
+    let config_dir = profile.filter(|_| ready && !active).map(|p| p.to_string_lossy().into_owned());
+    Ok(serde_json::json!({
+        "lease": serde_json::to_value(&lease).map_err(|e| e.to_string())?,
+        "id": id, "label": label, "expires_at": lease.expires_at,
+        "env_var": pins::env_var(provider), "config_dir": config_dir, "at_default": active,
+        "next": "Run the job with env_var set to config_dir for that job only (null: the account is the CLI's current sign-in), then release_lease.",
+    }))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Exact Claude attribution (see `session_hook`)
+
+/// Records which Claude account a session started on: the account signed in to its config dir,
+/// or with none given (the default login), the account SlopBar sees signed in to Claude Code.
+async fn record_session(app: &AppHandle, session_id: String, cwd: Option<String>, config_dir: Option<String>) -> Result<serde_json::Value, String> {
+    if !crate::session_hook::valid_session_id(&session_id) {
+        return Err("bad_session_id".into());
+    }
+    let state = app.state::<AppState>();
+    let default = || {
+        let snapshot = state.snapshot.lock().unwrap();
+        active_log::active_ids(&snapshot.accounts).into_iter().find(|(p, _)| *p == Provider::Claude).map(|(_, id)| id.to_string())
+    };
+    let id = match config_dir.filter(|d| std::path::Path::new(d).is_absolute()) {
+        Some(dir) => tauri::async_runtime::spawn_blocking(move || accounts::login_at(Provider::Claude, std::path::Path::new(&dir))).await.ok().flatten(),
+        None => default(),
+    };
+    let Some(id) = id else { return Ok(serde_json::json!({ "recorded": false, "reason": "unknown_account" })) };
+    let now = chrono::Utc::now();
+    let changed = state.active_log.lock().unwrap().record_session(&session_id, &id, cwd.as_deref().unwrap_or(""), now);
+    if changed {
+        let log = state.active_log.lock().unwrap().clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || active_log::save(&log)).await;
+    }
+    Ok(serde_json::json!({ "recorded": true }))
 }
 
 fn pin_listing(app: &AppHandle) -> pins::Listing {
@@ -1184,6 +1332,8 @@ fn http_client() -> reqwest::Client {
 async fn do_refresh(app: &AppHandle) -> Snapshot {
     let state = app.state::<AppState>();
     let _refresh = state.refresh_lock.lock().await;
+    // Ended leases free their accounts (and profiles) before this refresh decides anything.
+    state.leases.lock().unwrap().prune(chrono::Utc::now(), leases::process_alive);
     let started = Instant::now();
     let settings = state.settings.lock().unwrap().clone();
     state.diagnostics.poll_started(settings.refresh_minutes);
@@ -1192,7 +1342,7 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
         .unwrap_or_default();
     *state.sources.lock().unwrap() = found.clone();
     static CLEANUP_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let profiles = accounts::profile_sources(&pins::wanted(&settings.project_pins));
+    let profiles = accounts::profile_sources(&profile_accounts(&state));
     accounts::resolve_identities(&http_client(), &[found.clone(), profiles].concat()).await;
     let scan = found.clone();
     let active = tauri::async_runtime::spawn_blocking(move || accounts::capture(&scan))
@@ -1220,7 +1370,8 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
 
     let decisions = {
         let last = state.last_switch.lock().unwrap().clone();
-        balancer::decide(&list, &settings, &last)
+        let leased = state.leases.lock().unwrap().accounts();
+        balancer::decide_avoiding(&list, &settings, &last, &leased)
     };
     for (provider, id) in decisions {
         // Publish the current numbers first so the switch notice can name both accounts.
@@ -1301,6 +1452,7 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
             seen.last_success = snapshot.updated_at;
         }
     }
+    mark_leases(&state, &mut snapshot);
     *state.snapshot.lock().unwrap() = snapshot.clone();
     record_spend(&state);
     let _ = app.emit("usage-updated", &snapshot);
@@ -1527,6 +1679,7 @@ pub fn run() {
         profile_states: Mutex::default(),
         bulk_connect: Mutex::default(),
         hotkey_error: Mutex::default(),
+        leases: Mutex::default(),
     };
     tauri::Builder::default()
         // Must come first: a second launch hands over to the running instance and exits.

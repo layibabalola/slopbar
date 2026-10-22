@@ -9,7 +9,9 @@
 //! A Codex rollout names the account that started it (`creator_account_id`). A Claude transcript
 //! names none, so its messages go to the account SlopBar saw signed in to Claude Code at the time
 //! (`active_log`): that attribution is inferred, and a message from a time SlopBar was not
-//! watching stays unattributed. Usage elsewhere (WSL, other machines, the web) is not here.
+//! watching stays unattributed. A session whose start Claude Code's session hook reported
+//! (`session_hook`) goes to the account it started on instead: that attribution is exact. Usage
+//! elsewhere (WSL, other machines, the web) is not here.
 //!
 //! Each file's counts are kept per minute, model and folder, in memory and in `usage-index.json`,
 //! until its size or time changes; a transcript that only grew is read on from where it ended.
@@ -334,7 +336,28 @@ fn collect(dir: &Path, depth: u8, cutoff: SystemTime, codex: bool, out: &mut Vec
 // ---------------------------------------------------------------------------------------------
 // The index and its questions
 
-struct Source { codex: bool, account: Option<String>, models: Vec<String>, repos: Vec<String>, rows: Vec<Row> }
+struct Source {
+    codex: bool,
+    account: Option<String>,
+    /// Claude: the session id, from the transcript's file name.
+    session: Option<String>,
+    models: Vec<String>,
+    repos: Vec<String>,
+    rows: Vec<Row>,
+}
+
+/// The Claude Code session a transcript belongs to: `<session id>.jsonl`, or for a subagent's
+/// transcript `<session id>/subagents/<agent>.jsonl`.
+fn claude_session(path: &str) -> Option<String> {
+    let path = Path::new(path);
+    let parent = path.parent()?;
+    let id = if parent.file_name().is_some_and(|n| n == "subagents") {
+        parent.parent()?.file_name()?.to_str()?
+    } else {
+        path.file_stem()?.to_str()?
+    };
+    crate::session_hook::valid_session_id(id).then(|| id.to_string())
+}
 
 /// Every file's minutes, folders already named by repository.
 #[derive(Default)]
@@ -345,9 +368,10 @@ impl Index {
         // Folders keep their repository between scans; a scan runs after every refresh.
         static NAMES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
         let mut names = NAMES.get_or_init(Mutex::default).lock().unwrap();
-        let sources = store.files.values().filter(|f| !f.rows.is_empty()).map(|f| Source {
+        let sources = store.files.iter().filter(|(_, f)| !f.rows.is_empty()).map(|(path, f)| Source {
             codex: f.codex,
             account: f.account.clone(),
+            session: if f.codex { None } else { claude_session(path) },
             models: f.models.clone(),
             repos: f.cwds.iter().map(|c| names.entry(c.clone()).or_insert_with(|| repo_name(c)).clone()).collect(),
             rows: f.rows.clone(),
@@ -383,11 +407,14 @@ pub fn repo_name(cwd: &str) -> String {
 pub enum GroupBy { #[default] Repo, Model, Day }
 
 /// How a slice's tokens were tied to its account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Attribution {
     /// The session names its account (Codex).
     Session,
+    /// Claude Code's session hook reported the account the session started on (see
+    /// `session_hook`).
+    Exact,
     /// The account SlopBar saw signed in to the CLI at the time (Claude, and Codex sessions that
     /// name none).
     InferredFromActiveAccount,
@@ -461,7 +488,7 @@ pub struct Breakdown {
 }
 
 /// One minute's tokens, resolved to account, local time, repository and model.
-struct Resolved<'a> { provider: Provider, slot: Option<SlotKey>, inferred: bool, local: NaiveDateTime, repo: &'a str, model: &'a str, tokens: Tokens }
+struct Resolved<'a> { provider: Provider, slot: Option<SlotKey>, how: Attribution, local: NaiveDateTime, repo: &'a str, model: &'a str, tokens: Tokens }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum SlotKey { Known(String), Unknown(String) }
@@ -476,13 +503,15 @@ fn resolve<'a, Tz: TimeZone>(index: &'a Index, log: &active_log::Log, known: &[K
         let named = s.account.as_deref().map(|a| codex_slots.get(a).map_or_else(|| SlotKey::Unknown(a.to_string()), |id| SlotKey::Known(id.to_string())));
         for r in s.rows.iter().filter(|r| r.0 >= first) {
             let Some(at) = Utc.timestamp_opt(r.0 * 60, 0).single() else { continue };
-            let (slot, inferred) = match &named {
-                Some(k) => (Some(k.clone()), false),
+            let exact = s.session.as_deref().and_then(|id| log.session(id));
+            let (slot, how) = match (&named, exact) {
+                (Some(k), _) => (Some(k.clone()), Attribution::Session),
+                (None, Some(id)) => (Some(SlotKey::Known(id.to_string())), Attribution::Exact),
                 // A minute that starts before the account's first reading may still end inside it.
-                None => (log.at(provider, at).or_else(|| log.at(provider, at + Duration::seconds(59))).map(|id| SlotKey::Known(id.to_string())), true),
+                (None, None) => (log.at(provider, at).or_else(|| log.at(provider, at + Duration::seconds(59))).map(|id| SlotKey::Known(id.to_string())), Attribution::InferredFromActiveAccount),
             };
             f(Resolved {
-                provider, inferred: inferred && slot.is_some(), slot,
+                provider, how: if slot.is_some() { how } else { Attribution::Unattributed }, slot,
                 local: at.with_timezone(tz).naive_local(),
                 repo: s.repos.get(r.2 as usize).map_or("(none)", String::as_str),
                 model: s.models.get(r.1 as usize).map_or("unknown", String::as_str),
@@ -493,12 +522,17 @@ fn resolve<'a, Tz: TimeZone>(index: &'a Index, log: &active_log::Log, known: &[K
 }
 
 #[derive(Default)]
-struct Acc { tokens: Tokens, inferred: u64, session: u64, groups: HashMap<String, Tokens>, models: HashMap<String, Tokens>, heatmap: Heatmap }
+struct Acc { tokens: Tokens, inferred: u64, session: u64, exact: u64, groups: HashMap<String, Tokens>, models: HashMap<String, Tokens>, heatmap: Heatmap }
 
 impl Acc {
     fn add(&mut self, r: &Resolved, key: &str) {
         self.tokens.add(&r.tokens);
-        if r.inferred { self.inferred += r.tokens.total } else if r.slot.is_some() { self.session += r.tokens.total }
+        match r.how {
+            Attribution::InferredFromActiveAccount => self.inferred += r.tokens.total,
+            Attribution::Exact => self.exact += r.tokens.total,
+            Attribution::Session => self.session += r.tokens.total,
+            _ => {}
+        }
         self.groups.entry(key.to_string()).or_default().add(&r.tokens);
         self.models.entry(r.model.to_string()).or_default().add(&r.tokens);
         self.heatmap[r.local.weekday().num_days_from_monday() as usize][r.local.hour() as usize] += r.tokens.total;
@@ -573,12 +607,14 @@ pub fn breakdown<Tz: TimeZone>(index: &Index, log: &active_log::Log, known: &[Kn
 }
 
 fn slice(provider: Provider, id: Option<String>, email: Option<String>, alias: Option<String>, known: bool, acc: Acc, by_day: bool) -> Slice {
-    let attribution = match (id.is_some(), acc.session > 0, acc.inferred > 0) {
+    let kinds = [(acc.session, Attribution::Session), (acc.exact, Attribution::Exact), (acc.inferred, Attribution::InferredFromActiveAccount)];
+    let mut used = kinds.iter().filter(|(n, _)| *n > 0).map(|(_, a)| *a);
+    let attribution = match (id.is_some(), used.next(), used.next()) {
         (false, _, _) => Attribution::Unattributed,
-        (true, true, true) => Attribution::Mixed,
-        (true, _, true) => Attribution::InferredFromActiveAccount,
-        (true, _, false) if provider == Provider::Claude => Attribution::InferredFromActiveAccount,
-        _ => Attribution::Session,
+        (true, Some(_), Some(_)) => Attribution::Mixed,
+        (true, Some(one), None) => one,
+        (true, None, _) if provider == Provider::Claude => Attribution::InferredFromActiveAccount,
+        (true, None, _) => Attribution::Session,
     };
     Slice { provider, id, email, alias, known, attribution, tokens: acc.tokens, inferred_total: acc.inferred,
         groups: top(acc.groups, acc.tokens.total, by_day), heatmap: acc.heatmap }
@@ -600,18 +636,17 @@ pub struct DailyRow {
 /// Every local day of the lookback, oldest first.
 pub fn daily<Tz: TimeZone>(index: &Index, log: &active_log::Log, known: &[Known], now: DateTime<Utc>, tz: &Tz) -> Vec<DailyRow> {
     let emails: HashMap<&str, Option<&String>> = known.iter().map(|k| (k.id.as_str(), k.email.as_ref())).collect();
-    let mut rows: BTreeMap<(NaiveDate, u8, Option<SlotKey>, bool, String, String), Tokens> = BTreeMap::new();
+    let mut rows: BTreeMap<(NaiveDate, u8, Option<SlotKey>, Attribution, String, String), Tokens> = BTreeMap::new();
     resolve(index, log, known, now - Duration::days(LOOKBACK_DAYS), tz, |r| {
         let p = if r.provider == Provider::Claude { 0 } else { 1 };
-        rows.entry((r.local.date(), p, r.slot.clone(), r.inferred, r.repo.to_string(), r.model.to_string())).or_default().add(&r.tokens);
+        rows.entry((r.local.date(), p, r.slot.clone(), r.how, r.repo.to_string(), r.model.to_string())).or_default().add(&r.tokens);
     });
-    rows.into_iter().map(|((day, p, slot, inferred, repo, model), tokens)| {
+    rows.into_iter().map(|((day, p, slot, attribution, repo, model), tokens)| {
         let id = slot.map(|s| match s { SlotKey::Known(id) | SlotKey::Unknown(id) => id });
         DailyRow {
             day, provider: if p == 0 { Provider::Claude } else { Provider::Codex },
             email: id.as_deref().and_then(|i| emails.get(i).copied().flatten().cloned()),
-            attribution: match (&id, inferred) { (None, _) => Attribution::Unattributed, (Some(_), true) => Attribution::InferredFromActiveAccount, _ => Attribution::Session },
-            id, repo, model, tokens,
+            attribution, id, repo, model, tokens,
         }
     }).collect()
 }
@@ -713,6 +748,40 @@ mod tests {
         let shifted = breakdown(&index, &log, &known(), &f, at("2026-10-21T12:00:00Z"), &east);
         assert_eq!(shifted.accounts.iter().find(|s| s.id.as_deref() == Some("slot-a")).unwrap().heatmap[1][13], 370);
         assert_eq!(shifted.utc_offset_minutes, 180);
+    }
+
+    #[test]
+    fn sessions_the_hook_reported_go_to_their_account_exactly() {
+        let dir = TempDir::new();
+        let project = dir.0.join("claude").join("C--work-app");
+        let (hooked, unhooked) = ("0b5e7c1a-2f3d-4e5f-8a9b-0c1d2e3f4a5b", "9d8c7b6a-5f4e-4d3c-2b1a-0f9e8d7c6b5a");
+        std::fs::create_dir_all(project.join(hooked).join("subagents")).unwrap();
+        let cwd = "C:\\work\\app";
+        std::fs::write(project.join(format!("{hooked}.jsonl")), claude("m1", "2026-10-20T10:01:00Z", cwd, "claude-opus-5-5", 10, 0, 0, 0)).unwrap();
+        std::fs::write(project.join(hooked).join("subagents").join("agent-1.jsonl"), claude("m2", "2026-10-20T10:02:00Z", cwd, "claude-haiku-5-5", 5, 0, 0, 0)).unwrap();
+        std::fs::write(project.join(format!("{unhooked}.jsonl")), claude("m3", "2026-10-20T10:03:00Z", cwd, "claude-opus-5-5", 100, 0, 0, 0)).unwrap();
+        let gap = active_log::max_gap(5);
+        let mut log = active_log::Log::default();
+        // SlopBar saw slot-a signed in, but the hooked session ran on slot-b's profile.
+        for m in ["10:00", "10:05"] { log.note(Provider::Claude, "slot-a", at(&format!("2026-10-20T{m}:00Z")), gap); }
+        log.record_session(hooked, "slot-b", cwd, at("2026-10-20T10:00:30Z"));
+        let (index, _) = Scanner::new(None).scan(&roots(&dir.0), at("2026-10-21T12:00:00Z"));
+        let f = Filter { provider: Some(Provider::Claude), account: None, days: 7, group_by: GroupBy::Model };
+        let b = breakdown(&index, &log, &known(), &f, at("2026-10-21T12:00:00Z"), &Utc);
+        let slot = |id: &str| b.accounts.iter().find(|s| s.id.as_deref() == Some(id)).unwrap();
+        assert_eq!((slot("slot-b").tokens.total, slot("slot-b").attribution, slot("slot-b").inferred_total), (15, Attribution::Exact, 0), "the subagent's transcript too");
+        assert_eq!((slot("slot-a").tokens.total, slot("slot-a").attribution), (100, Attribution::InferredFromActiveAccount));
+        // Both kinds on one account are mixed.
+        log.record_session(unhooked, "slot-b", cwd, at("2026-10-20T10:02:30Z"));
+        log.record_session(hooked, "slot-a", cwd, at("2026-10-20T10:02:40Z"));
+        log.sessions.remove(unhooked);
+        let mixed = breakdown(&index, &log, &known(), &f, at("2026-10-21T12:00:00Z"), &Utc);
+        let a = mixed.accounts.iter().find(|s| s.id.as_deref() == Some("slot-a")).unwrap();
+        assert_eq!((a.tokens.total, a.attribution), (115, Attribution::Mixed));
+        let rows = daily(&index, &log, &known(), at("2026-10-21T12:00:00Z"), &Utc);
+        let total = |how: Attribution| rows.iter().filter(|r| r.attribution == how).map(|r| r.tokens.total).sum::<u64>();
+        assert_eq!((total(Attribution::Exact), total(Attribution::InferredFromActiveAccount)), (15, 100), "{rows:?}");
+        assert_eq!(claude_session("C:\\x\\projects\\p\\not-a-session!.jsonl"), None);
     }
 
     #[test]
