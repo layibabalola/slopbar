@@ -20,6 +20,8 @@ mod presence;
 mod rclone;
 mod unexpected;
 mod health;
+mod pins;
+mod bulk;
 mod auto_monitor;
 mod calendar;
 mod digest;

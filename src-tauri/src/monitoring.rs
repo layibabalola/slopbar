@@ -21,6 +21,10 @@ pub fn key(slot: &Slot) -> String {
     format!("{}:{}", slot.provider.name(), slot.id)
 }
 
+/// Held by every open monitoring sign-in (the user's, a bulk queue's or an automatic one), so
+/// only one sign-in terminal is ever open at a time.
+pub const SIGN_IN: &str = "monitoring-sign-in";
+
 /// Reserve connect/remove/disconnect for an account through their final disk mutation.
 /// The guard also releases reservations when a task fails or is cancelled.
 #[derive(Default)]
@@ -31,7 +35,12 @@ pub struct Operation {
 }
 impl Operations {
     pub fn begin(&self, provider: Provider, id: &str) -> Result<Operation, String> {
-        let key = format!("{}:{id}", provider.name());
+        self.begin_key(&format!("{}:{id}", provider.name()))
+    }
+
+    /// Reserves `key` itself, e.g. `SIGN_IN`.
+    pub fn begin_key(&self, key: &str) -> Result<Operation, String> {
+        let key = key.to_string();
         if !self.0.lock().unwrap().insert(key.clone()) {
             return Err("monitor_busy".into());
         }

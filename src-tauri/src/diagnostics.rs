@@ -90,6 +90,7 @@ pub enum Surface {
     Settings,
     Panel,
     Dock,
+    Switcher,
 }
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]

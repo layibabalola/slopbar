@@ -651,6 +651,9 @@ async function render() {
   } else if (!$("check-updates").disabled) $("check-updates").textContent = latest ? t("installUpdate") : t("checkUpdates");
   renderAccounts();
   if (!editingPlan()) renderSubscriptions();
+  renderHotkey();
+  loadBulk();
+  loadPins();
 }
 
 async function update(patch) {
@@ -848,6 +851,150 @@ $("check-updates").addEventListener("click", async () => {
 });
 
 listen("settings-changed", (e) => { settings = e.payload; render(); });
+
+// ---------------------------------------------------------------------------------------------
+// The quick switcher's shortcut (General)
+
+async function renderHotkey() {
+  if (document.activeElement !== $("hotkey")) $("hotkey").value = settings.switcher_hotkey ?? "";
+  $("hotkey").placeholder = t("hotkeyOff");
+  const problem = settings.switcher_hotkey ? await invoke("hotkey_status").catch(() => null) : null;
+  $("hotkey-hint").textContent = problem ? t(problem) : settings.switcher_hotkey ? t("switcherShortcutHint") : t("hotkeyOffHint");
+  $("hotkey-hint").classList.toggle("problem", !!problem);
+}
+async function saveHotkey() {
+  const before = settings.switcher_hotkey;
+  settings = { ...settings, switcher_hotkey: $("hotkey").value.trim() };
+  try {
+    await invoke("save_settings", { settings });
+    settings = await invoke("get_settings");
+    $("hotkey").value = settings.switcher_hotkey;
+  } catch {
+    settings = { ...settings, switcher_hotkey: before };
+    $("hotkey-hint").textContent = t("hotkey_invalid");
+    $("hotkey-hint").classList.add("problem");
+    return;
+  }
+  renderHotkey();
+}
+$("hotkey-save").addEventListener("click", saveHotkey);
+$("hotkey").addEventListener("keydown", (e) => { if (e.key === "Enter") saveHotkey(); });
+
+// ---------------------------------------------------------------------------------------------
+// Bulk actions (Accounts): monitoring for every unmonitored account, one sign-in at a time, and
+// removing accounts whose plan has ended.
+
+let bulk = { unmonitored: [], lapsed: { remove: [], in_use: [] }, connecting: null };
+const who = (target) => target.account || t("unknownAccount");
+
+function renderBulk() {
+  const c = bulk.connecting;
+  const running = c && !c.finished;
+  $("bulk-connect").disabled = running || !bulk.unmonitored.length;
+  $("bulk-connect-hint").textContent = bulk.unmonitored.length ? t("bulkConnectHint", { n: bulk.unmonitored.length }) : t("bulkConnectNone");
+  $("bulk-remove").disabled = !bulk.lapsed.remove.length;
+  $("bulk-remove-hint").textContent = bulk.lapsed.remove.length
+    ? t("bulkRemoveHint", { list: bulk.lapsed.remove.map(who).join(", ") })
+    : bulk.lapsed.in_use.length ? t("bulkRemoveInUse", { list: bulk.lapsed.in_use.map(who).join(", ") }) : t("bulkRemoveNone");
+  const status = $("bulk-status");
+  if (running && c.current) status.textContent = t("bulkConnecting", { i: c.done + 1, n: c.total, account: who(c.current) });
+  else if (c?.finished && c.error) status.textContent = t("bulkConnectStopped", { done: c.done, n: c.total, error: errorText("", c.error) });
+  else if (c?.finished && c.total) status.textContent = t("bulkConnectDone", { n: c.total });
+  status.hidden = !(running || (c?.finished && c.total)) || !status.textContent;
+}
+async function loadBulk() {
+  bulk = await invoke("bulk_status").catch(() => bulk);
+  renderBulk();
+}
+$("bulk-connect").addEventListener("click", async () => {
+  $("bulk-connect").disabled = true;
+  try { await invoke("connect_monitoring_all"); } catch (err) { alert(errorText("", String(err))); }
+  loadBulk();
+});
+$("bulk-remove").addEventListener("click", async () => {
+  await loadBulk();
+  const list = bulk.lapsed.remove;
+  if (!list.length) return;
+  const lines = list.map((a) => `• ${who(a)} (${a.provider === "claude" ? "Claude" : "Codex"}) — ${t("bulkEnded", { d: shortDay(a.ended) })}`);
+  if (!confirm(`${t("bulkRemoveConfirm", { n: list.length })}\n\n${lines.join("\n")}`)) return;
+  $("bulk-remove").disabled = true;
+  const result = await invoke("remove_lapsed_accounts").catch((err) => ({ removed: [], failed: [{ error: String(err) }] }));
+  if (result.snapshot) { snapshot = result.snapshot; renderAccounts(); }
+  const status = $("bulk-status");
+  status.textContent = result.failed.length
+    ? t("bulkRemoveFailed", { n: result.removed.length, failed: result.failed.length })
+    : t("bulkRemoved", { n: result.removed.length });
+  status.hidden = false;
+  loadBulk();
+});
+listen("bulk-monitoring", ({ payload }) => { bulk.connecting = payload; renderBulk(); if (payload.finished) loadBulk(); });
+listen("usage-updated", loadBulk);
+
+// ---------------------------------------------------------------------------------------------
+// An account per project (Accounts): pinned folders, and the lines that use them.
+
+let pinListing = { pins: [], launcher: null };
+const PIN_STATE = { ready: "pinReady", at_default: "pinAtDefault", no_login: "pinNoLogin" };
+
+function renderPins() {
+  $("pins").innerHTML = pinListing.pins.length ? pinListing.pins.map((p) => `
+    <div class="row pin" data-pin="${esc(p.provider)}|${esc(p.folder)}">
+      <span class="logo ${p.provider}">${MARK[p.provider]}</span>
+      <div class="title">
+        <label title="${esc(p.folder)}">${esc(p.folder)}</label>
+        <small>${esc(p.account ?? t("unknownAccount"))} · ${esc(t(PIN_STATE[p.state]))}</small>
+      </div>
+      <button class="btn" data-copy="${esc(p.launch)}" title="${esc(p.launch)}">${t("pinCopyLaunch")}</button>
+      <button class="btn" data-copy="${esc(p.powershell)}" title="${esc(p.powershell)}">${t("pinCopyPowerShell")}</button>
+      <button class="btn" data-copy="${esc(p.envrc)}" title="${esc(p.envrc)}">${t("pinCopyEnvrc")}</button>
+      <button class="remove" data-unpin="${esc(p.provider)}" data-folder="${esc(p.folder)}" title="${t("pinRemove")}">
+        <svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+      </button>
+    </div>`).join("") : `<div class="empty">${t("pinsNone")}</div>`;
+  const choice = $("pin-account").value;
+  $("pin-account").innerHTML = snapshot.accounts.map((a) =>
+    `<option value="${esc(a.provider)}|${esc(a.id)}">${a.provider === "claude" ? "Claude" : "Codex"} · ${esc(a.alias || a.email || t("unknownAccount"))}</option>`).join("");
+  if (choice) $("pin-account").value = choice;
+  $("pin-folder").placeholder = t("pinFolderPlaceholder");
+  $("pin-save").disabled = !snapshot.accounts.length;
+  $("pins-launcher").textContent = pinListing.launcher ? t("pinsLauncher", { path: pinListing.launcher }) : "";
+}
+async function loadPins() {
+  pinListing = await invoke("list_project_pins").catch(() => pinListing);
+  renderPins();
+}
+function pinStatus(text) {
+  $("pins-status").textContent = text;
+  $("pins-status").hidden = !text;
+}
+async function savePin() {
+  const folder = $("pin-folder").value.trim();
+  const [provider, id] = $("pin-account").value.split(/\|(.*)/s);
+  if (!folder || !provider) return;
+  try {
+    pinListing = await invoke("set_project_pin", { folder, provider, id });
+    $("pin-folder").value = "";
+    pinStatus("");
+    renderPins();
+  } catch (err) { pinStatus(String(err).includes("folder") ? t("presenceFolderInvalid") : String(err)); }
+}
+$("pin-save").addEventListener("click", savePin);
+$("pin-folder").addEventListener("keydown", (e) => { if (e.key === "Enter") savePin(); });
+$("pins").addEventListener("click", async (e) => {
+  const copy = e.target.closest("[data-copy]");
+  if (copy) {
+    try { await navigator.clipboard.writeText(copy.dataset.copy); pinStatus(t("pinCopied")); } catch { pinStatus(copy.dataset.copy); }
+    return;
+  }
+  const unpin = e.target.closest("[data-unpin]");
+  if (unpin) {
+    try {
+      pinListing = await invoke("set_project_pin", { folder: unpin.dataset.folder, provider: unpin.dataset.unpin, id: null });
+      renderPins();
+    } catch (err) { pinStatus(String(err)); }
+  }
+});
+listen("usage-updated", loadPins);
 
 // The window draws its own title bar (see settings.html).
 $("close").addEventListener("click", () => window.__TAURI__.window.getCurrentWindow().close());

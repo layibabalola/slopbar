@@ -79,6 +79,27 @@ pub enum Request {
     ConnectMonitoring { provider: Provider, id: String },
     DisconnectMonitoring { provider: Provider, id: String },
     RemoveAccount { provider: Provider, id: String },
+    /// Monitoring sign-ins for every account without one, one after another. Without `confirm`
+    /// only says which accounts that would be.
+    ConnectMonitoringAll {
+        #[serde(default)]
+        confirm: bool,
+    },
+    /// Remove every account whose plan has ended (see `bulk::lapsed`). Without `confirm` only
+    /// says which accounts that would be.
+    RemoveLapsedAccounts {
+        #[serde(default)]
+        confirm: bool,
+    },
+    /// Folders pinned to an account, with their state and the lines that use them (see `pins`).
+    ListProjectPins,
+    /// Pin `folder` to the provider's account `id`, or remove that pin when `id` is null.
+    SetProjectPin {
+        folder: String,
+        provider: Provider,
+        #[serde(default)]
+        id: Option<String>,
+    },
     CheckForUpdates,
     InstallUpdate,
     GetAppInfo,
@@ -135,6 +156,8 @@ pub const SETTINGS_PAGES: [&str; 7] = ["accounts", "subscriptions", "usage", "no
 pub enum InspectTarget {
     Settings,
     Flyout,
+    /// The quick switcher (Ctrl+Alt+S by default).
+    Switcher,
 }
 
 fn yes() -> bool { true }
