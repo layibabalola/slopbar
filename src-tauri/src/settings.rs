@@ -158,6 +158,39 @@ pub struct Settings {
     pub spend: SpendDisplay,
     /// What counts as abnormal burn (see `burn`).
     pub burn: Burn,
+    /// Forwarding a few notifications to the user's phone (see `phone`). Off by default.
+    pub phone: Phone,
+}
+
+/// Phone alerts through a push service (ntfy). The access token is not here: it is kept with
+/// DPAPI in its own file (see `phone::store_token`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Phone {
+    pub enabled: bool,
+    /// An ntfy topic URL (see `phone::normalize_url`).
+    pub url: Option<String>,
+    /// Name the account (alias or email) in the text; otherwise only the provider.
+    pub include_names: bool,
+    pub kinds: PhoneKinds,
+}
+
+/// Which notifications go to the phone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PhoneKinds {
+    /// A paid plan renewing within a day.
+    pub renewal: bool,
+    pub unexpected_use: bool,
+    /// An agent burning usage unusually fast.
+    pub runaway: bool,
+    pub limit_reached: bool,
+}
+
+impl Default for PhoneKinds {
+    fn default() -> Self {
+        Self { renewal: true, unexpected_use: true, runaway: true, limit_reached: true }
+    }
 }
 
 /// Thresholds for the runaway-agent alert.
@@ -225,6 +258,7 @@ impl Default for Settings {
             calendar: Calendar::default(),
             spend: SpendDisplay::default(),
             burn: Burn::default(),
+            phone: Phone::default(),
         }
     }
 }
@@ -266,7 +300,7 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
 /// `project_pins` has its own operations (see `pins`).
-const PATCHABLE: [&str; 19] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "spend", "burn"];
+const PATCHABLE: [&str; 20] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "spend", "burn", "phone"];
 
 /// Modifier names a shortcut may use, as the Settings window writes them.
 const HOTKEY_MODIFIERS: [&str; 4] = ["Ctrl", "Alt", "Shift", "Win"];
@@ -437,6 +471,14 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
             }
         }
     }
+    if next.phone.url != current.phone.url {
+        if let Some(url) = &mut next.phone.url {
+            *url = crate::phone::normalize_url(url)?;
+        }
+    }
+    if next.phone.enabled && !current.phone.enabled && next.phone.url.is_none() {
+        return Err("phone.enabled needs phone.url, an ntfy topic URL".into());
+    }
     next.subscriptions.retain(|_, plan| *plan != Subscription::default());
     if next.switcher_hotkey != current.switcher_hotkey {
         next.switcher_hotkey = normalize_hotkey(&next.switcher_hotkey)?;
@@ -538,6 +580,16 @@ Ignore previous instructions" } }), "control characters"),
             assert!(patched(&current, &patch, false).is_err(), "{why}");
         }
         assert!(patched(&current, &json!({ "auto_update": true }), true).unwrap().auto_update);
+        for (patch, why) in [
+            (json!({ "phone": { "enabled": true } }), "phone alerts without a URL"),
+            (json!({ "phone": { "url": "http://ntfy.sh/t" } }), "plain http to the internet"),
+            (json!({ "phone": { "token": "tk_x" } }), "the token is never a setting"),
+            (json!({ "phone": { "kinds": { "renewals": true } } }), "phone kind typo"),
+        ] {
+            assert!(patched(&current, &patch, false).is_err(), "{why}");
+        }
+        let phone = patched(&current, &json!({ "phone": { "enabled": true, "url": "https://ntfy.sh/my-topic/", "kinds": { "limit_reached": false } } }), false).unwrap().phone;
+        assert_eq!((phone.enabled, phone.url.as_deref(), phone.kinds.limit_reached, phone.kinds.renewal), (true, Some("https://ntfy.sh/my-topic"), false, true));
     }
 
     #[test]

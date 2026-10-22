@@ -1,4 +1,4 @@
-use crate::{accounts, active_log, auto_monitor, balancer, burn, ledger, bulk, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, migrate, model, monitoring, notify, panel, pins, plan_alerts, presence, providers, reset_credits, settings, sources, subscriptions, unexpected, updates, usage_index};
+use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, ledger, migrate, model, monitoring, notify, panel, phone, pins, plan_alerts, presence, providers, reset_credits, settings, sources, subscriptions, unexpected, updates, usage_index};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -346,6 +346,11 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             value(usage_breakdown(&app, usage_index::Filter { provider, account, days: days.unwrap_or(7), group_by: group_by.unwrap_or_default() }).await)
         }
         R::ExportCsv { folder } => value(write_csv(&app, folder).await?),
+        R::ExportBackup { path, passphrase } => write_backup(&app, path, passphrase).await,
+        R::RestoreBackup { path, passphrase, dry_run } => {
+            let bytes = tauri::async_runtime::spawn_blocking(move || backup::read(&path)).await.map_err(|_| "backup_unreadable".to_string())??;
+            value(apply_backup(&app, bytes, passphrase, dry_run).await?)
+        }
         R::UpdateSettings { patch } => {
             let state = app.state::<AppState>();
             let _held = state.settings_lock.lock().await;
@@ -1101,6 +1106,17 @@ async fn store_settings(app: &AppHandle, settings: Settings) -> Result<(), Strin
     let settings = if settings.switcher_hotkey == stored { settings } else {
         Settings { switcher_hotkey: settings::normalize_hotkey(&settings.switcher_hotkey)?, ..settings }
     };
+    // And a changed phone-alert URL: only an ntfy topic URL, never plain http to the internet.
+    let stored_phone = app.state::<AppState>().settings.lock().unwrap().phone.url.clone();
+    let mut settings = settings;
+    if settings.phone.url != stored_phone {
+        if let Some(url) = settings.phone.url.as_deref().filter(|u| !u.trim().is_empty()) {
+            settings.phone.url = Some(phone::normalize_url(url)?);
+        } else {
+            settings.phone.url = None;
+        }
+    }
+    if settings.phone.url.is_none() { settings.phone.enabled = false; }
     settings::save(&settings)?;
     diagnostics::set_crash_records(settings.crash_records);
     let previous = std::mem::replace(&mut *app.state::<AppState>().settings.lock().unwrap(), settings.clone());
@@ -1522,6 +1538,98 @@ fn csv_default_folder() -> Option<String> {
     csv_export::default_folder().map(|p| p.to_string_lossy().into_owned())
 }
 
+// ---------------------------------------------------------------------------------------------
+// Backup and restore (see `backup`)
+
+/// Seals settings, the weekly history and the spend ledger into a backup file. Only the slots'
+/// provider, id and email are read from the vault.
+async fn write_backup(app: &AppHandle, path: Option<String>, passphrase: backup::Passphrase) -> Result<serde_json::Value, String> {
+    let state = app.state::<AppState>();
+    let settings = state.settings.lock().unwrap().clone();
+    let history = state.usage_history.lock().unwrap().clone();
+    let ledger = state.ledger.lock().unwrap().clone();
+    let version = app_version(app.clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        let accounts = accounts::load_slots().into_iter().map(|s| backup::Account { provider: s.provider, id: s.id, email: s.email });
+        let now = chrono::Utc::now();
+        let contents = backup::Contents::new(&settings, &history, &ledger, accounts, &version, now);
+        let stamp = now.with_timezone(&chrono::Local).format("%Y-%m-%d-%H%M%S").to_string();
+        let target = backup::target(path.as_deref(), csv_export::default_folder(), &stamp)?;
+        let bytes = backup::seal(&contents, &passphrase)?;
+        backup::write(&target, &bytes)?;
+        Ok(serde_json::json!({ "path": target, "bytes": bytes.len(), "note": backup::NOTE }))
+    }).await.map_err(|_| "backup_unwritable".to_string())?
+}
+
+/// Opens a backup and previews merging it; unless `dry_run`, also saves and applies the result.
+async fn apply_backup(app: &AppHandle, bytes: Vec<u8>, passphrase: backup::Passphrase, dry_run: bool) -> Result<backup::Preview, String> {
+    let contents = tauri::async_runtime::spawn_blocking(move || backup::open(&bytes, &passphrase))
+        .await.map_err(|_| "backup_unreadable".to_string())??;
+    let known: Vec<(Provider, String)> = tauri::async_runtime::spawn_blocking(|| accounts::load_slots().into_iter().map(|s| (s.provider, s.id)).collect())
+        .await.unwrap_or_default();
+    let state = app.state::<AppState>();
+    let held = state.settings_lock.lock().await;
+    let current = state.settings.lock().unwrap().clone();
+    let now = chrono::Utc::now();
+    let (merged_settings, preview, history, ledger) = {
+        let folder = |f: &str| pins::normalize_folder(f).ok();
+        let presence_ok = |f: &str| settings::valid_presence_folder(f);
+        let calendar_ok = |p: &str| calendar::valid_path(p);
+        let here = backup::Here { known: &known, updates_enabled: updates_enabled(), folder: &folder, presence_folder_ok: &presence_ok, calendar_path_ok: &calendar_ok };
+        // Both held while merging, so a refresh finishing meanwhile is not lost.
+        let mut history = state.usage_history.lock().unwrap();
+        let mut ledger = state.ledger.lock().unwrap();
+        let (merged, preview) = backup::merge(&current, &history, &ledger, &contents, &here, now);
+        if dry_run { return Ok(preview); }
+        *history = merged.history.clone();
+        *ledger = merged.ledger.clone();
+        (merged.settings, preview, merged.history, merged.ledger)
+    };
+    subscriptions::save(&history)?;
+    ledger::save(&ledger)?;
+    store_settings(app, merged_settings).await?;
+    drop(held);
+    sync_pins(app, None).await;
+    do_refresh(app).await;
+    Ok(preview)
+}
+
+#[tauri::command]
+async fn export_backup(app: AppHandle, path: Option<String>, passphrase: backup::Passphrase) -> Result<serde_json::Value, String> {
+    write_backup(&app, path, passphrase).await
+}
+
+/// The Settings window reads the chosen file itself and passes its contents.
+#[tauri::command]
+async fn restore_backup(app: AppHandle, contents: String, passphrase: backup::Passphrase, dry_run: bool) -> Result<backup::Preview, String> {
+    apply_backup(&app, contents.into_bytes(), passphrase, dry_run).await
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phone alerts (see `phone`)
+
+#[tauri::command]
+fn phone_token_saved() -> bool {
+    settings::app_dir().is_some_and(|d| phone::load_token(&d).is_some())
+}
+
+/// Saves the access token with DPAPI; null or empty deletes it.
+#[tauri::command]
+async fn set_phone_token(token: Option<String>) -> Result<(), String> {
+    let dir = settings::app_dir().ok_or("phone_token_storage")?;
+    tauri::async_runtime::spawn_blocking(move || phone::store_token(&dir, token.as_deref())).await.map_err(|_| "phone_token_storage".to_string())?
+}
+
+/// "Send test": the saved URL and token, whether or not phone alerts are on.
+#[tauri::command]
+async fn send_phone_test(app: AppHandle, title: String, body: String) -> Result<(), String> {
+    let phone_settings = app.state::<AppState>().settings.lock().unwrap().phone.clone();
+    let url = phone_settings.url.clone().ok_or("phone_url_missing")?;
+    let message = phone::compose(&phone_settings, phone::Kind::Test, (&title, &body), (&title, &body)).ok_or("phone_url_missing")?;
+    let token = settings::app_dir().and_then(|d| phone::load_token(&d));
+    phone::send(&phone::client(), &url, token.as_deref(), &message).await
+}
+
 /// Re-reads the Codex CLI's local history off the async runtime, one scan at a time, then has
 /// open windows reload their report. Its first run reads weeks of rollouts and can take a while.
 fn scan_codex_local(app: &AppHandle) {
@@ -1666,6 +1774,11 @@ pub fn run() {
             get_usage_breakdown,
             export_csv,
             csv_default_folder,
+            export_backup,
+            restore_backup,
+            phone_token_saved,
+            set_phone_token,
+            send_phone_test,
             take_plan_alerts,
             take_capacity_alerts,
             get_credit_advice,

@@ -16,6 +16,8 @@ mod advisor;
 mod burn;
 mod reset_credits;
 mod ledger;
+mod backup;
+mod phone;
 mod codex_local;
 mod active_log;
 mod usage_index;

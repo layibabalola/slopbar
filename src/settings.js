@@ -726,6 +726,151 @@ $("export-csv").addEventListener("click", async () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// Backup and restore. Sign-ins are never in a backup; the passphrase is never stored.
+
+const codeText = (prefix, code) => {
+  const key = `${prefix}_${String(code ?? "")}`;
+  const text = t(key);
+  return text === key ? t(`${prefix}_failed`) : text;
+};
+let restoring = null;
+
+function backupStatus(text) {
+  const status = $("backup-status");
+  status.textContent = text; status.hidden = !text;
+}
+
+function passphrase() {
+  const value = $("backup-passphrase").value;
+  if ([...value].length < 8) { backupStatus(t("backupErr_backup_passphrase_too_short")); return null; }
+  return value;
+}
+
+$("backup-export").addEventListener("click", async () => {
+  const pass = passphrase();
+  if (!pass) return;
+  backupStatus(t("backupExporting"));
+  try {
+    const written = await invoke("export_backup", { path: null, passphrase: pass });
+    $("backup-passphrase").value = "";
+    backupStatus(t("backupSaved", { path: written.path }));
+  } catch (e) { backupStatus(codeText("backupErr", e)); }
+});
+
+$("backup-restore").addEventListener("click", () => {
+  if (!passphrase()) return;
+  $("backup-file").value = "";
+  $("backup-file").click();
+});
+
+$("backup-file").addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  const pass = passphrase();
+  if (!file || !pass) return;
+  backupStatus(t("backupOpening"));
+  try {
+    const contents = await file.text();
+    const preview = await invoke("restore_backup", { contents, passphrase: pass, dryRun: true });
+    restoring = { contents, pass };
+    renderBackupPreview(preview);
+    backupStatus("");
+  } catch (err) { restoring = null; $("backup-preview").hidden = true; backupStatus(codeText("backupErr", err)); }
+});
+
+function renderBackupPreview(p) {
+  const list = (items) => items.length ? esc(items.join(", ")) : "—";
+  const changes = (c) => t("backupChanges", { added: c.added.length, changed: c.changed.length });
+  const account = (a) => `${esc(a.alias || a.email || a.id)} · ${a.connected ? t("backupConnected") : t("backupPending")}`;
+  const rows = [
+    [t("backupFrom"), esc(`${shortDate(p.created_at)} · ${p.app_version}`)],
+    [t("backupPrefs"), list(p.settings)],
+    [t("backupAliases"), changes(p.aliases)],
+    [t("backupPlans"), changes(p.plans)],
+    [t("backupPins"), changes(p.pins)],
+    [t("backupHistory"), changes(p.history)],
+    [t("backupLedger"), changes(p.ledger)],
+    [t("backupAccounts"), p.accounts.map(account).join("<br>") || "—"],
+  ];
+  if (p.skipped.length) rows.push([t("backupSkipped"), esc(p.skipped.map((s) => s.what).join(", "))]);
+  $("backup-preview").innerHTML = rows.map(([k, v]) => `<div class="row"><div class="title"><label>${esc(k)}</label><small>${v}</small></div></div>`).join("") +
+    `<div class="row"><div class="title"><small>${esc(t("backupReconnect"))}</small></div>
+      <div class="presence-path"><button class="btn accent" id="backup-apply">${esc(t("backupApply"))}</button><button class="btn" id="backup-cancel">${esc(t("backupCancel"))}</button></div></div>`;
+  $("backup-preview").hidden = false;
+  $("backup-cancel").addEventListener("click", () => { restoring = null; $("backup-preview").hidden = true; });
+  $("backup-apply").addEventListener("click", async () => {
+    if (!restoring) return;
+    $("backup-apply").disabled = true;
+    try {
+      const done = await invoke("restore_backup", { contents: restoring.contents, passphrase: restoring.pass, dryRun: false });
+      restoring = null;
+      $("backup-passphrase").value = "";
+      $("backup-preview").hidden = true;
+      settings = await invoke("get_settings");
+      await render();
+      backupStatus(t("backupRestored", { n: done.pending }));
+    } catch (err) { backupStatus(codeText("backupErr", err)); $("backup-apply").disabled = false; }
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phone alerts (ntfy). The access token goes to its own DPAPI-protected file, never settings.
+
+const PHONE_KINDS = ["renewal", "unexpected_use", "runaway", "limit_reached"];
+const phoneStatus = (text) => { $("phone-status").textContent = text; $("phone-status").hidden = !text; };
+
+async function renderPhone() {
+  const phone = settings.phone;
+  $("phone-enabled").checked = phone.enabled;
+  $("phone-enabled").disabled = !phone.url;
+  if (document.activeElement !== $("phone-url")) $("phone-url").value = phone.url ?? "";
+  $("phone-include_names").checked = phone.include_names;
+  for (const kind of PHONE_KINDS) $(`phone-kind-${kind}`).checked = phone.kinds[kind];
+  $("phone-test").disabled = !phone.url;
+  const saved = await invoke("phone_token_saved").catch(() => false);
+  $("phone-token-state").textContent = saved ? t("phoneTokenSaved") : t("phoneTokenNone");
+}
+
+const updatePhone = (patch) => update({ phone: { ...settings.phone, ...patch } });
+$("phone-enabled").addEventListener("change", (e) => updatePhone({ enabled: e.target.checked }));
+$("phone-include_names").addEventListener("change", (e) => updatePhone({ include_names: e.target.checked }));
+for (const kind of PHONE_KINDS) {
+  $(`phone-kind-${kind}`).addEventListener("change", (e) => updatePhone({ kinds: { ...settings.phone.kinds, [kind]: e.target.checked } }));
+}
+$("phone-url-save").addEventListener("click", async () => {
+  const url = $("phone-url").value.trim() || null;
+  const before = settings;
+  try {
+    await update({ phone: { ...settings.phone, url } });
+    settings = await invoke("get_settings");
+    await render();
+    phoneStatus(url ? t("phoneUrlSaved") : "");
+  } catch {
+    settings = before;
+    await render();
+    phoneStatus(t("phoneUrlInvalid"));
+  }
+});
+$("phone-token-save").addEventListener("click", async () => {
+  try {
+    await invoke("set_phone_token", { token: $("phone-token").value.trim() || null });
+    $("phone-token").value = "";
+    phoneStatus("");
+  } catch (e) { phoneStatus(codeText("phoneErr", e)); }
+  renderPhone();
+});
+$("phone-token-clear").addEventListener("click", async () => {
+  try { await invoke("set_phone_token", { token: null }); phoneStatus(""); } catch (e) { phoneStatus(codeText("phoneErr", e)); }
+  renderPhone();
+});
+$("phone-test").addEventListener("click", async () => {
+  phoneStatus(t("phoneTestSending"));
+  try {
+    await invoke("send_phone_test", { title: t("phoneTestTitle"), body: t("phoneTestBody") });
+    phoneStatus(t("phoneTestSent"));
+  } catch (e) { phoneStatus(codeText("phoneErr", e)); }
+});
+
+// ---------------------------------------------------------------------------------------------
 // Everything else
 
 async function render() {
@@ -749,6 +894,7 @@ async function render() {
   $("crash-records").checked = settings.crash_records;
   $("auto-monitoring").checked = settings.auto_connect_monitoring;
   renderCalendar();
+  renderPhone();
   renderPresence();
   const version = await invoke("app_version");
   $("version").textContent = /^\d/.test(version) ? `v${version}` : version;

@@ -15,7 +15,7 @@ use crate::accounts::Provider;
 use crate::model::{AccountUsage, Snapshot};
 use crate::settings::Settings;
 
-const VERSION: u8 = 1;
+pub(crate) const VERSION: u8 = 1;
 /// Completed weeks kept per account and window kind (about three months).
 const KEEP: usize = 12;
 /// The verdict looks at this many of the latest completed weeks.

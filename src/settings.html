@@ -169,6 +169,57 @@
           <input type="checkbox" class="switch" id="notify-digest" />
         </div>
       </div>
+      <h2 data-i18n="sPhone"></h2>
+      <div class="group">
+        <div class="row">
+          <div class="title"><label for="phone-enabled" data-i18n="phoneEnabled"></label><small data-i18n="phoneHint"></small></div>
+          <input type="checkbox" class="switch" id="phone-enabled" />
+        </div>
+        <div class="row">
+          <div class="title"><label for="phone-url" data-i18n="phoneUrl"></label><small data-i18n="phoneUrlHint"></small></div>
+        </div>
+        <div class="row">
+          <div class="presence-path">
+            <input type="text" id="phone-url" spellcheck="false" placeholder="https://ntfy.sh/your-topic" />
+            <button class="btn" id="phone-url-save" data-i18n="presenceSave"></button>
+          </div>
+        </div>
+        <div class="row">
+          <div class="title"><label for="phone-token" data-i18n="phoneToken"></label><small id="phone-token-state"></small></div>
+        </div>
+        <div class="row">
+          <div class="presence-path">
+            <input type="password" id="phone-token" autocomplete="off" spellcheck="false" />
+            <button class="btn" id="phone-token-save" data-i18n="presenceSave"></button>
+            <button class="btn" id="phone-token-clear" data-i18n="phoneTokenClear"></button>
+          </div>
+        </div>
+        <div class="row">
+          <div class="title"><label for="phone-include_names" data-i18n="phoneNames"></label><small data-i18n="phoneNamesHint"></small></div>
+          <input type="checkbox" class="switch" id="phone-include_names" />
+        </div>
+        <div class="row">
+          <label for="phone-kind-renewal" data-i18n="phoneKindRenewal"></label>
+          <input type="checkbox" class="switch" id="phone-kind-renewal" />
+        </div>
+        <div class="row">
+          <label for="phone-kind-unexpected_use" data-i18n="phoneKindUnexpected"></label>
+          <input type="checkbox" class="switch" id="phone-kind-unexpected_use" />
+        </div>
+        <div class="row">
+          <label for="phone-kind-runaway" data-i18n="phoneKindRunaway"></label>
+          <input type="checkbox" class="switch" id="phone-kind-runaway" />
+        </div>
+        <div class="row">
+          <label for="phone-kind-limit_reached" data-i18n="phoneKindLimit"></label>
+          <input type="checkbox" class="switch" id="phone-kind-limit_reached" />
+        </div>
+        <div class="row">
+          <div class="title"><label data-i18n="phoneTest"></label><small data-i18n="phoneTestHint"></small></div>
+          <button class="btn" id="phone-test" data-i18n="phoneTestButton"></button>
+        </div>
+      </div>
+      <p class="hint" id="phone-status" role="status" hidden></p>
     </section>
 
     <!-- Data -->
@@ -259,6 +310,22 @@
         </div>
       </div>
       <p class="hint" id="diagnostics-status" role="status" hidden></p>
+      <h2 data-i18n="sBackup"></h2>
+      <div class="group">
+        <div class="row">
+          <div class="title"><label for="backup-passphrase" data-i18n="backupPassphrase"></label><small data-i18n="backupHint"></small></div>
+        </div>
+        <div class="row">
+          <div class="presence-path">
+            <input type="password" id="backup-passphrase" autocomplete="new-password" spellcheck="false" />
+            <button class="btn" id="backup-export" data-i18n="backupExport"></button>
+            <button class="btn" id="backup-restore" data-i18n="backupRestore"></button>
+          </div>
+        </div>
+      </div>
+      <input type="file" id="backup-file" accept=".slopbar-backup" hidden />
+      <div class="group" id="backup-preview" hidden></div>
+      <p class="hint" id="backup-status" role="status" hidden></p>
     </section>
 
     <!-- Health -->
