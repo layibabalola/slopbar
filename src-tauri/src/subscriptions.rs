@@ -440,6 +440,41 @@ pub enum RenewalWarning {
 
 pub const WASTEFUL_DAYS: i64 = 3;
 
+/// OpenAI: grandfathered ChatGPT Pro 200 subscribers keep the previous Codex allowance through
+/// this day; after it Pro 200 includes a lower allowance at the same price.
+/// https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers
+pub const PRO_200_LAST_DAY: (i32, u32, u32) = (2026, 10, 29);
+/// The new allowance as a share of the old. OpenAI gives no figure; third-party estimates put it
+/// at about half.
+pub const PRO_200_NEW_ALLOWANCE: f64 = 0.5;
+
+/// Pro 200's coming allowance cut, for one account on it.
+#[derive(Debug, Clone, Serialize)]
+pub struct AllowanceChange {
+    /// The last day of the previous allowance.
+    pub last_day: NaiveDate,
+    /// The highest weekly usage in recent weeks, the week in progress included.
+    pub peak_percent: f64,
+    /// That peak measured against the new allowance.
+    pub projected_percent: f64,
+    /// That week would reach the limit under the new allowance.
+    pub would_hit_limit: bool,
+}
+
+/// For a Codex account on Pro 200 before the cut: whether its recent weeks would fit the smaller
+/// allowance. None for other plans, after the cut, or with no week to go on.
+pub fn allowance_change(acc: &AccountUsage, h: &AccountHistory, now: DateTime<Utc>) -> Option<AllowanceChange> {
+    let (y, m, d) = PRO_200_LAST_DAY;
+    let last_day = NaiveDate::from_ymd_opt(y, m, d)?;
+    if acc.provider != Provider::Codex || acc.plan.as_deref() != Some("pro") || now.date_naive() > last_day { return None; }
+    let mut done: Vec<&WindowRecord> = h.windows.iter().filter(|r| r.kind == "weekly" && r.resets_at <= now && (r.counts() || r.local)).collect();
+    done.sort_by_key(|r| std::cmp::Reverse(r.resets_at));
+    let live = acc.windows.iter().filter(|w| w.kind == "weekly" && !acc.stale && acc.error.is_none()).map(|w| w.used_percent);
+    let peak = done.iter().take(RECENT).map(|r| r.peak).chain(live).reduce(f64::max)?;
+    let projected = peak / PRO_200_NEW_ALLOWANCE;
+    Some(AllowanceChange { last_day, peak_percent: peak, projected_percent: (projected * 10.0).round() / 10.0, would_hit_limit: projected >= 100.0 })
+}
+
 fn renewal_warning(renewal: Option<&Renewal>, ends_at: Option<DateTime<Utc>>, a: &Assessment, now: DateTime<Utc>) -> Option<RenewalWarning> {
     let left = renewal?.at - now;
     if ends_at.is_some() || left <= chrono::Duration::zero() { return None; }
@@ -489,6 +524,8 @@ pub struct Entry {
     pub idle_now: bool,
     /// Codex only: what the Codex CLI on this PC shows for this account.
     pub local: Option<crate::codex_local::LocalActivity>,
+    /// Codex Pro 200 only, until its allowance is cut (see `allowance_change`).
+    pub allowance_change: Option<AllowanceChange>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -591,6 +628,7 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
             plan_code: acc.billing.plan_code.clone(),
             idle_now,
             local: activity,
+            allowance_change: allowance_change(acc, h, now),
         }
     }).collect();
     let providers = Provider::ALL.into_iter().filter(|p| accounts.iter().any(|a| a.provider == *p)).map(|provider| {

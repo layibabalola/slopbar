@@ -343,6 +343,7 @@ function subscriptionRow(e) {
         <small>${esc(weekText)}${e.stale ? ` · ${t("lastReading")}` : ""}${week?.runs_out_at ? ` · <b class="runs-out">${esc(t("runsOut", { at: dayTime(week.runs_out_at) }))}</b>` : ""}</small>
         ${local ? `<small>${esc(local)}</small>` : ""}
         ${e.idle_now ? `<small>${t("subIdleNow")}</small>` : ""}
+        ${e.allowance_change?.would_hit_limit ? `<small class="advice">${esc(t("subProCut", { d: shortDate(`${e.allowance_change.last_day}T12:00:00`), p: Math.round(e.allowance_change.peak_percent), q: Math.round(e.allowance_change.projected_percent) }))}</small>` : ""}
         ${verdictLines(e).map((l) => `<small>${esc(l)}</small>`).join("")}
         ${providerDate ? `<small>${esc(providerDate)}</small>` : ""}
         ${kindNote ? `<small>${esc(kindNote)}</small>` : ""}
