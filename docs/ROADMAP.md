@@ -97,6 +97,7 @@ upstream PR.
 |---|---|---|
 | 45 | **Smaller footprint without losing features**: Settings, switcher and flyout built on demand; one shared WebView2 process group; quiet idle timers; capped diagnostics exports and install rollbacks. Measured: 404 MB -> 171 MB private and 4.88% -> 0.73% of a core at idle. | done (07416eb) |
 | 46 | **Native taskbar widget**: draw the always-visible widget with Windows' own drawing instead of a web view, for a small (~80-100 MB) idle footprint. | done (ac9e355) |
+| 47 | **Flyout on demand**: the flyout is built on click and closed when dismissed, so no WebView2 process runs at idle. Done in the native-widget session. | done (a74cf4b) |
 | 30b | **Translate the 130 strings added in waves 5 and 6.** | done (aab0f12) |
 
 ## Done before this roadmap (branch `claude/subscription-value`; upstream thelioo/slopbar#8–#11, stacked on #6)
