@@ -54,6 +54,30 @@ upstream PR.
 | 22 | **Auto-connect monitoring.** When an unmonitored account is the one in use, start its monitoring sign-in automatically (one browser approval), with backoff and a setting. Added by the owner on 2026-10-21. | done (7e7ba16) |
 | 19 | **Claude Code status line.** The active account's headroom and time-to-limit in the status line. | done (520049a) |
 
+## Wave 4: running (added by the owner on 2026-10-22)
+
+| # | Item | Status |
+|---|---|---|
+| 23 | **Encrypt the account vault** with DPAPI like the monitoring store, with a safe one-time migration and rollback. | running |
+| 24 | **Green tests and CI**: fix the failing login-script test and the flaky http_diagnostics test; run cargo test on Windows in GitHub Actions for every PR. | running |
+| 25 | **Token health and revoke-all**: detect revoked sign-ins; one action revokes every SlopBar-held session of an account. | running |
+| 26 | **Plan change advisor**: concrete cancel/downgrade moves with projected savings and remaining headroom. | running |
+| 27 | **Claude extra usage**: track pay-as-you-go overage (extra_usage limit and credits used) and alert before it bills. | running |
+| 28 | **Spend ledger**: month-by-month cost per plan, year-to-date totals, optional tax rate and currency. | running |
+| 29 | **SlopBar Ultra releases and updates**: signed installers from the fork; Ultra's updater follows the fork's releases. | running |
+
+## Wave 5: queued
+
+| # | Item |
+|---|---|
+| 30 | **Translations** of every new string into the nine other supported languages. |
+| 31 | **Exact Claude attribution**: a Claude Code SessionStart hook recording which account each session started on. |
+| 32 | **Account leases**: agents claim and release an account for a job through the door. |
+| 33 | **Smart launcher**: slopbar-run combines project pins with recommend_account. |
+| 34 | **Sparklines and compact mode** in the flyout. |
+| 35 | **Onboarding** for first run. |
+| 36 | **Accessibility pass**: keyboard, screen reader, contrast. |
+
 ## Done before this roadmap (branch `claude/subscription-value`; upstream thelioo/slopbar#8–#11, stacked on #6)
 
 Subscriptions page with verdicts and renewal dates; Codex inspection from local history;
