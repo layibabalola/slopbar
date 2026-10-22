@@ -44,7 +44,13 @@ pub fn line(pipe: &str, cache: Option<&Path>, limit: Duration, now: DateTime<Utc
         return Some(c.line).filter(|l| !l.is_empty());
     }
     let request = Request::GetHeadroom { provider: Some(Provider::Claude), id: None };
-    let line = crate::door::call_within(pipe, &request, limit).ok().and_then(|v| format(&v, &chrono::Local, now));
+    let started = std::time::Instant::now();
+    let reply = crate::door::call_within(pipe, &request, limit);
+    // SLOPBAR_STATUSLINE_DEBUG=1 says on stderr why nothing was printed.
+    if std::env::var_os("SLOPBAR_STATUSLINE_DEBUG").is_some() {
+        eprintln!("door: {} after {:?}", reply.as_ref().err().map_or("ok", String::as_str), started.elapsed());
+    }
+    let line = reply.ok().and_then(|v| format(&v, &chrono::Local, now));
     if let Some(path) = cache {
         // A failure is remembered too, so a stuck app costs the deadline once per `FRESH`.
         remember(path, &Cached { at: now, line: line.clone().unwrap_or_default() });
