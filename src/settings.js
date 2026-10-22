@@ -1,6 +1,6 @@
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
-import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetText, errorText, duration, shortDate, shortDay, windowLabel, windowResetText, visibleResetWindows, placesText } from "./i18n.js";
+import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetText, errorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -242,6 +242,7 @@ listen("account-added", () => { $("add-hint").hidden = true; });
 // The verdicts come from the backend (subscriptions.rs); this page only words them.
 
 let report = null;
+const NOTIFY_KINDS = ["usage", "resets", "switches", "renewals"];
 const money = (v) => (v == null ? "" : `$${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`);
 const pct = (v) => `${Math.round(v)}%`;
 const VERDICT_TONE = { exhausted_weekly: "bad", unused: "warn", underused: "warn", healthy: "ok", insufficient_data: "" };
@@ -330,7 +331,7 @@ function subscriptionRow(e) {
         : `<span class="btn use" aria-hidden="true" style="visibility:hidden">${t("subManage")}</span>`}
       <span></span>
       <div class="monitor-state">
-        <small>${esc(weekText)}${e.stale ? ` · ${t("lastReading")}` : ""}</small>
+        <small>${esc(weekText)}${e.stale ? ` · ${t("lastReading")}` : ""}${week?.runs_out_at ? ` · <b class="runs-out">${esc(t("runsOut", { at: dayTime(week.runs_out_at) }))}</b>` : ""}</small>
         ${local ? `<small>${esc(local)}</small>` : ""}
         ${e.idle_now ? `<small>${t("subIdleNow")}</small>` : ""}
         ${verdictLines(e).map((l) => `<small>${esc(l)}</small>`).join("")}
@@ -424,6 +425,8 @@ $("subscriptions").addEventListener("change", (e) => {
 // Rows skipped while a plan was being edited catch up once focus leaves the fields.
 $("subscriptions").addEventListener("focusout", () => setTimeout(() => { if (!editingPlan()) renderSubscriptions(); }));
 listen("usage-updated", loadSubscriptions);
+// A plan notification was clicked.
+listen("show-page", ({ payload: page }) => document.querySelector(`.nav[data-page="${page}"]`)?.click());
 
 // ---------------------------------------------------------------------------------------------
 // Everything else
@@ -445,7 +448,7 @@ async function render() {
   $("startup").checked = settings.launch_at_login;
   $("auto-update").checked = updatesEnabled && settings.auto_update;
   $("auto-update").disabled = !updatesEnabled;
-  for (const kind of ["usage", "resets", "switches"]) $(`notify-${kind}`).checked = settings.notifications[kind];
+  for (const kind of NOTIFY_KINDS) $(`notify-${kind}`).checked = settings.notifications[kind];
   renderPresence();
   const version = await invoke("app_version");
   $("version").textContent = /^\d/.test(version) ? `v${version}` : version;
@@ -526,7 +529,7 @@ $("presence-path").addEventListener("keydown", (e) => { if (e.key === "Enter") s
 invoke("sync_folders").then((folders) => { syncFolders = folders ?? []; if (settings) renderPresence(); }, () => {});
 invoke("rclone_remotes").then((found) => { rclone = found ?? rclone; if (settings) renderPresence(); }, () => {});
 
-for (const kind of ["usage", "resets", "switches"]) {
+for (const kind of NOTIFY_KINDS) {
   $(`notify-${kind}`).addEventListener("change", (e) => update({ notifications: { ...settings.notifications, [kind]: e.target.checked } }));
 }
 document.querySelectorAll("[data-mark]").forEach((el) => (el.innerHTML = MARK[el.dataset.mark]));

@@ -1,4 +1,4 @@
-use crate::{accounts, balancer, codex_local, diagnostics, dock, door, inspect, migrate, model, monitoring, notify, panel, presence, providers, settings, sources, subscriptions, updates};
+use crate::{accounts, balancer, codex_local, diagnostics, dock, door, inspect, migrate, model, monitoring, notify, panel, plan_alerts, presence, providers, settings, sources, subscriptions, updates};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -12,7 +12,7 @@ use accounts::Provider;
 use model::Snapshot;
 use settings::Settings;
 
-const SETTINGS_LABEL: &str = "settings";
+pub(crate) const SETTINGS_LABEL: &str = "settings";
 const MENU_IDS: [&str; 3] = ["refresh", "settings", "quit"];
 
 pub struct AppState {
@@ -45,6 +45,8 @@ pub struct AppState {
     pub(crate) sources: Mutex<Vec<sources::Source>>,
     /// Recent readings of unclaimed accounts, to notice use outside this PC.
     presence_tracks: Mutex<presence::Tracks>,
+    /// Plan notifications already shown (renewals, running out), so each is shown once.
+    plan_alerts: Mutex<plan_alerts::Sent>,
 }
 
 #[tauri::command]
@@ -62,6 +64,21 @@ fn subscription_report(state: &AppState) -> subscriptions::Report {
 #[tauri::command]
 fn get_subscriptions(state: tauri::State<AppState>) -> subscriptions::Report {
     subscription_report(&state)
+}
+
+/// The plan notifications due now (see `plan_alerts`), each returned once. The taskbar widget
+/// asks after every refresh and words them in the user's language.
+#[tauri::command]
+fn take_plan_alerts(state: tauri::State<AppState>) -> Vec<plan_alerts::Alert> {
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    if snapshot.updated_at.is_none() { return vec![]; }
+    let report = subscription_report(&state);
+    let prefs = state.settings.lock().unwrap().notifications.clone();
+    let mut sent = state.plan_alerts.lock().unwrap();
+    let due = plan_alerts::due(&report, &snapshot, &prefs, &mut sent, chrono::Utc::now());
+    // Unsaved, they are still remembered until the app restarts.
+    if !due.is_empty() { let _ = plan_alerts::save(&sent); }
+    due
 }
 
 /// Opens the provider's billing page in the browser. The address is fixed per provider, so the
@@ -541,7 +558,7 @@ fn set_menu_labels(state: tauri::State<AppState>, labels: HashMap<String, String
     }
 }
 
-fn show_settings(app: &AppHandle) {
+pub(crate) fn show_settings(app: &AppHandle) {
     if let Some(w) = app.get_webview_window(SETTINGS_LABEL) {
         let _ = w.show();
         let _ = w.unminimize();
@@ -641,13 +658,16 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     let hold = chrono::Duration::seconds(2 * interval.max(60) as i64 + 30);
     presence::infer(&mut state.presence_tracks.lock().unwrap(), &mut list, hold, now);
 
-    let snapshot = Snapshot { accounts: list, updated_at: Some(chrono::Utc::now()) };
+    let mut snapshot = Snapshot { accounts: list, updated_at: Some(chrono::Utc::now()) };
     state.diagnostics.samples(&snapshot);
     let history = {
         let mut history = state.usage_history.lock().unwrap();
         subscriptions::record(&mut history, &snapshot, &valid, chrono::Utc::now());
         history.clone()
     };
+    // A reading older than two refresh intervals is not the current rate.
+    let max_age = chrono::Duration::seconds(2 * interval as i64 + 300);
+    subscriptions::attach_forecasts(&mut snapshot, &history, max_age, chrono::Utc::now());
     if subscriptions::save(&history).is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::HistorySave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
     state.diagnostics.record(None, None, diagnostics::Event::PollFinished { elapsed_ms: diagnostics::millis(started), accounts: snapshot.accounts.len(),
         native_sources: found.iter().filter(|s| s.distro.is_none()).count(), wsl_sources: found.iter().filter(|s| s.distro.is_some()).count() });
@@ -713,6 +733,7 @@ pub fn run() {
         last_switch: Mutex::default(),
         sources: Mutex::default(),
         presence_tracks: Mutex::default(),
+        plan_alerts: Mutex::new(plan_alerts::load()),
     };
     tauri::Builder::default()
         // Must come first: a second launch hands over to the running instance and exits.
@@ -727,6 +748,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_usage,
             get_subscriptions,
+            take_plan_alerts,
             open_billing_page,
             export_diagnostics,
             record_frontend_error,
