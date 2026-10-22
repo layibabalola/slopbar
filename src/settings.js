@@ -281,7 +281,7 @@ listen("account-added", () => { $("add-hint").hidden = true; });
 // The verdicts come from the backend (subscriptions.rs); this page only words them.
 
 let report = null;
-const NOTIFY_KINDS = ["usage", "resets", "switches", "renewals", "unexpected_use", "digest"];
+const NOTIFY_KINDS = ["usage", "resets", "switches", "renewals", "extra_usage", "unexpected_use", "digest"];
 const money = (v) => (v == null ? "" : `$${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`);
 const pct = (v) => `${Math.round(v)}%`;
 const VERDICT_TONE = { exhausted_weekly: "bad", unused: "warn", underused: "warn", healthy: "ok", insufficient_data: "" };
@@ -359,6 +359,24 @@ function creditsLine(c) {
   return parts.join(" · ");
 }
 
+// Claude extra usage this month, when turned on: "Extra usage: $73.47 of $400 (18%)".
+function extraUsageLine(x) {
+  if (!x || x.enabled !== true) return "";
+  const used = x.used != null ? money(x.used) : "—";
+  return x.monthly_limit != null
+    ? t("subExtraUsage", { v: used, limit: money(x.monthly_limit), p: x.utilization != null ? pct(x.utilization) : "—" })
+    : t("subExtraUsageNoLimit", { v: used });
+}
+
+// Claude extra usage this month, when turned on: "Extra usage: $73.47 of $400 (18%)".
+function extraUsageLine(x) {
+  if (!x || x.enabled !== true) return "";
+  const used = x.used != null ? money(x.used) : "—";
+  return x.monthly_limit != null
+    ? t("subExtraUsage", { v: used, limit: money(x.monthly_limit), p: x.utilization != null ? pct(x.utilization) : "—" })
+    : t("subExtraUsageNoLimit", { v: used });
+}
+
 function subscriptionRow(e) {
   const key = `${e.provider}:${e.id}`;
   const prefs = settings.subscriptions?.[key] ?? {};
@@ -375,6 +393,7 @@ function subscriptionRow(e) {
   const local = localText(e);
   const perUse = costPerUseText(e);
   const credits = creditsLine(e.credits);
+  const extra = extraUsageLine(e.extra_usage);
   // Anything resting on this PC's history says what it cannot see.
   const caveat = e.local && (a.basis === "local_codex" || a.verdict === "insufficient_data") ? t("subLocalCaveat") : "";
   return `
@@ -398,6 +417,7 @@ function subscriptionRow(e) {
         ${local ? `<small>${esc(local)}</small>` : ""}
         ${perUse ? `<small>${esc(perUse)}</small>` : ""}
         ${credits ? `<small>${esc(credits)}</small>` : ""}
+        ${extra ? `<small class="${e.extra_usage.utilization >= 75 ? "advice" : ""}">${esc(extra)}</small>` : ""}
         ${e.idle_now ? `<small>${t("subIdleNow")}</small>` : ""}
         ${e.allowance_change?.would_hit_limit ? `<small class="advice">${esc(t("subProCut", { d: shortDate(`${e.allowance_change.last_day}T12:00:00`), p: Math.round(e.allowance_change.peak_percent), q: Math.round(e.allowance_change.projected_percent) }))}</small>` : ""}
         ${verdictLines(e).map((l) => `<small>${esc(l)}</small>`).join("")}
@@ -424,6 +444,7 @@ function providerSummary(p, s) {
   if (s.exhausted) parts.push(t("subExhaustedCount", { n: s.exhausted }));
   if (s.unused) parts.push(t("subUnusedCount", { n: s.unused }));
   if (s.possible_savings) parts.push(t("subSavings", { v: money(s.possible_savings) }));
+  if (s.extra_usage_spent != null) parts.push(t("subExtraUsageTotal", { v: money(s.extra_usage_spent) }));
   return parts.join(" · ");
 }
 
@@ -446,9 +467,66 @@ function poolText(s) {
   return parts.join(" · ");
 }
 
+const PROVIDER_NAMES = Object.fromEntries(PROVIDERS);
+
+// The plan change advisor: concrete moves per provider, with what they save and what is left.
+function adviceMove(m) {
+  const who = m.alias || m.email || t("unknownAccount");
+  const what = m.action === "cancel" ? t("advCancel", { plan: m.from }) : t("advDowngrade", { from: m.from, to: m.to });
+  const why = [t(`subVerdict_${m.verdict}`), m.peak_percent != null ? t("advPeak", { p: pct(m.peak_percent) }) : "",
+    m.basis === "local_codex" ? t("advLocal") : "", m.before ? t("advBefore", { d: shortDate(m.before) }) : ""].filter(Boolean).join(" · ");
+  return `
+    <div class="advice-move">
+      <div class="who"><div class="name">${esc(who)}</div><small>${esc(what)} · <b>${esc(t("perMonth", { v: money(m.monthly_saving) }))}</b></small><small>${esc(why)}</small></div>
+      <button class="btn use" data-billing="${m.provider}">${t("subManage")} <svg viewBox="0 0 16 16"><path d="M6 3h7v7M13 3 5 11"/></svg></button>
+    </div>`;
+}
+
+function adviceCard() {
+  const list = (report.advice ?? []).filter((a) => settings.providers[a.provider]);
+  if (!list.length) return "";
+  return `
+    <div class="provider advisor">
+      <div class="provider-head"><h3>${t("advTitle")}</h3></div>
+      ${list.map((a) => {
+        const name = PROVIDER_NAMES[a.provider] ?? a.provider;
+        const lines = [];
+        if (a.evidence === "clear_only") lines.push(t("advThin", { n: a.weeks_used, needed: a.weeks_needed }));
+        const head = a.moves.length ? t("advSave", { provider: name, v: money(a.monthly_saving), n: a.moves.length }) : t("advNone", { provider: name });
+        if (a.spare_after != null) lines.push(t("advAfter", { held: amount(a.capacity_after), unit: a.unit, spare: a.spare_after_percent != null ? pct(a.spare_after_percent) : "—" }));
+        if (a.kept_for_capacity) lines.push(t("advKept", { n: a.kept_for_capacity }));
+        return `
+          <p class="hint sub-pool"><b>${esc(head)}</b>${lines.length ? ` · ${esc(lines.join(" · "))}` : ""}</p>
+          ${a.moves.length ? `<div class="group">${a.moves.map(adviceMove).join("")}</div>` : ""}`;
+      }).join("")}
+      <p class="hint">${t("advHint")}</p>
+    </div>`;
+}
+
+// The spend ledger: what the plans cost, year to date and over the last twelve months.
+function spendCard() {
+  const s = report.spend;
+  if (!s) return "";
+  const label = s.currency ? ` ${s.currency}` : "";
+  const taxed = (v, w) => esc(money(v) + label) + (w != null ? ` <small>(${esc(t("spendWithTax", { v: money(w), p: s.tax_percent }))})</small>` : "");
+  const months = s.months.slice(-6).map((m) => `${m.month}: ${money(m.total)}${m.extra_usage ? ` (${t("spendExtra", { v: money(m.extra_usage) })})` : ""}`).join(" · ");
+  const prefs = settings.spend ?? {};
+  return `
+    <div class="provider spend">
+      <div class="provider-head"><h3>${t("spendTitle")}</h3></div>
+      <p class="hint sub-pool">${t("spendYtd")}: <b>${taxed(s.year_to_date, s.year_to_date_with_tax)}</b> · ${t("spend12")}: <b>${taxed(s.trailing_12_months, s.trailing_12_months_with_tax)}</b></p>
+      ${months ? `<p class="hint sub-pool">${esc(months)}</p>` : `<p class="hint sub-pool">${t("spendEmpty")}</p>`}
+      <div class="plan-fields">
+        <label>${t("spendTax")} <input type="number" min="0" max="100" step="0.01" data-spend-tax value="${prefs.tax_percent ?? ""}" placeholder="0" /></label>
+        <label>${t("spendCurrency")} <input type="text" maxlength="24" data-spend-currency value="${esc(prefs.currency ?? "")}" placeholder="USD" /></label>
+      </div>
+      <p class="hint">${t("spendHint")}</p>
+    </div>`;
+}
+
 function renderSubscriptions() {
   if (!report || !settings) return;
-  patch($("subscriptions"), PROVIDERS.filter(([p]) => settings.providers[p]).map(([p, name]) => {
+  patch($("subscriptions"), adviceCard() + PROVIDERS.filter(([p]) => settings.providers[p]).map(([p, name]) => {
     const list = report.accounts.filter((e) => e.provider === p);
     const totals = report.providers.find((s) => s.provider === p);
     const summary = providerSummary(p, totals);
@@ -467,7 +545,7 @@ function renderSubscriptions() {
         <p class="hint">${t(p === "claude" ? "subClaudeFree" : "subCodexFree")}</p>
         ${p === "codex" && since ? `<p class="hint">${esc(t("subCodexLocal", { d: shortDate(since) }))}</p>` : ""}
       </div>`;
-  }).join(""));
+  }).join("") + spendCard());
 }
 
 async function loadSubscriptions() {
@@ -477,6 +555,11 @@ async function loadSubscriptions() {
 }
 
 const editingPlan = () => !!document.activeElement?.closest?.(".plan-fields");
+
+function setSpend(change) {
+  const spend = { ...(settings.spend ?? {}), ...change };
+  return update({ spend }).then(loadSubscriptions);
+}
 
 function setPlan(key, change) {
   // Show the change at once; the report reloads with the backend's view of it.
@@ -504,6 +587,11 @@ $("subscriptions").addEventListener("change", (e) => {
   } else if (el.dataset.subCost != null) {
     const cost = Number(el.value);
     setPlan(el.dataset.subCost, { monthly_cost: el.value && cost >= 0 && cost <= 10000 ? Math.round(cost * 100) / 100 : null });
+  } else if (el.dataset.spendTax != null) {
+    const v = Number(el.value);
+    setSpend({ tax_percent: el.value && v > 0 && v <= 100 ? Math.round(v * 100) / 100 : null });
+  } else if (el.dataset.spendCurrency != null) {
+    setSpend({ currency: el.value.trim().slice(0, 24) || null });
   } else if (el.dataset.subLapse != null) {
     // The last paid day is the day before renewal; without a known renewal, keep it in rotation a month.
     const until = el.dataset.until ? new Date(new Date(el.dataset.until).getTime() - 86400000) : new Date(Date.now() + 30 * 86400000);

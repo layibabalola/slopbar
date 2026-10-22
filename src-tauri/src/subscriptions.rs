@@ -299,7 +299,7 @@ fn median(values: &[f64]) -> Option<f64> {
 }
 
 /// Where a renewal date comes from, so the window never presents a guess as a fact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DateSource {
     /// The user typed the billing day.
@@ -546,6 +546,8 @@ pub struct Entry {
     pub cost_per_use: Option<CostPerUse>,
     /// Codex only: purchased credits and their trend.
     pub credits: Option<CreditInfo>,
+    /// Claude only: extra usage beyond the plan this month, when the provider reported it.
+    pub extra_usage: Option<crate::model::ExtraUsage>,
     /// Inputs for the provider's pool sizing; not part of the report.
     #[serde(skip)]
     pool_weeks: BTreeMap<NaiveDate, f64>,
@@ -555,6 +557,15 @@ pub struct Entry {
     /// The week SlopBar started watching the account.
     #[serde(skip)]
     pool_since: Option<NaiveDate>,
+}
+
+impl Entry {
+    /// The busiest recent week in percent of this plan's allowance: the latest `RECENT` weeks that
+    /// count, and the week in progress.
+    pub(crate) fn recent_peak(&self) -> Option<f64> {
+        let live = self.this_week.as_ref().filter(|_| !self.stale).map(|w| w.used_percent);
+        self.pool_weeks.values().rev().take(RECENT).copied().chain(live).reduce(f64::max)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -575,6 +586,10 @@ pub struct ProviderSummary {
     pub cost_per_use: BlendedCost,
     /// Codex: purchased credits across its accounts, when any reported a balance.
     pub credit_balance: Option<f64>,
+    /// Claude: extra usage spent this month across the accounts that have it turned on, in
+    /// dollars, on top of `monthly_total`; None when none has.
+    pub extra_usage_spent: Option<f64>,
+    pub extra_usage_limit: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -582,6 +597,11 @@ pub struct Report {
     pub accounts: Vec<Entry>,
     pub providers: Vec<ProviderSummary>,
     pub generated_at: DateTime<Utc>,
+    /// Plan changes per provider (`advisor`).
+    #[serde(default)]
+    pub advice: Vec<crate::advisor::ProviderAdvice>,
+    /// What the plans have cost month by month (`ledger`), when the app has a ledger.
+    pub spend: Option<crate::ledger::Summary>,
 }
 
 /// A Codex plan with no use in the live week and none on this PC for this long reads as unused
@@ -673,12 +693,13 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
             plan_weight: plan_weight(acc),
             cost_per_use,
             credits,
+            extra_usage: acc.extra_usage.clone().filter(|_| acc.provider == Provider::Claude),
             pool_weeks,
             pool_local,
             pool_since,
         }
     }).collect();
-    let providers = Provider::ALL.into_iter().filter(|p| accounts.iter().any(|a| a.provider == *p)).map(|provider| {
+    let providers: Vec<ProviderSummary> = Provider::ALL.into_iter().filter(|p| accounts.iter().any(|a| a.provider == *p)).map(|provider| {
         let paid: Vec<&Entry> = accounts.iter().filter(|a| a.provider == provider && a.plan_kind == PlanKind::Personal).collect();
         ProviderSummary {
             provider,
@@ -693,9 +714,17 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
             cost_per_use: blended_cost(&paid),
             credit_balance: accounts.iter().filter(|a| a.provider == provider).filter_map(|a| a.credits.as_ref()?.balance)
                 .fold(None, |t, b| Some(t.unwrap_or(0.0) + b)),
+            extra_usage_spent: sum_extra(&accounts, provider, |x| x.used),
+            extra_usage_limit: sum_extra(&accounts, provider, |x| x.monthly_limit),
         }
     }).collect();
-    Report { accounts, providers, generated_at: now }
+    let advice = crate::advisor::advise(&accounts, &providers);
+    Report { accounts, providers, generated_at: now, advice, spend: None }
+}
+
+fn sum_extra(accounts: &[Entry], provider: Provider, f: impl Fn(&crate::model::ExtraUsage) -> Option<f64>) -> Option<f64> {
+    accounts.iter().filter(|a| a.provider == provider).filter_map(|a| a.extra_usage.as_ref().filter(|x| x.active()).and_then(&f))
+        .fold(None, |t, v| Some(t.unwrap_or(0.0) + v))
 }
 
 /// The provider pages where a plan is managed or cancelled. Fixed here, so nothing the window or
@@ -959,7 +988,7 @@ mod tests {
             plan: Some("pro".into()), org: None, active: false, sources: vec![],
             windows: vec![UsageWindow { kind: kind.into(), window_seconds: None, used_percent: percent, resets_at: Some(resets_at) }],
             credits: None, resets: vec![], error: None, monitor_error: None, stale: false, fetched_at: None,
-            monitor_connected: true, billing: BillingHints::default(), remote: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false,
+            monitor_connected: true, billing: BillingHints::default(), remote: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None,
         }
     }
 

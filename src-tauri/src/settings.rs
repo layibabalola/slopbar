@@ -57,11 +57,13 @@ pub struct Notifications {
     pub renewals: bool,
     /// Monday mornings: last week's spend, savings, renewals and accounts that ran out.
     pub digest: bool,
+    /// Claude extra usage reaching 75% and 90% of its monthly limit.
+    pub extra_usage: bool,
 }
 
 impl Default for Notifications {
     fn default() -> Self {
-        Self { usage: true, resets: true, switches: true, renewals: true, unexpected_use: true, digest: true }
+        Self { usage: true, resets: true, switches: true, renewals: true, unexpected_use: true, digest: true, extra_usage: true }
     }
 }
 
@@ -147,6 +149,19 @@ pub struct Settings {
     /// for a few minutes (see `auto_monitor`). On unless the user turns it off.
     pub auto_connect_monitoring: bool,
     pub calendar: Calendar,
+    /// How spend totals are shown (see `ledger`).
+    pub spend: SpendDisplay,
+}
+
+/// Display-only choices for the spend ledger: amounts stay US list prices unless the user
+/// entered costs, whatever these say.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpendDisplay {
+    /// Sales tax or VAT in percent, added to the totals shown.
+    pub tax_percent: Option<f64>,
+    /// A label for the amounts ("USD", "EUR").
+    pub currency: Option<String>,
 }
 
 /// One folder pinned to one account of a provider.
@@ -181,6 +196,7 @@ impl Default for Settings {
             switcher_hotkey: DEFAULT_SWITCHER_HOTKEY.into(),
             auto_connect_monitoring: true,
             calendar: Calendar::default(),
+            spend: SpendDisplay::default(),
         }
     }
 }
@@ -222,7 +238,7 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
 /// `project_pins` has its own operations (see `pins`).
-const PATCHABLE: [&str; 17] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey"];
+const PATCHABLE: [&str; 18] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "spend"];
 
 /// Modifier names a shortcut may use, as the Settings window writes them.
 const HOTKEY_MODIFIERS: [&str; 4] = ["Ctrl", "Alt", "Shift", "Win"];

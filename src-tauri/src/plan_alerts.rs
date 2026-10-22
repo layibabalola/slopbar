@@ -40,7 +40,13 @@ pub enum Kind {
     /// Codex Pro 200 accounts that would reach the limit under the allowance after the cut, named
     /// together in `accounts`. Once, before the cut.
     ProAllowanceCut,
+    /// A Claude account's extra usage reached 75% or 90% of its monthly limit (`percent`). Once
+    /// per account, threshold and month.
+    ExtraUsage,
 }
+
+/// Shares of the monthly extra-usage limit that are worth a notification.
+pub const EXTRA_USAGE_THRESHOLDS: [f64; 2] = [90.0, 75.0];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Alert {
@@ -60,6 +66,13 @@ pub struct Alert {
     /// Every account the notification is about, by alias or email, when there are several.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub accounts: Vec<String>,
+    /// Extra usage: the threshold reached, and the amounts in dollars.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<f64>,
 }
 
 pub fn load() -> Sent {
@@ -104,7 +117,7 @@ pub fn due(report: &Report, snapshot: &Snapshot, prefs: &Notifications, sent: &m
                 _ => continue,
             };
             out.push(Alert { kind, provider: e.provider, id: e.id.clone(), email: e.email.clone(), alias: e.alias.clone(),
-                at: renewal.at, source: Some(renewal.source), verdict: Some(e.assessment.verdict), monthly_cost: e.monthly_cost, resets_at: None, accounts: vec![] });
+                at: renewal.at, source: Some(renewal.source), verdict: Some(e.assessment.verdict), monthly_cost: e.monthly_cost, resets_at: None, accounts: vec![], percent: None, used: None, limit: None });
         }
         let cut: Vec<&crate::subscriptions::Entry> = report.accounts.iter()
             .filter(|e| e.allowance_change.as_ref().is_some_and(|c| c.would_hit_limit) && e.ends_at.is_none()).collect();
@@ -113,8 +126,23 @@ pub fn due(report: &Report, snapshot: &Snapshot, prefs: &Notifications, sent: &m
                 let at = change.last_day.and_hms_opt(23, 59, 59).map(|d| d.and_utc()).unwrap_or(now);
                 out.push(Alert { kind: Kind::ProAllowanceCut, provider: first.provider, id: first.id.clone(), email: first.email.clone(), alias: first.alias.clone(),
                     at, source: None, verdict: None, monthly_cost: None, resets_at: None,
-                    accounts: cut.iter().map(|e| e.alias.clone().or_else(|| e.email.clone()).unwrap_or_else(|| e.id.clone())).collect() });
+                    accounts: cut.iter().map(|e| e.alias.clone().or_else(|| e.email.clone()).unwrap_or_else(|| e.id.clone())).collect(), percent: None, used: None, limit: None });
             }
+        }
+    }
+    if prefs.extra_usage {
+        for e in &report.accounts {
+            let Some(x) = e.extra_usage.as_ref().filter(|x| x.active() && !e.stale) else { continue };
+            let Some(u) = x.utilization else { continue };
+            // The highest threshold reached; reaching 90% first marks 75% too, so one notification.
+            let Some(&percent) = EXTRA_USAGE_THRESHOLDS.iter().find(|t| u >= **t) else { continue };
+            let month = crate::ledger::month_key(now);
+            let key = |t: f64| format!("extra_usage:{}:{}:{month}:{t}", e.provider.name(), e.id);
+            if !mark(key(percent), sent) { continue; }
+            for t in EXTRA_USAGE_THRESHOLDS.iter().filter(|t| **t < percent) { mark(key(*t), sent); }
+            out.push(Alert { kind: Kind::ExtraUsage, provider: e.provider, id: e.id.clone(), email: e.email.clone(), alias: e.alias.clone(),
+                at: now, source: None, verdict: None, monthly_cost: None, resets_at: None, accounts: vec![],
+                percent: Some(percent), used: x.used, limit: x.monthly_limit });
         }
     }
     if prefs.usage {
@@ -124,7 +152,7 @@ pub fn due(report: &Report, snapshot: &Snapshot, prefs: &Notifications, sent: &m
             // Once per weekly window: its reset, to the hour, absorbs jitter between readings.
             if !mark(format!("runs_out:{}:{}:{}", a.provider.name(), a.id, resets_at.timestamp() / 3600), sent) { continue; }
             out.push(Alert { kind: Kind::RunsOut, provider: a.provider, id: a.id.clone(), email: a.email.clone(), alias: a.alias.clone(),
-                at, source: None, verdict: None, monthly_cost: None, resets_at: Some(resets_at), accounts: vec![] });
+                at, source: None, verdict: None, monthly_cost: None, resets_at: Some(resets_at), accounts: vec![], percent: None, used: None, limit: None });
         }
     }
     out
@@ -146,7 +174,7 @@ pub(crate) mod tests {
             plan: Some("pro".into()), org: None, active: false, sources: vec![],
             windows: vec![UsageWindow { kind: "weekly".into(), window_seconds: Some(7 * 86400), used_percent: used, resets_at: Some(resets_at) }],
             credits: None, resets: vec![], error: None, monitor_error: None, stale: false, fetched_at: None,
-            monitor_connected: true, billing: BillingHints::default(), remote: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false,
+            monitor_connected: true, billing: BillingHints::default(), remote: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None,
         }
     }
 
@@ -305,5 +333,36 @@ pub(crate) mod tests {
         let mut fresh = Sent::default();
         assert!(due(&r, &w.snapshot, &w.settings.notifications, &mut fresh, now).is_empty());
         assert!(fresh.sent.is_empty());
+    }
+
+    #[test]
+    fn extra_usage_warns_at_75_and_90_percent_once_a_month_and_only_when_turned_on() {
+        let now = at("2026-10-20T12:00:00Z");
+        let mut acc = account("claude1", 10.0, now + Duration::days(3));
+        acc.provider = Provider::Claude;
+        let snapshot = |u: f64, enabled: bool| { let mut a = acc.clone(); a.extra_usage = Some(crate::model::ExtraUsage { enabled: Some(enabled), monthly_limit: Some(400.0), used: Some(u * 4.0), utilization: Some(u) }); Snapshot { accounts: vec![a], updated_at: Some(now) } };
+        let mut sent = Sent::default();
+        let run = |u: f64, enabled: bool, prefs: &Notifications, sent: &mut Sent, now: DateTime<Utc>| {
+            let s = snapshot(u, enabled);
+            due(&report(&s, &History::default(), &Settings::default(), None, now), &s, prefs, sent, now)
+        };
+        let on = Notifications::default();
+        assert!(run(70.0, true, &on, &mut sent, now).is_empty());
+        let a = run(76.0, true, &on, &mut sent, now);
+        assert_eq!((a.len(), a[0].kind, a[0].percent, a[0].used, a[0].limit), (1, Kind::ExtraUsage, Some(75.0), Some(304.0), Some(400.0)));
+        assert!(run(80.0, true, &on, &mut sent, now).is_empty(), "once per threshold");
+        assert_eq!(run(91.0, true, &on, &mut sent, now)[0].percent, Some(90.0));
+        assert!(run(95.0, true, &on, &mut sent, now).is_empty());
+        // A new month warns again; jumping straight to 90% is one notification, not two.
+        let next = at("2026-11-03T00:00:00Z");
+        let a = run(92.0, true, &on, &mut sent, next);
+        assert_eq!((a.len(), a[0].percent), (1, Some(90.0)));
+        assert!(run(92.0, true, &on, &mut sent, next).is_empty());
+        // Turned off in Notifications, or extra usage not enabled: nothing, and nothing marked.
+        let mut sent = Sent::default();
+        let off = Notifications { extra_usage: false, ..Default::default() };
+        assert!(run(95.0, true, &off, &mut sent, now).is_empty());
+        assert!(run(95.0, false, &on, &mut sent, now).is_empty());
+        assert_eq!(run(95.0, true, &on, &mut sent, now).len(), 1);
     }
 }

@@ -63,6 +63,27 @@ pub struct AccountUsage {
     /// soon as that login is renewed or works again; the CLI signs in again on its own.
     #[serde(default)]
     pub cli_rejected: bool,
+    /// Claude: pay-as-you-go use beyond the plan's limits this month, when the usage endpoint
+    /// reported it (see `providers::claude::extra_usage`).
+    #[serde(default)]
+    pub extra_usage: Option<ExtraUsage>,
+}
+
+/// Claude's extra usage: what the account may spend beyond its plan each month, and what it has.
+/// Amounts are in US dollars; the endpoint reports cents (a 40000 limit is $400).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ExtraUsage {
+    /// The user turned extra usage on. None when the endpoint did not say.
+    pub enabled: Option<bool>,
+    pub monthly_limit: Option<f64>,
+    pub used: Option<f64>,
+    /// Used against the limit, in percent.
+    pub utilization: Option<f64>,
+}
+
+impl ExtraUsage {
+    /// Turned on: it can cost money this month.
+    pub fn active(&self) -> bool { self.enabled == Some(true) }
 }
 
 /// A monitored account's weekly usage jumped while every computer sharing its status said it
