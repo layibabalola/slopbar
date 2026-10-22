@@ -372,25 +372,42 @@ fn step(message: &Value, exports: &dyn Fn() -> Option<std::path::PathBuf>, cance
     Step::Reply(reply(id, outcome))
 }
 
-/// Serves MCP over stdin/stdout (newline-delimited JSON-RPC) until stdin closes. Tool calls run
-/// on their own threads so a slow one never holds up pings, cancellations or other calls.
+/// Serves MCP over stdin/stdout (newline-delimited JSON-RPC) until stdin closes or the agent host
+/// that started it exits. Tool calls run on their own threads so a slow one never holds up pings,
+/// cancellations or other calls.
 pub fn serve_stdio() -> std::io::Result<()> {
+    // A host that dies without closing stdin (another process inherited the pipe's write end)
+    // would otherwise leave this server running for days.
+    if let Some(parent) = crate::instance::parent_of(std::process::id()) {
+        watch_parent(parent, || std::process::exit(0));
+    }
+    serve(std::io::stdin().lock(), std::io::stdout())
+}
+
+/// Calls `gone` on a background thread once process `parent` exits.
+fn watch_parent(parent: u32, gone: impl FnOnce() + Send + 'static) {
+    std::thread::spawn(move || {
+        crate::instance::wait_gone(parent);
+        gone();
+    });
+}
+
+fn serve<W: Write + Send + 'static>(mut input: impl BufRead, out: W) -> std::io::Result<()> {
     let pipe: Arc<str> = crate::door::pipe_name().into();
-    let out = Arc::new(Mutex::new(std::io::stdout()));
+    let out = Arc::new(Mutex::new(out));
     let cancelled = Arc::new(Mutex::new(HashSet::<String>::new()));
-    let send = |out: &Mutex<std::io::Stdout>, value: &Value| -> std::io::Result<()> {
+    let send = |out: &Mutex<W>, value: &Value| -> std::io::Result<()> {
         let mut line = serde_json::to_vec(value).map_err(std::io::Error::other)?;
         line.push(b'\n');
         let mut out = out.lock().unwrap();
         out.write_all(&line)?;
         out.flush()
     };
-    let mut stdin = std::io::stdin().lock();
     let mut line = Vec::new();
     let mut calls: Vec<std::thread::JoinHandle<()>> = Vec::new();
     loop {
         line.clear();
-        if stdin.read_until(b'\n', &mut line)? == 0 {
+        if input.read_until(b'\n', &mut line)? == 0 {
             // Input closed: finish the calls already asked for before exiting.
             for call in calls {
                 let _ = call.join();
@@ -417,7 +434,7 @@ pub fn serve_stdio() -> std::io::Result<()> {
                         let value = reply(id.clone(), Ok(result(crate::door::call(&pipe, &request))));
                         // A cancelled request gets no reply (MCP cancellation).
                         if !cancelled.lock().unwrap().remove(&id.to_string()) {
-                            let _ = send(&out, &value);
+                            let _ = send(&*out, &value);
                         }
                     }));
                 }
@@ -430,6 +447,42 @@ pub fn serve_stdio() -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::test_support::TempDir;
+
+    /// Output shared with the test after `serve` takes its copy.
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().write(bytes) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn the_server_answers_then_exits_when_input_closes() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#, "\n",
+        );
+        let out = Shared::default();
+        // Returns (rather than waiting for more input) once the input is at its end.
+        serve(std::io::Cursor::new(input), out.clone()).unwrap();
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        let ids: Vec<_> = text.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["id"].clone()).collect();
+        assert_eq!(ids, [json!(1), json!(2)]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_server_learns_when_its_host_exits() {
+        let mut host = std::process::Command::new("cmd").args(["/c", "ping", "-n", "2", "127.0.0.1"])
+            .stdout(std::process::Stdio::null()).spawn().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        watch_parent(host.id(), move || tx.send(()).unwrap());
+        // Still running: nothing yet.
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err());
+        host.wait().unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(10)).expect("noticed the host exit");
+    }
 
     /// Handles one message as the server would, running a tool call against a fake app that echoes
     /// each request (or fails with `error`).

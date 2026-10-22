@@ -56,7 +56,7 @@ zstd = { version = "0.13", default-features = false }
 memchr = "2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_RemoteDesktop"] }
 # UI Automation, to find taskbar items that have no window of their own (the Widgets button).
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_UI_Accessibility", "Win32_UI_Shell"] }
 # The webview Tauri already uses, to read and capture a window for agents without showing it.

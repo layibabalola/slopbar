@@ -119,6 +119,7 @@ async fn health_report(app: &AppHandle) -> health::Report {
             any_wanted: n.usage || n.resets || n.switches || n.renewals || n.unexpected_use },
         auto_connect: settings.auto_connect_monitoring,
         vault_plaintext: accounts::plaintext_slots(),
+        processes: tauri::async_runtime::spawn_blocking(crate::instance::processes).await.ok().flatten(),
     }, chrono::Utc::now())
 }
 
@@ -129,11 +130,21 @@ async fn get_health(app: AppHandle) -> health::Report {
 
 /// Quits, then starts the installed executable again (the door's `restart_app`, Health's fix).
 fn restart(app: &AppHandle) -> Result<(), String> {
+    // One successor however many callers ask at once (parallel installs each ask).
+    static RESTARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if RESTARTING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return Ok(());
+    }
     // The installed executable, even if this one was renamed aside for an update.
     let exe = std::env::current_exe().map_err(|e| e.to_string())?
-        .with_file_name(if cfg!(windows) { "slopbar.exe" } else { "slopbar" });
-    std::process::Command::new(&exe).arg("--after").arg(std::process::id().to_string())
-        .spawn().map_err(|e| format!("restart failed: {e}"))?;
+        .with_file_name(crate::instance::APP_EXE);
+    // A duplicate of an older build ignores the instance lock and would take the door over once
+    // this one exits; it renews the same monitoring sessions, so it is ended rather than kept.
+    crate::instance::end_duplicates();
+    if let Err(e) = std::process::Command::new(&exe).arg("--after").arg(std::process::id().to_string()).spawn() {
+        RESTARTING.store(false, std::sync::atomic::Ordering::Release);
+        return Err(format!("restart failed: {e}"));
+    }
     let h = app.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -418,6 +429,8 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             "version": app_version(app.clone()),
             "updates_enabled": updates_enabled(),
             "build": diagnostics::build_info(),
+            // Which process answers the door (the installer quits exactly this one).
+            "pid": std::process::id(),
         })),
         R::InspectWindow { window, page, screenshot } => {
             let target = match window {
@@ -1180,43 +1193,54 @@ fn http_client() -> reqwest::Client {
 }
 
 /// Captures live logins into the vault, fetches every account's usage, then lets the balancer
-/// switch accounts that reached their threshold.
+/// switch accounts that reached their threshold. The widget gets the new numbers as soon as they
+/// are known; sharing and bookkeeping follow, and the index, calendar and Codex scans run after.
 async fn do_refresh(app: &AppHandle) -> Snapshot {
+    use diagnostics::RefreshPhase as P;
     let state = app.state::<AppState>();
     let _refresh = state.refresh_lock.lock().await;
     let started = Instant::now();
+    let mut phases = diagnostics::Phases::start();
     let settings = state.settings.lock().unwrap().clone();
     state.diagnostics.poll_started(settings.refresh_minutes);
     let found = tauri::async_runtime::spawn_blocking(sources::discover)
         .await
         .unwrap_or_default();
     *state.sources.lock().unwrap() = found.clone();
-    static CLEANUP_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    phases.end(P::Discover);
     let profiles = accounts::profile_sources(&pins::wanted(&settings.project_pins));
     accounts::resolve_identities(&http_client(), &[found.clone(), profiles].concat()).await;
+    phases.end(P::Identities);
     let scan = found.clone();
     let active = tauri::async_runtime::spawn_blocking(move || accounts::capture(&scan))
         .await
         .unwrap_or_default();
+    phases.end(P::Capture);
     // Before reading the vault: renewals made in project profiles are synced into it.
     sync_pins(app, Some(active.clone())).await;
+    phases.end(P::Pins);
     let slots = tauri::async_runtime::spawn_blocking(accounts::load_slots).await.unwrap_or_default();
+    phases.end(P::Vault);
+    static CLEANUP_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !CLEANUP_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        let homes = found.clone();
-        let protected = state.monitor.protected_tokens(&slots).await;
-        let started = Instant::now();
-        let result = tauri::async_runtime::spawn_blocking(move || crate::login::cleanup(&homes, protected.as_ref())).await;
-        state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::Cleanup,
-            code: if result.is_ok() { diagnostics::Code::Ok } else { diagnostics::Code::Other }, elapsed_ms: diagnostics::millis(started) });
+        // Leftover sign-in folders from earlier runs: once, beside this refresh.
+        let (app, homes, slots) = (app.clone(), found.clone(), slots.clone());
+        tauri::async_runtime::spawn(async move {
+            let state = app.state::<AppState>();
+            let protected = state.monitor.protected_tokens(&slots).await;
+            let started = Instant::now();
+            let result = tauri::async_runtime::spawn_blocking(move || crate::login::cleanup(&homes, protected.as_ref())).await;
+            state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::Cleanup,
+                code: if result.is_ok() { diagnostics::Code::Ok } else { diagnostics::Code::Other }, elapsed_ms: diagnostics::millis(started) });
+        });
     }
 
     let mut cache = state.usage_cache.lock().unwrap().clone();
     let mut list = providers::fetch_all(&http_client(), &slots, &active, &mut cache, &settings, &state.monitor).await;
     let valid: HashSet<_> = slots.iter().map(monitoring::key).collect();
     cache.retain(|key, _| valid.contains(key));
-    let saved = providers::save_cache(&cache);
-    if saved.is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::CacheSave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
-    *state.usage_cache.lock().unwrap() = cache;
+    *state.usage_cache.lock().unwrap() = cache.clone();
+    phases.end(P::Fetch);
 
     let decisions = {
         let last = state.last_switch.lock().unwrap().clone();
@@ -1239,6 +1263,21 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
                 }
             }
         }
+    }
+    phases.end(P::Balance);
+
+    // The widget redraws now: what sharing and forecasts add is carried over from the last
+    // refresh until they are worked out below.
+    {
+        let mut early = list.clone();
+        carry_over(&mut early, &state.snapshot.lock().unwrap().accounts);
+        let early = Snapshot { accounts: early, updated_at: Some(chrono::Utc::now()) };
+        *state.snapshot.lock().unwrap() = early.clone();
+        let _ = app.emit("usage-updated", &early);
+    }
+    phases.end(P::Publish);
+    if providers::save_cache(&cache).is_err() {
+        state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::CacheSave, code: diagnostics::Code::Storage, elapsed_ms: 0 });
     }
 
     // Other machines: what they share through the presence folder, then what rising usage implies.
@@ -1276,6 +1315,7 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     if let Some(log) = log {
         let _ = unexpected::save(&log);
     }
+    phases.end(P::Presence);
 
     let mut snapshot = Snapshot { accounts: list, updated_at: Some(chrono::Utc::now()) };
     state.diagnostics.samples(&snapshot);
@@ -1301,9 +1341,13 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
             seen.last_success = snapshot.updated_at;
         }
     }
+    phases.end(P::Bookkeeping);
     *state.snapshot.lock().unwrap() = snapshot.clone();
     record_spend(&state);
     let _ = app.emit("usage-updated", &snapshot);
+    phases.end(P::Final);
+    state.diagnostics.record(None, None, phases.event());
+    // Off the refresh: each runs one at a time on its own.
     if settings.providers.codex { scan_codex_local(app); }
     if settings.calendar.enabled {
         let app = app.clone();
@@ -1311,6 +1355,19 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     }
     scan_usage_index(app);
     snapshot
+}
+
+/// Gives freshly fetched accounts what the last refresh worked out from sharing and forecasts,
+/// so the early redraw does not blank them for a moment.
+fn carry_over(list: &mut [crate::model::AccountUsage], previous: &[crate::model::AccountUsage]) {
+    for a in list.iter_mut() {
+        if let Some(p) = previous.iter().find(|p| p.provider == a.provider && p.id == a.id) {
+            a.remote = p.remote.clone();
+            a.used_outside = p.used_outside;
+            a.runs_out_at = p.runs_out_at;
+            a.unexpected = p.unexpected.clone();
+        }
+    }
 }
 
 /// Records which account each CLI has signed in, seeding the log once from the diagnostics

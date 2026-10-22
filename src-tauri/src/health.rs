@@ -123,6 +123,8 @@ pub struct Inputs<'a> {
     pub auto_connect: bool,
     /// Saved sign-ins still stored as plaintext (see `accounts::migrate_vault`).
     pub vault_plaintext: usize,
+    /// SlopBar's processes in this Windows session, when they could be listed.
+    pub processes: Option<crate::instance::Processes>,
 }
 
 fn name(a: &AccountUsage) -> String {
@@ -244,6 +246,22 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         Some(t) => check("refresh", Status::Ok, "Last refresh", format!("Usage was read {}.", ago(now, t)), None),
     });
 
+    if let Some(p) = inputs.processes {
+        checks.push(if p.instances > 1 {
+            check("instances", Status::Problem, "SlopBar is running more than once",
+                format!("{} copies are running and each renews the same monitoring sign-ins, which can get them rejected. Restarting leaves one.", p.instances),
+                Some(Fix::RestartApp))
+        } else {
+            check("instances", Status::Ok, "Running once", "One copy of SlopBar is running.", None)
+        });
+        // Information only: each agent session starts its own server, which ends with the session.
+        checks.push(check("agent_servers", Status::Ok, "Agent servers", match p.mcp_servers {
+            0 => "No agent is connected (slopbar-mcp).".to_string(),
+            1 => "1 agent server (slopbar-mcp) is running.".to_string(),
+            n => format!("{n} agent servers (slopbar-mcp) are running, one per agent session."),
+        }, None));
+    }
+
     match inputs.door {
         Door::Unsupported => {}
         Door::Listening => checks.push(check("door", Status::Ok, "Agent door", "Listening for agents (slopbar-mcp).", None)),
@@ -340,6 +358,7 @@ mod tests {
         notifications: Notifications,
         auto_connect: bool,
         vault_plaintext: usize,
+        processes: Option<crate::instance::Processes>,
     }
 
     impl Case {
@@ -354,13 +373,14 @@ mod tests {
                 notifications: Notifications { registered: Some(true), app_enabled: None, system_enabled: None, any_wanted: true },
                 auto_connect: true,
                 vault_plaintext: 0,
+                processes: Some(crate::instance::Processes { instances: 1, mcp_servers: 3 }),
             }
         }
 
         fn run(&self) -> Report {
             checks(&Inputs { accounts: &self.accounts, monitoring: &self.monitoring, refresh_minutes: 5, last_success: self.last_success,
                 door: self.door, sharing: &self.sharing, journal: self.journal, notifications: self.notifications, auto_connect: self.auto_connect,
-                vault_plaintext: self.vault_plaintext }, now())
+                vault_plaintext: self.vault_plaintext, processes: self.processes }, now())
         }
     }
 
@@ -373,7 +393,23 @@ mod tests {
         let r = Case::healthy().run();
         assert_eq!((r.status, r.problems, r.warnings), (Status::Ok, 0, 0), "{:#?}", r.checks);
         let ids: Vec<_> = r.checks.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(ids, ["monitoring", "freshness", "refresh", "door", "sharing", "journal", "notifications"]);
+        assert_eq!(ids, ["monitoring", "freshness", "refresh", "instances", "agent_servers", "door", "sharing", "journal", "notifications"]);
+    }
+
+    #[test]
+    fn a_second_copy_is_a_problem_and_agent_servers_are_only_information() {
+        let mut case = Case::healthy();
+        case.processes = Some(crate::instance::Processes { instances: 2, mcp_servers: 25 });
+        let r = case.run();
+        let c = find(&r, "instances");
+        assert_eq!((c.status, c.fix.clone(), c.title.as_str()), (Status::Problem, Some(Fix::RestartApp), "SlopBar is running more than once"));
+        let servers = find(&r, "agent_servers");
+        assert_eq!((servers.status, servers.fix.clone()), (Status::Ok, None));
+        assert!(servers.reason.starts_with("25 agent servers"));
+        // Unknown (the list could not be read): no claim either way.
+        case.processes = None;
+        let r = case.run();
+        assert!(!r.checks.iter().any(|c| c.id == "instances" || c.id == "agent_servers"));
     }
 
     #[test]

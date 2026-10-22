@@ -31,7 +31,8 @@ mod statusline;
 pub use statusline::run as statusline;
 pub use diagnostics::write_build_info;
 mod door;
-pub use door::wait_for_exit;
+mod instance;
+pub use instance::claim as claim_instance;
 mod mcp;
 pub use mcp::serve_stdio as serve_mcp;
 #[cfg(feature = "desktop")]

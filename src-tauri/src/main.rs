@@ -7,11 +7,11 @@ fn main() {
         let status = slopbar_lib::write_build_info(std::path::Path::new(&args[2]));
         std::process::exit(if status.is_ok() { 0 } else { 1 });
     }
-    if args.len() == 3 && args[1] == "--after" {
-        // Started by a restart: let the previous instance finish its orderly exit first.
-        if let Some(pid) = args[2].to_str().and_then(|s| s.parse().ok()) {
-            slopbar_lib::wait_for_exit(pid, std::time::Duration::from_secs(60));
-        }
+    // Started by a restart: the previous instance finishes its orderly exit first.
+    let after = (args.len() == 3 && args[1] == "--after").then(|| args[2].to_str().and_then(|s| s.parse().ok())).flatten();
+    // Before anything reads app data: a second instance hands over and exits.
+    if !slopbar_lib::claim_instance(after) {
+        return;
     }
     slopbar_lib::run()
 }
