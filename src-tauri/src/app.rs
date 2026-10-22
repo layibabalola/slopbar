@@ -1081,8 +1081,9 @@ const SWITCHER_LINGER: Duration = Duration::from_secs(30);
 /// Settings and the quick switcher are not created at startup (`"create": false`): each is
 /// built when first opened and destroyed when closed, so neither keeps a WebView2 renderer
 /// while unused. Whatever must outlive them is kept here or in settings, not in the page. The
-/// web taskbar widget is built only while the setting `native_widget` is off (`dock::apply_mode`).
-pub(crate) const ON_DEMAND: [&str; 3] = [SETTINGS_LABEL, SWITCHER_LABEL, dock::LABEL];
+/// web taskbar widget is built only while the setting `native_widget` is off (`dock::apply_mode`),
+/// and the flyout on its first open, released a minute after it closes (see `panel`).
+pub(crate) const ON_DEMAND: [&str; 4] = [SETTINGS_LABEL, SWITCHER_LABEL, dock::LABEL, panel::LABEL];
 
 /// The window `label` (one of `ON_DEMAND`), created from its configuration if it is not open.
 /// Builds off the main thread: building a window there waits on the event loop it runs.
@@ -1101,6 +1102,7 @@ pub(crate) async fn on_demand_window(app: &AppHandle, label: &str) -> Option<tau
         SWITCHER_LABEL => watch_switcher(&win),
         #[cfg(windows)]
         dock::LABEL => dock::exclude_from_peek(&win),
+        panel::LABEL => panel::watch(app, &win),
         _ => {}
     }
     Some(win)
@@ -1385,6 +1387,7 @@ fn take_settings_page(state: tauri::State<AppState>) -> Option<String> {
 #[tauri::command]
 fn set_panel_height(app: AppHandle, height: f64) {
     *app.state::<AppState>().panel_height.lock().unwrap() = height;
+    panel::page_ready();
     panel::place(&app);
 }
 
@@ -2153,24 +2156,6 @@ pub fn run() {
             *app.state::<AppState>().menu_items.lock().unwrap() = items;
             app.on_menu_event(|app, event| menu_event(app, event.id().as_ref()));
 
-            #[cfg(windows)]
-            for label in [dock::LABEL, panel::LABEL] {
-                if let Some(win) = app.get_webview_window(label) {
-                    dock::exclude_from_peek(&win);
-                }
-            }
-            #[cfg(windows)]
-            if let Some(win) = app.get_webview_window(panel::LABEL) {
-                panel::round_corners(&win);
-            }
-            if let Some(win) = app.get_webview_window(panel::LABEL) {
-                let handle = handle.clone();
-                win.on_window_event(move |e| {
-                    if let WindowEvent::Focused(false) = e {
-                        panel::on_blur(&handle);
-                    }
-                });
-            }
             apply_settings(handle);
             apply_hotkey(handle);
             dock::show_docked(handle);

@@ -29,6 +29,7 @@
       {
         "label": "panel",
         "title": "SlopBar",
+        "create": false,
         "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --process-per-site --disable-gpu",
         "url": "index.html",
         "width": 380,

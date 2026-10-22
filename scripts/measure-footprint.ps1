@@ -13,13 +13,19 @@
 
 .EXAMPLE
   pwsh scripts/measure-footprint.ps1 -Exe src-tauri/target/release/slopbar.exe
+
+.EXAMPLE
+  pwsh scripts/measure-footprint.ps1 -Exe src-tauri/target/release/slopbar.exe -Widget web
+  The same build with the web taskbar widget (native_widget off), to compare with -Widget native.
 #>
 param(
   [Parameter(Mandatory)] [string] $Exe,
   [int] $WarmupSeconds = 150,
   [int] $SampleSeconds = 30,
   [string] $Source = (Join-Path $env:APPDATA 'dev.thelio.slopbar'),
-  [switch] $Keep
+  [switch] $Keep,
+  # Which taskbar widget to measure (setting native_widget); the copy's own value when omitted.
+  [ValidateSet('', 'native', 'web')] [string] $Widget = ''
 )
 $ErrorActionPreference = 'Stop'
 
@@ -41,6 +47,7 @@ if (Test-Path $settingsPath) {
   foreach ($n in @($s.notifications.PSObject.Properties.Name)) { $s.notifications.$n = $false }
   if ($s.phone) { $s.phone.enabled = $false }
   if ($s.calendar) { $s.calendar.enabled = $false }
+  if ($Widget) { $s | Add-Member -Force -NotePropertyName native_widget -NotePropertyValue ($Widget -eq 'native') }
   $s | ConvertTo-Json -Depth 20 | Set-Content -Encoding utf8 $settingsPath
 }
 
