@@ -290,10 +290,11 @@ window.addEventListener("contextmenu", (e) => {
   if (IS_DOCK) invoke("dock_menu");
 });
 
-/** Both windows follow the taskbar's theme, like the shell's own flyouts. */
+/** Both windows follow the taskbar's theme, like the shell's own flyouts; the backend says
+ * when it changes (`taskbar-theme`), so nothing polls for it. */
 const theme = () => invoke("taskbar_theme").then((t) => (document.documentElement.dataset.theme = t));
 theme();
-setInterval(theme, 10_000);
+listen("taskbar-theme", ({ payload }) => (document.documentElement.dataset.theme = payload));
 
 document.getElementById("open-settings").addEventListener("click", () => invoke("open_settings"));
 document.getElementById("open-switcher").addEventListener("click", () => invoke("open_switcher"));
@@ -329,7 +330,16 @@ function loadTrails() {
 listen("usage-updated", loadTrails);
 loadTrails();
 invoke("get_usage").then(render);
-setInterval(() => invoke("get_usage").then(render), 60_000);
+// Times ("resets in 2 h") move on between refreshes. The widget redraws every minute; the
+// flyout only while it is open, and as it opens.
+let panelOpen = false;
+if (!IS_DOCK) {
+  listen("panel-visible", ({ payload }) => {
+    panelOpen = payload;
+    if (payload) invoke("get_usage").then(render);
+  });
+}
+setInterval(() => { if (IS_DOCK || panelOpen) invoke("get_usage").then(render); }, 60_000);
 
 // A warning sign in the flyout's header while any self-check (Settings > Health) has a problem.
 const $health = document.getElementById("health-badge");

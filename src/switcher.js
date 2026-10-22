@@ -120,5 +120,5 @@ invoke("system_locale").then(setSystemLocale, () => {}).finally(() => invoke("ge
 
 const theme = () => invoke("taskbar_theme").then((v) => (document.documentElement.dataset.theme = v));
 theme();
-setInterval(theme, 10_000);
+listen("taskbar-theme", ({ payload }) => (document.documentElement.dataset.theme = payload));
 invoke("get_usage").then((s) => { snapshot = s; render(); });

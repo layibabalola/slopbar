@@ -19,6 +19,8 @@ Installs this checkout's release build over the local SlopBar without anyone qui
 finish a usage refresh through the door and stops it the moment the refresh returns. Monitoring
 tokens rotate only during a refresh or a sign-in, so none is in flight at that moment. The
 journal then records a missing clean shutdown, as after any crash.
+4. Removes rollback folders beyond the newest three, except one an executable still runs from.
+
 Rollback restores executables only; app data and monitoring sessions are never touched.
 #>
 param(
@@ -141,6 +143,11 @@ do {
 } until (($r -and -not $r.isError -and $r.structuredContent.build.commit -eq $head) -or (Get-Date) -gt $deadline)
 if (-not $r -or $r.isError -or $r.structuredContent.build.commit -ne $head) { throw 'The new build did not come up on the door within 60 seconds.' }
 Write-Output "SlopBar $head is running. Previous executables: $backup"
+
+# 4. Keep the newest few rollback folders; the old instance has exited by now. Folders an
+# executable still runs from (agents' MCP servers of an older build) stay until a later install.
+$pruned = Remove-OldRollbacks $RollbackRoot $backup (Get-SlopBarExecutablePaths)
+if ($pruned) { Write-Output "Removed $($pruned.Count) older rollback folder(s)." }
 
 } finally {
   Exit-InstallLock $lock

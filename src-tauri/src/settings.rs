@@ -281,11 +281,26 @@ impl Default for Settings {
 /// config dir, but usable before the app is built, so settings are ready before any window
 /// can ask for them.
 pub fn app_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join(IDENTIFIER))
+    isolated_dir().or_else(|| dirs::config_dir().map(|d| d.join(IDENTIFIER)))
 }
 
 pub fn legacy_app_dir() -> Option<PathBuf> {
+    if isolated() {
+        return None;
+    }
     dirs::config_dir().map(|d| d.join(LEGACY_IDENTIFIER))
+}
+
+/// Where `SLOPBAR_DATA_DIR` points, for running a build beside the installed app (to measure
+/// it, say): app data of its own, and so its own door, instance lock and WebView2 folder.
+fn isolated_dir() -> Option<PathBuf> {
+    std::env::var_os("SLOPBAR_DATA_DIR").filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// Whether this process runs on `SLOPBAR_DATA_DIR`. It then leaves what belongs to the
+/// installed app alone: launch at login and updates.
+pub fn isolated() -> bool {
+    isolated_dir().is_some()
 }
 
 fn path() -> Option<PathBuf> {
