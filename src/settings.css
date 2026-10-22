@@ -272,6 +272,7 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
 
 /* Sparklines: the weekly window over the last 7 days (sparkline.js). */
 .meter .spark { display: block; width: 100%; height: auto; margin-top: 6px; overflow: visible; }
+.meter .spark-empty { width: 100% !important; }
 .spark-base { stroke: var(--track); stroke-width: 1; fill: none; }
 .spark-line { stroke: var(--dim); stroke-width: 1.3; fill: none; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
 .spark-dot { fill: var(--dim); }

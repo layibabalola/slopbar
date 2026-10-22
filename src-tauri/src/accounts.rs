@@ -737,12 +737,11 @@ fn has_cli(provider: Provider, source: &Source) -> bool {
     let exe = executable(provider);
     let status = match &source.distro {
         // A login shell, so ~/.local/bin and version managers are on PATH.
-        Some(distro) => sources::command("wsl.exe")
-            .args(["-d", distro, "--", "bash", "-lc", &format!("command -v {exe}")])
-            .output(),
-        None => sources::command("where.exe").arg(exe).output(),
+        // With a deadline, so a hung WSL cannot hold up adding an account.
+        Some(distro) => sources::wsl(&["-d", distro, "--", "bash", "-lc", &format!("command -v {exe}")], std::time::Duration::from_secs(15)),
+        None => sources::command("where.exe").arg(exe).output().ok(),
     };
-    status.is_ok_and(|o| o.status.success())
+    status.is_some_and(|o| o.status.success())
 }
 
 /// Where to run a sign-in: a source that has the CLI, preferring one where it's signed in.

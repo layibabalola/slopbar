@@ -413,7 +413,7 @@ mod tests {
             .into_iter()
             .map(|(provider, percent)| Item::Chip { provider, percent, tip: widget::chip_tip(&En, provider, percent) })
             .collect();
-        View { items, health_problems: problems, label: "SlopBar".into() }
+        View { items, health_problems: problems, label: "SlopBar".into(), details: vec![] }
     }
 
     const LOOK: Look = Look { theme: Theme::Dark, hot: false, pressed: false };
@@ -535,7 +535,7 @@ mod tests {
         let long = r.measure("Loading, loading, loading");
         assert!(short > 20.0 && short < 80.0, "{short}");
         assert!(long > short * 2.5);
-        let view = View { items: vec![Item::Text { text: "Loading".into(), dim: true }], health_problems: 0, label: String::new() };
+        let view = View { items: vec![Item::Text { text: "Loading".into(), dim: true }], health_problems: 0, label: String::new(), details: vec![] };
         let (s, l) = r.draw(&view, LOOK, 96, 48).unwrap();
         assert_eq!(l.width, 1.0 + 8.0 + short.ceil() + 8.0 + 1.0);
         assert!(s.pixels().chunks_exact(4).any(|q| q[3] > 100));

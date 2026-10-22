@@ -181,12 +181,18 @@ fn note_trail(h: &mut AccountHistory, acc: &AccountUsage, now: DateTime<Utc>) {
     h.trail.retain(|p| p.at > cutoff);
 }
 
-/// Every account's trail as `[milliseconds since 1970, percent used]` pairs, keyed like the
-/// history (`provider:id`).
+/// Every account's trail as `[milliseconds since 1970, percent used]` pairs, keyed the way the
+/// pages name accounts (`claude:id`). The history keys accounts by the provider's display name
+/// (`Claude:id`), so the provider part is lowercased here: looked up under the history's own
+/// keys, every sparkline found nothing and drew only its empty baseline.
 pub fn sparklines(history: &History, now: DateTime<Utc>) -> HashMap<String, Vec<(i64, f64)>> {
     let cutoff = now - chrono::Duration::days(TRAIL_DAYS);
+    let page_key = |k: &str| match k.split_once(':') {
+        Some((provider, id)) => format!("{}:{id}", provider.to_ascii_lowercase()),
+        None => k.to_string(),
+    };
     history.accounts.iter()
-        .map(|(k, h)| (k.clone(), h.trail.iter().filter(|p| p.at > cutoff).map(|p| (p.at.timestamp_millis(), p.used)).collect::<Vec<_>>()))
+        .map(|(k, h)| (page_key(k), h.trail.iter().filter(|p| p.at > cutoff).map(|p| (p.at.timestamp_millis(), p.used)).collect::<Vec<_>>()))
         .filter(|(_, v)| !v.is_empty())
         .collect()
 }
@@ -1067,7 +1073,8 @@ mod tests {
         observe(&mut h, &reading("weekly", 3.0, later + days(6)), later);
         assert_eq!(h.trail.iter().map(|p| p.used).collect::<Vec<_>>(), [20.0, 3.0]);
         let mut history = History::default();
-        history.accounts.insert("claude:a1".into(), h);
+        // The history keys accounts as `Claude:id`; the pages look them up as `claude:id`.
+        history.accounts.insert(history_key(Provider::Claude, "a1"), h);
         assert_eq!(sparklines(&history, later)["claude:a1"].len(), 2);
         assert!(sparklines(&history, later + days(8)).is_empty());
     }

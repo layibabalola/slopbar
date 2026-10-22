@@ -20,26 +20,31 @@ export function sparklineText(points) {
 /**
  * The sparkline's SVG for `points` ([milliseconds, percent] pairs, oldest first). The x axis is
  * the last 7 days ending now and the y axis 0–100%, so every account's line reads the same way.
- * Without readings it keeps its place, empty, so rows line up.
+ * Without readings in those 7 days it draws nothing (a bare baseline read as "flat at 0%") but
+ * keeps its place, so rows line up, and says so to screen readers. `tooltip: false` leaves out
+ * the hover text, for a row whose own tooltip already says it.
  */
-export function sparkline(points, { width = 56, height = 16, now = Date.now() } = {}) {
-  const label = sparklineText(points);
+export function sparkline(points, { width = 56, height = 16, now = Date.now(), tooltip = true } = {}) {
+  const shown = (points ?? []).filter(([at, v]) => at >= now - SPAN && at <= now + 60000 && Number.isFinite(v));
+  const label = sparklineText(shown);
+  if (!shown.length) {
+    return `<span class="spark spark-empty" style="width:${width}px;height:${height}px" role="img" aria-label="${esc(label)}"${tooltip ? ` title="${esc(label)}"` : ""}></span>`;
+  }
   const pad = 1.5;
   const x = (at) => pad + ((Math.min(now, Math.max(now - SPAN, at)) - (now - SPAN)) / SPAN) * (width - 2 * pad);
   const y = (v) => height - pad - (Math.min(100, Math.max(0, v)) / 100) * (height - 2 * pad);
   let d = "";
   let prev = null;
-  for (const [at, v] of points ?? []) {
-    if (at < now - SPAN) continue;
+  for (const [at, v] of shown) {
     d += `${prev == null || at - prev > GAP ? "M" : "L"}${x(at).toFixed(1)} ${y(v).toFixed(1)}`;
     prev = at;
   }
-  const last = points?.at(-1);
-  const tone = !last ? "" : last[1] >= 90 ? "bad" : last[1] >= 70 ? "warn" : "ok";
+  const last = shown.at(-1);
+  const tone = last[1] >= 90 ? "bad" : last[1] >= 70 ? "warn" : "ok";
   return `<svg class="spark" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="${esc(label)}">`
-    + `<title>${esc(label)}</title>`
+    + (tooltip ? `<title>${esc(label)}</title>` : "")
     + `<path class="spark-base" d="M${pad} ${height - pad}H${width - pad}"/>`
-    + (d ? `<path class="spark-line" d="${d}"/>` : "")
-    + (last && last[0] >= now - SPAN ? `<circle class="spark-dot ${tone}" cx="${x(last[0]).toFixed(1)}" cy="${y(last[1]).toFixed(1)}" r="1.8"/>` : "")
+    + `<path class="spark-line" d="${d}"/>`
+    + `<circle class="spark-dot ${tone}" cx="${x(last[0]).toFixed(1)}" cy="${y(last[1]).toFixed(1)}" r="1.8"/>`
     + `</svg>`;
 }

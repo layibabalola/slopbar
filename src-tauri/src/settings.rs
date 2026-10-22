@@ -170,6 +170,9 @@ pub struct Settings {
     /// The taskbar widget is drawn natively (Direct2D) instead of in a WebView2, which saves most
     /// of the app's idle memory. Off brings back the web widget, kept for one release.
     pub native_widget: bool,
+    /// Where to look for CLI sign-ins in WSL (see `sources::WslScan`): by default only distros
+    /// already running, plus stopped ones that held sign-ins before.
+    pub wsl_accounts: crate::sources::WslScan,
 }
 
 /// Phone alerts through a push service (ntfy). The access token is not here: it is kept with
@@ -273,6 +276,7 @@ impl Default for Settings {
             compact_suggested: false,
             onboarding_dismissed: false,
             native_widget: true,
+            wsl_accounts: crate::sources::WslScan::Auto,
         }
     }
 }
@@ -329,7 +333,7 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
 /// `project_pins` has its own operations (see `pins`).
-const PATCHABLE: [&str; 24] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed", "native_widget"];
+const PATCHABLE: [&str; 25] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed", "native_widget", "wsl_accounts"];
 
 /// Modifier names a shortcut may use, as the Settings window writes them.
 const HOTKEY_MODIFIERS: [&str; 4] = ["Ctrl", "Alt", "Shift", "Win"];

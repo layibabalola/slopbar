@@ -2,6 +2,7 @@
 // Missing languages and keys fall back to English.
 const MESSAGES = {
   en: {
+    tipMonitorOn: "Monitoring connected: usage stays current after you switch away", tipMonitorOff: "Monitoring not connected: usage updates only while it is in use here", tipPace: "Pace this week: {p}% of an even rate", tipVerdict: "Plan use: {v}", wslAccounts: "Look for accounts in WSL", wslAccountsHint: "Automatic reads WSL distros that are already running, plus stopped ones that had CLI sign-ins before, so SlopBar never starts WSL needlessly.", wsl_auto: "Automatic", wsl_on: "Always (starts stopped distros)", wsl_off: "Off", wslRescan: "Rescan WSL", wslRescanHint: "Looks in every WSL distro once, starting stopped ones, to find sign-ins made there.", wslRescanButton: "Rescan", wslRescanning: "Looking in WSL…",
     sparkText: "Weekly usage, last 7 days: {from}% to {to}%, peak {peak}%",
     sparkNone: "No weekly usage readings in the last 7 days yet",
     compactOffer: "{n} accounts make a long list. The compact layout shows each on one line.",
@@ -253,6 +254,7 @@ const MESSAGES = {
     subCodexLocal: "Codex rows also show this PC's own Codex history, which names the account behind each thread since {d}. Use in WSL, on other machines or in the cloud is not seen locally.",
   },
   pt: {
+    tipMonitorOn: "Monitoramento conectado: o uso continua atualizado depois que você troca de conta", tipMonitorOff: "Monitoramento não conectado: o uso só é atualizado enquanto a conta está em uso aqui", tipPace: "Ritmo desta semana: {p}% de um ritmo uniforme", tipVerdict: "Uso do plano: {v}", wslAccounts: "Procurar contas no WSL", wslAccountsHint: "Automático lê as distribuições do WSL que já estão em execução, e as paradas que já tiveram logins de CLI, para o SlopBar nunca iniciar o WSL sem necessidade.", wsl_auto: "Automático", wsl_on: "Sempre (inicia distribuições paradas)", wsl_off: "Desligado", wslRescan: "Verificar o WSL de novo", wslRescanHint: "Procura uma vez em todas as distribuições do WSL, iniciando as paradas, para achar logins feitos nelas.", wslRescanButton: "Verificar", wslRescanning: "Procurando no WSL…",
     sDiagnostics: "Diagnóstico",
     exportDiagnostics: "Exportar diagnóstico",
     diagnosticsHint: "Histórico local: até 7 dias ou 10.000 eventos. Relatórios incluem números anônimos de contas e uso, sem credenciais ou identidades. Nada é enviado automaticamente.",
@@ -398,6 +400,7 @@ const MESSAGES = {
     nCreditExpiringTitle: "Crédito de reset do {provider} expira em {d}", nCreditExpiringBody: "{account} · {n} sem uso",
   },
   es: {
+    tipMonitorOn: "Monitorización conectada: el uso sigue al día después de cambiar de cuenta", tipMonitorOff: "Monitorización no conectada: el uso solo se actualiza mientras la cuenta está en uso aquí", tipPace: "Ritmo de esta semana: {p}% de un ritmo uniforme", tipVerdict: "Uso del plan: {v}", wslAccounts: "Buscar cuentas en WSL", wslAccountsHint: "Automático lee las distribuciones de WSL que ya están en ejecución, y las detenidas que antes tenían sesiones de la CLI, para que SlopBar nunca inicie WSL sin necesidad.", wsl_auto: "Automático", wsl_on: "Siempre (inicia distribuciones detenidas)", wsl_off: "Desactivado", wslRescan: "Volver a buscar en WSL", wslRescanHint: "Busca una vez en todas las distribuciones de WSL, iniciando las detenidas, para encontrar sesiones iniciadas allí.", wslRescanButton: "Buscar", wslRescanning: "Buscando en WSL…",
     sDiagnostics: "Diagnóstico",
     exportDiagnostics: "Exportar diagnóstico",
     diagnosticsHint: "Historial local: hasta 7 días o 10.000 eventos. Incluye cuentas anónimas y uso, sin credenciales ni identidades. No se envía nada automáticamente.",
@@ -543,6 +546,7 @@ const MESSAGES = {
     nCreditExpiringTitle: "El crédito de reinicio de {provider} caduca el {d}", nCreditExpiringBody: "{account} · {n} sin usar",
   },
   fr: {
+    tipMonitorOn: "Surveillance connectée : l'utilisation reste à jour après un changement de compte", tipMonitorOff: "Surveillance non connectée : l'utilisation n'est mise à jour que lorsque le compte est utilisé ici", tipPace: "Rythme cette semaine : {p} % d'un rythme régulier", tipVerdict: "Utilisation du forfait : {v}", wslAccounts: "Chercher des comptes dans WSL", wslAccountsHint: "Automatique lit les distributions WSL déjà démarrées, et celles arrêtées qui avaient déjà des connexions CLI, pour que SlopBar ne démarre jamais WSL inutilement.", wsl_auto: "Automatique", wsl_on: "Toujours (démarre les distributions arrêtées)", wsl_off: "Désactivé", wslRescan: "Réanalyser WSL", wslRescanHint: "Regarde une fois dans chaque distribution WSL, en démarrant celles arrêtées, pour trouver les connexions faites là.", wslRescanButton: "Réanalyser", wslRescanning: "Recherche dans WSL…",
     sDiagnostics: "Diagnostic",
     exportDiagnostics: "Exporter le diagnostic",
     diagnosticsHint: "Historique local : 7 jours ou 10 000 événements maximum. Comptes anonymes et utilisation, sans identifiants de connexion ni identité. Aucun envoi automatique.",
@@ -688,6 +692,7 @@ const MESSAGES = {
     nCreditExpiringTitle: "Le crédit de réinitialisation {provider} expire {d}", nCreditExpiringBody: "{account} · {n} inutilisés",
   },
   de: {
+    tipMonitorOn: "Überwachung verbunden: Die Nutzung bleibt aktuell, auch nach einem Kontowechsel", tipMonitorOff: "Überwachung nicht verbunden: Die Nutzung wird nur aktualisiert, solange das Konto hier verwendet wird", tipPace: "Tempo diese Woche: {p} % eines gleichmäßigen Tempos", tipVerdict: "Tarifnutzung: {v}", wslAccounts: "In WSL nach Konten suchen", wslAccountsHint: "Automatisch liest WSL-Distributionen, die bereits laufen, und gestoppte, die früher CLI-Anmeldungen hatten, damit SlopBar WSL nie unnötig startet.", wsl_auto: "Automatisch", wsl_on: "Immer (startet gestoppte Distributionen)", wsl_off: "Aus", wslRescan: "WSL erneut durchsuchen", wslRescanHint: "Sieht einmal in jeder WSL-Distribution nach und startet dabei gestoppte, um dort erfolgte Anmeldungen zu finden.", wslRescanButton: "Durchsuchen", wslRescanning: "WSL wird durchsucht…",
     sDiagnostics: "Diagnose",
     exportDiagnostics: "Diagnose exportieren",
     diagnosticsHint: "Lokaler Verlauf: bis zu 7 Tage oder 10.000 Ereignisse. Anonyme Kontonummern und Nutzung, ohne Zugangsdaten oder Kontodaten. Kein automatischer Upload.",
@@ -833,6 +838,7 @@ const MESSAGES = {
     nCreditExpiringTitle: "{provider}-Reset-Guthaben verfällt {d}", nCreditExpiringBody: "{account} · {n} ungenutzt",
   },
   it: {
+    tipMonitorOn: "Monitoraggio collegato: l'utilizzo resta aggiornato anche dopo aver cambiato account", tipMonitorOff: "Monitoraggio non collegato: l'utilizzo si aggiorna solo mentre l'account è in uso qui", tipPace: "Ritmo di questa settimana: {p}% di un ritmo costante", tipVerdict: "Uso del piano: {v}", wslAccounts: "Cerca account in WSL", wslAccountsHint: "Automatico legge le distribuzioni WSL già in esecuzione, e quelle ferme che avevano già accessi della CLI, così SlopBar non avvia mai WSL inutilmente.", wsl_auto: "Automatico", wsl_on: "Sempre (avvia le distribuzioni ferme)", wsl_off: "Disattivato", wslRescan: "Ricontrolla WSL", wslRescanHint: "Controlla una volta ogni distribuzione WSL, avviando quelle ferme, per trovare gli accessi fatti lì.", wslRescanButton: "Ricontrolla", wslRescanning: "Ricerca in WSL…",
     sDiagnostics: "Diagnostica",
     exportDiagnostics: "Esporta diagnostica",
     diagnosticsHint: "Cronologia locale: fino a 7 giorni o 10.000 eventi. Conti anonimi e utilizzo, senza credenziali o identità. Nessun caricamento automatico.",
@@ -978,6 +984,7 @@ const MESSAGES = {
     nCreditExpiringTitle: "Il credito di reset di {provider} scade il {d}", nCreditExpiringBody: "{account} · {n} inutilizzati",
   },
   ja: {
+    tipMonitorOn: "モニタリング接続済み: 切り替えた後も使用量が最新に保たれます", tipMonitorOff: "モニタリング未接続: 使用量はこの PC で使用中のときだけ更新されます", tipPace: "今週のペース: 均等なペースの {p}%", tipVerdict: "プランの利用状況: {v}", wslAccounts: "WSL でアカウントを探す", wslAccountsHint: "自動では、すでに実行中の WSL ディストリビューションと、以前 CLI のサインインがあった停止中のものだけを読み取るため、SlopBar が不要に WSL を起動することはありません。", wsl_auto: "自動", wsl_on: "常に (停止中のディストリビューションも起動)", wsl_off: "オフ", wslRescan: "WSL を再スキャン", wslRescanHint: "停止中のものも起動して、すべての WSL ディストリビューションを一度調べ、そこで行われたサインインを見つけます。", wslRescanButton: "再スキャン", wslRescanning: "WSL を調べています…",
     sDiagnostics: "診断",
     exportDiagnostics: "診断をエクスポート",
     diagnosticsHint: "ローカル履歴は最大7日間または10,000件です。匿名のアカウント番号と使用量を含みますが、認証情報やアカウントの識別情報は含みません。自動送信はしません。",
@@ -1123,6 +1130,7 @@ const MESSAGES = {
     nCreditExpiringTitle: "{provider} のリセットクレジットが {d} に期限切れ", nCreditExpiringBody: "{account} · 未使用 {n} 件",
   },
   zh: {
+    tipMonitorOn: "已连接监控：切换账号后用量仍保持最新", tipMonitorOff: "未连接监控：仅在本机使用该账号时才更新用量", tipPace: "本周进度：均匀速度的 {p}%", tipVerdict: "套餐使用：{v}", wslAccounts: "在 WSL 中查找账号", wslAccountsHint: "自动模式只读取已在运行的 WSL 发行版，以及以前有过 CLI 登录的已停止发行版，因此 SlopBar 不会无故启动 WSL。", wsl_auto: "自动", wsl_on: "始终（会启动已停止的发行版）", wsl_off: "关闭", wslRescan: "重新扫描 WSL", wslRescanHint: "检查每个 WSL 发行版一次（会启动已停止的发行版），以找到在其中完成的登录。", wslRescanButton: "重新扫描", wslRescanning: "正在查找 WSL…",
     sDiagnostics: "诊断",
     exportDiagnostics: "导出诊断",
     diagnosticsHint: "本地历史最多保留7天或10,000条事件。报告包含匿名账户编号和使用量，不含凭据或账户身份信息，不会自动上传。",
@@ -1268,6 +1276,7 @@ const MESSAGES = {
     nCreditExpiringTitle: "{provider} 限额重置将于 {d} 到期", nCreditExpiringBody: "{account} · {n} 次未使用",
   },
   ko: {
+    tipMonitorOn: "모니터링 연결됨: 다른 계정으로 전환한 뒤에도 사용량이 최신으로 유지됩니다", tipMonitorOff: "모니터링 연결 안 됨: 이 PC에서 사용 중일 때만 사용량이 업데이트됩니다", tipPace: "이번 주 속도: 균등한 속도의 {p}%", tipVerdict: "플랜 사용: {v}", wslAccounts: "WSL에서 계정 찾기", wslAccountsHint: "자동은 이미 실행 중인 WSL 배포판과, 이전에 CLI 로그인이 있었던 중지된 배포판만 읽으므로 SlopBar가 불필요하게 WSL을 시작하지 않습니다.", wsl_auto: "자동", wsl_on: "항상 (중지된 배포판도 시작)", wsl_off: "끔", wslRescan: "WSL 다시 검색", wslRescanHint: "중지된 배포판도 시작하여 모든 WSL 배포판을 한 번 살펴보고 그곳에서 한 로그인을 찾습니다.", wslRescanButton: "다시 검색", wslRescanning: "WSL 검색 중…",
     sDiagnostics: "진단",
     exportDiagnostics: "진단 내보내기",
     diagnosticsHint: "로컬 기록은 최대 7일 또는 10,000개 이벤트입니다. 익명 계정 번호와 사용량이 포함되며 자격 증명이나 계정 식별 정보는 제외됩니다. 자동 업로드하지 않습니다.",
@@ -1413,6 +1422,7 @@ const MESSAGES = {
     nCreditExpiringTitle: "{provider} 초기화 크레딧 {d} 만료", nCreditExpiringBody: "{account} · 미사용 {n}개",
   },
   ru: {
+    tipMonitorOn: "Мониторинг подключён: использование остаётся актуальным и после переключения", tipMonitorOff: "Мониторинг не подключён: использование обновляется, только пока аккаунт используется здесь", tipPace: "Темп на этой неделе: {p}% от равномерного", tipVerdict: "Использование тарифа: {v}", wslAccounts: "Искать аккаунты в WSL", wslAccountsHint: "Автоматически: читаются уже запущенные дистрибутивы WSL и остановленные, в которых раньше были входы CLI, поэтому SlopBar не запускает WSL без нужды.", wsl_auto: "Автоматически", wsl_on: "Всегда (запускает остановленные дистрибутивы)", wsl_off: "Выкл.", wslRescan: "Пересканировать WSL", wslRescanHint: "Один раз проверяет каждый дистрибутив WSL, запуская остановленные, чтобы найти выполненные там входы.", wslRescanButton: "Пересканировать", wslRescanning: "Поиск в WSL…",
     sDiagnostics: "Диагностика",
     exportDiagnostics: "Экспорт диагностики",
     diagnosticsHint: "Локальная история: до 7 дней или 10 000 событий. Анонимные номера аккаунтов и использование, без учётных данных и идентификации аккаунтов. Автоматической отправки нет.",

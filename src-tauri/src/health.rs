@@ -127,6 +127,36 @@ pub struct Inputs<'a> {
     pub processes: Option<crate::instance::Processes>,
     /// Space SlopBar takes on disk, when it could be measured.
     pub disk: Option<Disk>,
+    /// How the last refresh went with WSL (see `sources::wsl_status`).
+    pub wsl: crate::sources::WslStatus,
+}
+
+/// WSL, when it is there or was asked about: which distros are read, which are left stopped,
+/// and whether WSL stopped answering. None on a PC without WSL.
+fn wsl_check(s: &crate::sources::WslStatus) -> Option<Check> {
+    use crate::sources::{WslPlan, WslScan};
+    let data = Some(Fix::OpenSettings { page: "data" });
+    s.checked_at?;
+    if s.timed_out || s.backing_off {
+        let slow: Vec<&str> = s.distros.iter().filter(|d| d.timed_out).map(|d| d.name.as_str()).collect();
+        let what = if slow.is_empty() { "WSL did not answer in time".to_string() } else { format!("WSL ({}) did not answer in time", slow.join(", ")) };
+        return Some(check("wsl", Status::Warning, "WSL",
+            format!("{what}, so SlopBar skipped it rather than wait; it tries again in a few minutes. If WSL stays stuck, `wsl --shutdown` in a terminal restarts it, or set Look for accounts in WSL to Off (Settings > Data)."), data));
+    }
+    if !s.installed { return None; }
+    if s.mode == WslScan::Off {
+        return Some(check("wsl", Status::Ok, "WSL", "Not searched for accounts: Look for accounts in WSL is Off (Settings > Data).", None));
+    }
+    let names = |f: &dyn Fn(&crate::sources::DistroStatus) -> bool| s.distros.iter().filter(|d| f(d)).map(|d| d.name.clone()).collect::<Vec<_>>();
+    let read = names(&|d| d.plan != WslPlan::Skip);
+    let skipped = names(&|d| d.plan == WslPlan::Skip);
+    let mut parts = vec![];
+    if !read.is_empty() { parts.push(format!("Read: {}.", read.join(", "))); }
+    if !skipped.is_empty() {
+        parts.push(format!("Left stopped: {} (no CLI sign-ins seen there; Rescan WSL in Settings > Data looks once).", skipped.join(", ")));
+    }
+    if parts.is_empty() { parts.push("No distros.".into()); }
+    Some(check("wsl", Status::Ok, "WSL", parts.join(" "), None))
 }
 
 /// What SlopBar keeps on disk: its app data (diagnostics exports and captures included) and the
@@ -349,6 +379,8 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         },
     });
 
+    checks.extend(wsl_check(&inputs.wsl));
+
     let j = inputs.journal;
     checks.push(if !j.started {
         check("journal", Status::Warning, "Diagnostics journal", "Not started yet.", None)
@@ -412,6 +444,7 @@ mod tests {
         vault_plaintext: usize,
         processes: Option<crate::instance::Processes>,
         disk: Option<Disk>,
+        wsl: crate::sources::WslStatus,
     }
 
     impl Case {
@@ -428,13 +461,14 @@ mod tests {
                 vault_plaintext: 0,
                 processes: Some(crate::instance::Processes { instances: 1, mcp_servers: 3 }),
                 disk: None,
+                wsl: Default::default(),
             }
         }
 
         fn run(&self) -> Report {
             checks(&Inputs { accounts: &self.accounts, monitoring: &self.monitoring, refresh_minutes: 5, last_success: self.last_success,
                 door: self.door, sharing: &self.sharing, journal: self.journal, notifications: self.notifications, auto_connect: self.auto_connect,
-                vault_plaintext: self.vault_plaintext, processes: self.processes, disk: self.disk }, now())
+                vault_plaintext: self.vault_plaintext, processes: self.processes, disk: self.disk, wsl: self.wsl.clone() }, now())
         }
     }
 
@@ -684,6 +718,31 @@ mod tests {
         assert!(find(&case.run(), "notifications").reason.contains("every app"));
         case.notifications.any_wanted = false;
         assert_eq!(find(&case.run(), "notifications").status, Status::Ok, "nothing to show, nothing wrong");
+    }
+
+    #[test]
+    fn wsl_shows_only_when_relevant_and_warns_when_it_hangs() {
+        use crate::sources::{DistroStatus, WslPlan, WslScan, WslStatus};
+        let mut c = Case::healthy();
+        // No WSL on this PC, or not looked at yet: no row.
+        assert!(c.run().checks.iter().all(|k| k.id != "wsl"));
+        c.wsl = WslStatus { checked_at: Some(now()), installed: false, ..Default::default() };
+        assert!(c.run().checks.iter().all(|k| k.id != "wsl"));
+        let distro = |name: &str, running, plan| DistroStatus { name: name.into(), running, plan, has_logins: false, known: false, timed_out: false };
+        c.wsl = WslStatus { mode: WslScan::Auto, checked_at: Some(now()), installed: true, timed_out: false, backing_off: false,
+            distros: vec![distro("Debian", true, WslPlan::Read), distro("Ubuntu-22.04", false, WslPlan::Skip)] };
+        let r = c.run();
+        let k = find(&r, "wsl");
+        assert_eq!(k.status, Status::Ok);
+        assert!(k.reason.contains("Read: Debian.") && k.reason.contains("Left stopped: Ubuntu-22.04"), "{}", k.reason);
+        // A hung WSL is a warning with a way out, not a stalled refresh.
+        c.wsl.timed_out = true;
+        let r = c.run();
+        let k = find(&r, "wsl");
+        assert_eq!((k.status, k.fix.clone()), (Status::Warning, Some(Fix::OpenSettings { page: "data" })));
+        assert!(k.reason.contains("wsl --shutdown"));
+        c.wsl = WslStatus { mode: WslScan::Off, checked_at: Some(now()), installed: true, ..Default::default() };
+        assert!(find(&c.run(), "wsl").reason.contains("Off"));
     }
 
     #[test]
