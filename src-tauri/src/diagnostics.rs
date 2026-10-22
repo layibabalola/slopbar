@@ -1064,7 +1064,7 @@ mod tests {
             billing: crate::model::BillingHints { tier: Some(canary.into()), billing_type: Some(canary.into()), ..Default::default() },
             remote: vec![crate::model::RemoteSeat { machine: canary.into(), where_: vec![canary.into()], seen_at: chrono::Utc::now(), live: true }],
             used_outside: true,
-            runs_out_at: None, unexpected: None,
+            runs_out_at: None, unexpected: None, extra_usage: None,
         };
         let snapshot = Snapshot {
             accounts: vec![a],

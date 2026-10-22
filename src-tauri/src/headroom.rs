@@ -366,7 +366,7 @@ mod tests {
             id: id.into(), provider: Provider::Claude, email: Some(format!("{id}@example.invalid")), alias: None, plan: Some("max".into()), org: None,
             active, sources: vec![], windows: vec![window("session", 10.0, 3), window("weekly", weekly, weekly_resets_in_hours)],
             credits: None, resets: vec![], error: None, monitor_error: None, stale: false,
-            fetched_at: Some(at(NOW) - Duration::minutes(2)), monitor_connected: true, billing: Default::default(), remote: vec![], used_outside: false, runs_out_at: None, unexpected: None,
+            fetched_at: Some(at(NOW) - Duration::minutes(2)), monitor_connected: true, billing: Default::default(), remote: vec![], used_outside: false, runs_out_at: None, unexpected: None, extra_usage: None,
         }
     }
 

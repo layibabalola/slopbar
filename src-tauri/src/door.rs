@@ -37,6 +37,8 @@ pub enum Request {
     GetSettings,
     /// Each account's plan, weekly usage history, verdict and next renewal (see `subscriptions`).
     GetSubscriptions,
+    /// Plan changes per provider: cancels and downgrades with savings (see `advisor`).
+    GetPlanAdvice,
     /// Tokens by account and repository, model or day from the CLIs' files here (see `usage_index`).
     GetUsageBreakdown {
         #[serde(default)]

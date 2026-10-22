@@ -1,4 +1,4 @@
-use crate::{accounts, active_log, auto_monitor, balancer, bulk, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, migrate, model, monitoring, notify, panel, pins, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates, usage_index};
+use crate::{accounts, active_log, auto_monitor, balancer, ledger, bulk, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, migrate, model, monitoring, notify, panel, pins, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates, usage_index};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -56,6 +56,8 @@ pub struct AppState {
     unexpected_log: Mutex<unexpected::Log>,
     /// Plan notifications already shown (renewals, running out), so each is shown once.
     plan_alerts: Mutex<plan_alerts::Sent>,
+    /// What the plans have cost month by month (see `ledger`).
+    ledger: Mutex<ledger::Ledger>,
     /// Connect monitoring automatically: how long accounts have been in use, and backoffs.
     auto_monitor: Mutex<auto_monitor::Tracker>,
     /// What refreshes and startup learned for Settings > Health.
@@ -153,7 +155,20 @@ fn subscription_report(state: &AppState) -> subscriptions::Report {
     let snapshot = state.snapshot.lock().unwrap().clone();
     let settings = state.settings.lock().unwrap().clone();
     let local = state.codex_local.lock().unwrap().clone();
-    subscriptions::report(&snapshot, &state.usage_history.lock().unwrap(), &settings, local.as_deref(), chrono::Utc::now())
+    let now = chrono::Utc::now();
+    let mut report = subscriptions::report(&snapshot, &state.usage_history.lock().unwrap(), &settings, local.as_deref(), now);
+    report.spend = Some(ledger::summary(&state.ledger.lock().unwrap(), &settings.spend, now));
+    report
+}
+
+/// Charges renewals that have passed and this month's extra usage to the spend ledger.
+fn record_spend(state: &AppState) {
+    let report = subscription_report(state);
+    let ledger = {
+        let mut ledger = state.ledger.lock().unwrap();
+        ledger::record(&mut ledger, &report, chrono::Utc::now()).then(|| ledger.clone())
+    };
+    if let Some(ledger) = ledger { let _ = ledger::save(&ledger); }
 }
 
 #[tauri::command]
@@ -276,6 +291,10 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::Refresh => value(do_refresh(&app).await),
         R::GetSettings => value(app.state::<AppState>().settings.lock().unwrap().clone()),
         R::GetSubscriptions => value(subscription_report(&app.state::<AppState>())),
+        R::GetPlanAdvice => {
+            let report = subscription_report(&app.state::<AppState>());
+            Ok(serde_json::json!({ "providers": report.advice, "generated_at": report.generated_at }))
+        }
         R::GetUsageBreakdown { provider, account, days, group_by } => {
             if days.is_some_and(|d| !(1..=usage_index::LOOKBACK_DAYS as u32).contains(&d)) {
                 return Err(format!("days must be 1-{}", usage_index::LOOKBACK_DAYS));
@@ -1224,6 +1243,7 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
         }
     }
     *state.snapshot.lock().unwrap() = snapshot.clone();
+    record_spend(&state);
     let _ = app.emit("usage-updated", &snapshot);
     if settings.providers.codex { scan_codex_local(app); }
     if settings.calendar.enabled {
@@ -1307,11 +1327,12 @@ async fn write_csv(app: &AppHandle, folder: Option<String>) -> Result<csv_export
     let log = state.active_log.lock().unwrap().clone();
     let history = state.usage_history.lock().unwrap().clone();
     let report = subscription_report(&state);
+    let ledger = state.ledger.lock().unwrap().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let now = chrono::Utc::now();
         let rows = usage_index::daily(&index, &log, &known, now, &chrono::Local);
         let stamp = now.with_timezone(&chrono::Local).format("%Y-%m-%d-%H%M%S").to_string();
-        csv_export::write(&folder, &csv_export::history_csv(&history, &known), &csv_export::breakdown_csv(&rows), &csv_export::subscriptions_csv(&report), &stamp)
+        csv_export::write(&folder, &csv_export::history_csv(&history, &known), &csv_export::breakdown_csv(&rows), &csv_export::subscriptions_csv(&report), &csv_export::ledger_csv(&ledger), &stamp)
     }).await.map_err(|_| "export_folder_unwritable".to_string())?
 }
 
@@ -1441,6 +1462,7 @@ pub fn run() {
         presence_tracks: Mutex::default(),
         unexpected_log: Mutex::new(unexpected::load()),
         plan_alerts: Mutex::new(plan_alerts::load()),
+        ledger: Mutex::new(ledger::load()),
         auto_monitor: Mutex::new(auto_monitor::Tracker::new(auto_monitor::load())),
         health: Mutex::default(),
         profile_states: Mutex::default(),

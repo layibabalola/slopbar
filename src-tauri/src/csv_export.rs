@@ -71,7 +71,7 @@ pub fn breakdown_csv(rows: &[DailyRow]) -> String {
 pub fn subscriptions_csv(report: &Report) -> String {
     csv(&["provider", "account_id", "email", "alias", "plan", "in_use", "verdict", "confidence", "basis", "weeks_counted", "average_peak_percent",
         "median_peak_percent", "limit_weeks", "renewal_looks_unneeded", "this_week_percent", "pace_percent", "runs_out_at", "next_renewal",
-        "renewal_source", "renewal_warning", "monthly_cost", "cost_entered", "cancel_after", "ends_at", "plan_weight", "days_tracked"],
+        "renewal_source", "renewal_warning", "monthly_cost", "cost_entered", "cancel_after", "ends_at", "plan_weight", "days_tracked", "extra_usage_enabled", "extra_usage_used", "extra_usage_limit"],
         report.accounts.iter().map(|e| {
             let a = &e.assessment;
             vec![text(e.provider.name()), text(&e.id), opt(e.email.as_deref()), opt(e.alias.as_deref()), opt(e.plan.as_deref()), e.active.to_string(),
@@ -80,7 +80,8 @@ pub fn subscriptions_csv(report: &Report) -> String {
                 num(e.this_week.as_ref().and_then(|w| w.pace_percent)), time(e.this_week.as_ref().and_then(|w| w.runs_out_at)),
                 time(e.renewal.as_ref().map(|r| r.at)), e.renewal.as_ref().map(|r| name(r.source)).unwrap_or_default(),
                 e.renewal_warning.map(name).unwrap_or_default(), num(e.monthly_cost), e.cost_entered.to_string(),
-                e.cancel_after.map(|d| d.to_string()).unwrap_or_default(), time(e.ends_at), num(e.plan_weight), e.days_tracked.to_string()]
+                e.cancel_after.map(|d| d.to_string()).unwrap_or_default(), time(e.ends_at), num(e.plan_weight), e.days_tracked.to_string(),
+                e.extra_usage.as_ref().and_then(|x| x.enabled).map(|b| b.to_string()).unwrap_or_default(), num(e.extra_usage.as_ref().and_then(|x| x.used)), num(e.extra_usage.as_ref().and_then(|x| x.monthly_limit))]
         }))
 }
 
@@ -90,12 +91,27 @@ pub struct Written { pub folder: PathBuf, pub files: Vec<WrittenFile> }
 #[derive(Debug, Clone, Serialize)]
 pub struct WrittenFile { pub kind: &'static str, pub path: PathBuf, pub rows: usize, pub bytes: u64 }
 
-/// Writes the three files into `folder` (made if missing), named by the local time.
-pub fn write(folder: &Path, history: &str, breakdown: &str, subscriptions: &str, stamp: &str) -> Result<Written, String> {
+/// Writes the four files into `folder` (made if missing), named by the local time.
+/// The spend ledger: one row per plan charge and per account's extra usage in a month. Accounts
+/// are named by their history key (provider and id), as the ledger stores them.
+pub fn ledger_csv(ledger: &crate::ledger::Ledger) -> String {
+    let mut rows = vec![];
+    for (month, m) in &ledger.months {
+        for c in &m.charges {
+            rows.push(vec![text(month), text(&c.account), text("plan"), time(Some(c.at)), num(c.amount), opt(c.tier.as_deref()), name(c.source), c.cost_entered.to_string()]);
+        }
+        for (account, spent) in &m.extra {
+            rows.push(vec![text(month), text(account), text("extra_usage"), String::new(), num(Some(*spent)), String::new(), String::new(), String::new()]);
+        }
+    }
+    csv(&["month", "account", "kind", "charged_at", "amount_usd", "tier", "date_source", "cost_entered"], rows)
+}
+
+pub fn write(folder: &Path, history: &str, breakdown: &str, subscriptions: &str, ledger: &str, stamp: &str) -> Result<Written, String> {
     if !folder.is_absolute() { return Err("export_folder_not_absolute".into()); }
     std::fs::create_dir_all(folder).map_err(|_| "export_folder_unwritable")?;
     let mut files = vec![];
-    for (kind, body) in [("weekly_history", history), ("usage_breakdown", breakdown), ("subscriptions", subscriptions)] {
+    for (kind, body) in [("weekly_history", history), ("usage_breakdown", breakdown), ("subscriptions", subscriptions), ("spend_ledger", ledger)] {
         let path = folder.join(format!("SlopBar-{}-{stamp}.csv", kind.replace('_', "-")));
         std::fs::write(&path, body).map_err(|_| "export_folder_unwritable")?;
         files.push(WrittenFile { kind, rows: body.matches("\r\n").count().saturating_sub(1), bytes: body.len() as u64, path });
@@ -123,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_three_files_with_emails_and_rows() {
+    fn writes_four_files_with_emails_and_rows() {
         let mut history = History::default();
         history.accounts.insert("Claude:slot-a".into(), AccountHistory { windows: vec![WindowRecord { kind: "weekly".into(), resets_at: at("2026-10-20T00:00:00Z"),
             peak: 87.456, first_obs: at("2026-10-13T01:00:00Z"), last_obs: at("2026-10-19T23:00:00Z"), hours: 150, days: 7, idle: false, local: false }], ..Default::default() });
@@ -136,15 +152,22 @@ mod tests {
             attribution: Attribution::Unattributed, repo: "my, repo".into(), model: "claude-opus-5-5".into(), tokens: Tokens { input: 1, cache_write: 2, cached: 3, output: 4, total: 10 } }];
         let b = breakdown_csv(&rows);
         assert!(b.contains("2026-10-20,Claude,,,unattributed,\"my, repo\",claude-opus-5-5,1,2,3,4,10\r\n"), "{b}");
-        let report = Report { accounts: vec![], providers: vec![], generated_at: at("2026-10-21T00:00:00Z") };
+        let report = Report { accounts: vec![], providers: vec![], generated_at: at("2026-10-21T00:00:00Z"), advice: vec![], spend: None };
         let s = subscriptions_csv(&report);
         let dir = crate::test_support::TempDir::new();
         let out = dir.0.join("nested").join("SlopBar Exports");
-        let written = write(&out, &h, &b, &s, "2026-10-21-120000").unwrap();
-        assert_eq!(written.files.len(), 3);
-        assert_eq!(written.files.iter().map(|f| f.rows).collect::<Vec<_>>(), [1, 1, 0]);
+        let mut ledger = crate::ledger::Ledger::default();
+        ledger.months.entry("2026-10".into()).or_default().charges.push(crate::ledger::Charge { account: "Claude:slot-a".into(), at: at("2026-10-05T00:00:00Z"),
+            amount: Some(200.0), tier: Some("Max 20x".into()), source: crate::subscriptions::DateSource::Provider, cost_entered: false });
+        ledger.months.get_mut("2026-10").unwrap().extra.insert("Claude:slot-a".into(), 12.345);
+        let l = ledger_csv(&ledger);
+        assert!(l.contains("2026-10,Claude:slot-a,plan,2026-10-05T00:00:00Z,200,Max 20x,provider,false\r\n"), "{l}");
+        assert!(l.contains("2026-10,Claude:slot-a,extra_usage,,12.35,,,\r\n"), "{l}");
+        let written = write(&out, &h, &b, &s, &l, "2026-10-21-120000").unwrap();
+        assert_eq!(written.files.len(), 4);
+        assert_eq!(written.files.iter().map(|f| f.rows).collect::<Vec<_>>(), [1, 1, 0, 2]);
         assert!(written.files[0].path.ends_with("SlopBar-weekly-history-2026-10-21-120000.csv"));
         assert_eq!(std::fs::read_to_string(&written.files[1].path).unwrap(), b);
-        assert_eq!(write(Path::new("relative"), "", "", "", "x").unwrap_err(), "export_folder_not_absolute");
+        assert_eq!(write(Path::new("relative"), "", "", "", "", "x").unwrap_err(), "export_folder_not_absolute");
     }
 }

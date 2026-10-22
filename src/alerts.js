@@ -91,6 +91,11 @@ export async function checkPlans() {
       notify(t("nRunsOutTitle", { provider, at: dayTime(a.at) }), t("nRunsOutBody", { account: accountName(a), t: until(a.resets_at) }), "subscriptions");
       continue;
     }
+    if (a.kind === "extra_usage") {
+      notify(t("nExtraTitle", { provider, p: Math.round(a.percent) }),
+        t("nExtraBody", { account: accountName(a), v: money(a.used ?? 0), limit: a.limit != null ? money(a.limit) : "—" }), "subscriptions");
+      continue;
+    }
     if (a.kind === "pro_allowance_cut") {
       // The last day of the old allowance, at local noon so no time zone moves it.
       notify(t("nProCutTitle", { d: shortDate(`${a.at.slice(0, 10)}T12:00:00`) }), t("nProCutBody", { accounts: (a.accounts ?? []).join(", ") }), "subscriptions");

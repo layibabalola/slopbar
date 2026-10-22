@@ -28,6 +28,8 @@ pub struct Cached {
     monitor_error: Option<String>,
     /// The provider's own billing record, last read at most a few times a day.
     billing: Option<crate::model::BillingHints>,
+    /// Claude's extra usage, from the last successful read.
+    extra_usage: Option<crate::model::ExtraUsage>,
     #[serde(skip)]
     verified: bool,
 }
@@ -118,18 +120,18 @@ pub async fn fetch_all(
                 billing: slot.billing(),
                 remote: vec![],
                 used_outside: false,
-                runs_out_at: None, unexpected: None,
+                runs_out_at: None, unexpected: None, extra_usage: None,
             };
             let entry = cache.entry(monitoring::key(slot)).or_default();
             match result {
-                Some(Ok(Fetched { windows, credits, resets, monitor_error, billing })) => {
+                Some(Ok(Fetched { windows, credits, resets, monitor_error, billing, extra_usage })) => {
                     // Billing is read less often than usage: keep the last record between reads.
                     let billing = match (billing, entry.billing.take()) {
                         (Some(new), Some(old)) => Some(old.overlay(&new)),
                         (new, old) => new.or(old),
                     };
                     *entry = Cached { windows, credits, resets, at: Some(Utc::now()),
-                        blocked_until: None, error: None, monitor_error, billing, verified: true };
+                        blocked_until: None, error: None, monitor_error, billing, extra_usage, verified: true };
                 }
                 Some(Err(err)) => {
                     let backoff = err.strip_prefix("rate_limited:").and_then(|s| s.parse::<i64>().ok())
@@ -144,6 +146,7 @@ pub async fn fetch_all(
             acc.windows = entry.windows.clone();
             acc.credits = entry.credits.clone();
             acc.resets = entry.resets.clone();
+            acc.extra_usage = entry.extra_usage.clone();
             acc.fetched_at = entry.at;
             acc.stale = !entry.verified || entry.error.is_some();
             acc.error = entry.error.clone();
@@ -183,6 +186,7 @@ struct Fetched {
     resets: Vec<ResetGrant>,
     monitor_error: Option<String>,
     billing: Option<crate::model::BillingHints>,
+    extra_usage: Option<crate::model::ExtraUsage>,
 }
 
 trait Usage {
@@ -260,9 +264,9 @@ async fn observed_usage(usage: &impl Usage, monitor: &Monitor, slot: &Slot, toke
 async fn fetch_token(client: &reqwest::Client, slot: &Slot, provider: Provider, token: &str, account: Option<&str>, observe: &evidence::Observer<'_>) -> Result<Fetched, String> {
     match provider {
         Provider::Claude => claude::fetch(client, token, slot, observe)
-            .await.map(|u| Fetched { windows: u.windows, credits: None, resets: u.resets, monitor_error: None, billing: u.billing }),
+            .await.map(|u| Fetched { windows: u.windows, credits: None, resets: u.resets, monitor_error: None, billing: u.billing, extra_usage: u.extra_usage }),
         Provider::Codex => codex::fetch(client, token, account, observe)
-            .await.map(|u| Fetched { windows: u.windows, credits: u.credits, resets: u.resets, monitor_error: None, billing: u.billing }),
+            .await.map(|u| Fetched { windows: u.windows, credits: u.credits, resets: u.resets, monitor_error: None, billing: u.billing, extra_usage: None }),
     }
 }
 
@@ -278,7 +282,7 @@ mod tests {
             async fn fetch(&self, _: Provider, token: &str, _: Option<&str>, _: &evidence::Observer<'_>) -> Result<Fetched, String> {
                 self.0.lock().unwrap().push(token.to_owned());
                 if token == "monitor-access" { return Err("bad_response".into()); }
-                Ok(Fetched { windows: observed(24.0).windows, credits: None, resets: vec![], monitor_error: None, billing: None })
+                Ok(Fetched { windows: observed(24.0).windows, credits: None, resets: vec![], monitor_error: None, billing: None, extra_usage: None })
             }
         }
         let dir = TempDir::new();
@@ -317,7 +321,7 @@ mod tests {
         impl Usage for Observed {
             async fn fetch(&self, _: Provider, token: &str, _: Option<&str>, _: &evidence::Observer<'_>) -> Result<Fetched, String> {
                 self.0.lock().unwrap().push(token.to_owned());
-                Ok(Fetched { windows: observed(24.0).windows, credits: None, resets: vec![], monitor_error: None, billing: None })
+                Ok(Fetched { windows: observed(24.0).windows, credits: None, resets: vec![], monitor_error: None, billing: None, extra_usage: None })
             }
         }
         for active in [false, true] {
