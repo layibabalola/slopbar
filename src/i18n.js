@@ -77,6 +77,12 @@ const MESSAGES = {
     subManage: "Manage plan", subNextBilling: "Next billing date", subResetDate: "Reset", subCorrectHint: "Wrong? Pick the right date; later renewals count on from it.", subMonthlyCost: "Monthly cost", subLettingLapse: "I'm cancelling this plan",
     subPaidCount: "{n} paid", subMonthlyTotal: "{v}/mo", subUnpriced: "{n} unpriced", subExhaustedCount: "{n} run out weekly",
     subUnusedCount: "{n} unused", subSavings: "could save {v}/mo",
+    subPool: "Your usage fits in {n} × {unit} (+{spare} spare); you hold {held}", subPoolBasis: "busiest of {n} weeks + 20%",
+    subPoolEstimate: "estimate", subPoolInsufficient: "Pool size: not enough history yet ({n} of {needed} weeks)",
+    subPoolUnweighted: "{n} plans of unknown size left out",
+    subBlendedPercent: "{v} per 1% of a {unit} week used", subPerPercent: "{v} per 1% of the weekly limit used",
+    subPerThread: "{v} per thread (this PC only)",
+    subCredits: "Credits: {v}", subCreditsUnlimited: "Unlimited credits", subCreditsSpent: "spent {n} since {d}",
     subClaudeFree: "After a Claude plan ends the account falls back to Claude Free, which does not include Claude Code. Remove the account from SlopBar once its paid period is over.",
     subCodexFree: "After a ChatGPT plan ends the account falls back to ChatGPT Free, which still includes Codex with lower limits.",
 
