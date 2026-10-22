@@ -15,6 +15,8 @@ default = ["desktop"]
 desktop = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-autostart", "dep:tauri-plugin-single-instance", "dep:tauri-plugin-updater", "dep:tauri-plugin-notification", "dep:tauri-plugin-global-shortcut", "dep:webview2-com", "dep:tauri-winrt-notification"]
 # Local fixes must not silently replace themselves with an upstream release.
 upstream-updates = ["desktop"]
+# SlopBar Ultra release builds: updates only from the fork's own signed channel (docs/ULTRA-RELEASES.md).
+ultra-updates = ["upstream-updates"]
 
 [[bin]]
 name = "slopbar"

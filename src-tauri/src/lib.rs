@@ -26,6 +26,7 @@ mod auto_monitor;
 mod calendar;
 mod digest;
 mod statusline;
+mod ultra_release;
 pub use statusline::run as statusline;
 pub use diagnostics::write_build_info;
 mod door;
