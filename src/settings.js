@@ -251,7 +251,7 @@ listen("account-added", () => { $("add-hint").hidden = true; });
 // The verdicts come from the backend (subscriptions.rs); this page only words them.
 
 let report = null;
-const NOTIFY_KINDS = ["usage", "resets", "switches", "renewals", "unexpected_use"];
+const NOTIFY_KINDS = ["usage", "resets", "switches", "renewals", "unexpected_use", "digest"];
 const money = (v) => (v == null ? "" : `$${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`);
 const pct = (v) => `${Math.round(v)}%`;
 const VERDICT_TONE = { exhausted_weekly: "bad", unused: "warn", underused: "warn", healthy: "ok", insufficient_data: "" };
@@ -509,6 +509,7 @@ async function render() {
   for (const kind of NOTIFY_KINDS) $(`notify-${kind}`).checked = settings.notifications[kind];
   $("crash-records").checked = settings.crash_records;
   $("auto-monitoring").checked = settings.auto_connect_monitoring;
+  renderCalendar();
   renderPresence();
   const version = await invoke("app_version");
   $("version").textContent = /^\d/.test(version) ? `v${version}` : version;
@@ -545,6 +546,33 @@ $("export-diagnostics").addEventListener("click", async () => {
 });
 $("crash-records").addEventListener("change", (e) => update({ crash_records: e.target.checked }));
 $("auto-monitoring").addEventListener("change", (e) => update({ auto_connect_monitoring: e.target.checked }));
+
+// The plan-renewal calendar (calendar.rs): an .ics file calendar apps can subscribe to.
+let calendarDefault = "";
+invoke("default_calendar_path").then((p) => { calendarDefault = p ?? ""; if (settings) renderCalendar(); }, () => {});
+function renderCalendar() {
+  $("calendar-enabled").checked = settings.calendar?.enabled ?? false;
+  if (document.activeElement !== $("calendar-path")) $("calendar-path").value = settings.calendar?.path ?? calendarDefault;
+}
+const calendarStatus = (text) => { $("calendar-status").textContent = text; $("calendar-status").hidden = !text; };
+async function exportCalendar() {
+  try {
+    const { path, events } = await invoke("export_calendar");
+    calendarStatus(t("calendarSaved", { n: events, path }));
+  } catch { calendarStatus(t("calendarFailed")); }
+}
+$("calendar-enabled").addEventListener("change", async (e) => {
+  await update({ calendar: { ...settings.calendar, enabled: e.target.checked } });
+  if (e.target.checked) exportCalendar();
+});
+$("calendar-save").addEventListener("click", async () => {
+  const path = $("calendar-path").value.trim();
+  if (path && path !== calendarDefault && !(await invoke("check_calendar_path", { path }))) { calendarStatus(t("calendarPathInvalid")); return; }
+  calendarStatus("");
+  await update({ calendar: { ...settings.calendar, path: path && path !== calendarDefault ? path : null } });
+  if (settings.calendar.enabled) exportCalendar();
+});
+$("calendar-export").addEventListener("click", exportCalendar);
 
 // ---------------------------------------------------------------------------------------------
 // Health: the backend's self-check (health.rs) with each check's fix wired to the matching action.

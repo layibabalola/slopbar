@@ -93,8 +93,28 @@ command = 'C:\Users\<you>\AppData\Local\SlopBar\slopbar-mcp.exe'
 | `check_for_updates`, `install_update`, `get_app_info`, `open_settings` | Updates (builds with automatic updates only), version and build, and showing the Settings window. |
 | `quit_app`, `restart_app` | Quit as the tray's Quit does, or quit and start the installed executable again. |
 | `export_diagnostics`, `list_diagnostic_exports` | Write a diagnostics export (a repeat within 30 seconds returns the same file) or list earlier ones; listing works while SlopBar is closed. |
+| `export_calendar` | Write the plan-renewal calendar (below) now and return its path. |
 
 The server never starts SlopBar, reads credentials or contacts a provider itself: each tool asks the running app, which performs the same action as the matching Settings control. They talk over a named pipe that only the signed-in user and SYSTEM can open and that rejects remote clients. The server checks that the process answering runs as the same Windows user, connects so that process cannot act as the agent's, bounds every reply in size and time, and only passes on an export path inside the export folder. Sign-ins always happen in the CLI's own login, completed by the user. Usage results include account emails, so treat them like the Settings window. `slopbar-mcp.exe` is a separate executable so that app updates, which stop `slopbar.exe`, do not cut agents off mid-session.
+
+### Claude Code status line
+
+`slopbar-mcp.exe --statusline` prints one line about the Claude account in use, for Claude Code's [status line](https://docs.claude.com/en/docs/claude-code/statusline), for example `work · 12% 5h · 42% wk · runs out Fri 3PM`. It asks the running app, reuses an answer for 15 seconds, gives up after 120 ms and prints nothing when SlopBar is not running. To use it, add this to `~/.claude/settings.json` (forward slashes keep the JSON simple):
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "C:/Users/<you>/AppData/Local/SlopBar/slopbar-mcp.exe --statusline"
+  }
+}
+```
+
+### Renewal calendar and Monday digest
+
+**Settings → Subscriptions → Renewal calendar** keeps an iCalendar file (`Documents\SlopBar\renewals.ics` unless you pick another path) with an all-day event for each paid plan's next renewal, and a reminder three days ahead for plans that look unused or underused. Subscribe to the file from Outlook (**Add calendar → From file**) or import it into Google Calendar; with **Keep a renewal calendar** on, SlopBar rewrites it after each refresh, and each renewal keeps the same event ID across rewrites, so subscribed calendars update rather than duplicate it. **Export now** writes it once.
+
+The **Monday digest** (Settings → Notifications, on by default) is one notification on Monday mornings with what your paid plans cost per month, what you could save, the plans renewing that week, accounts that ran out in the past week and how many plans your usage needs. Clicking it opens Settings → Subscriptions.
 
 To install a local release build without quitting SlopBar by hand, run `scripts/install-local-build.ps1` after `cargo build --locked --release --features tauri/custom-protocol --manifest-path src-tauri/Cargo.toml`. It checks the build matches the clean checkout, moves the running executables into a rollback folder under `%LOCALAPPDATA%\SlopBar-Rollback`, copies the new ones in and restarts SlopBar through `restart_app`.
 

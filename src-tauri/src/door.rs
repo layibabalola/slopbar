@@ -81,6 +81,8 @@ pub enum Request {
     ListSharingLocations,
     /// Open the provider's billing page in the user's browser (fixed URL per provider).
     OpenBillingPage { provider: Provider },
+    /// Write the plan-renewal calendar (see `calendar`) to its path in settings now.
+    ExportCalendar,
     /// Quit as the tray's Quit does.
     QuitApp,
     /// Quit, then start the installed executable again (picking up a new build).
@@ -186,7 +188,13 @@ fn vet_export(result: Value, dir: Option<&Path>) -> Result<Value, String> {
 
 /// Sends `request` to the running app and returns its result.
 pub fn call(name: &str, request: &Request) -> Result<Value, String> {
-    let reply = request_raw(name, request)?;
+    call_within(name, request, CLIENT_TIMEOUT)
+}
+
+/// `call`, giving up after `limit` (connecting included): for callers that must stay quick, such
+/// as the status line.
+pub fn call_within(name: &str, request: &Request, limit: Duration) -> Result<Value, String> {
+    let reply = request_raw(name, request, limit)?;
     if let Some(error) = reply.error {
         return Err(error);
     }
@@ -423,7 +431,8 @@ mod imp {
     }
 
     /// Sends one request to the running app and waits (bounded) for its raw reply.
-    pub fn request_raw(name: &str, request: &Request) -> Result<Reply, String> {
+    pub fn request_raw(name: &str, request: &Request, limit: Duration) -> Result<Reply, String> {
+        let deadline = std::time::Instant::now() + limit;
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
         use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
@@ -434,7 +443,11 @@ mod imp {
                 Ok(pipe) => break pipe,
                 Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) && tries < 100 => {
                     tries += 1;
-                    std::thread::sleep(Duration::from_millis(100));
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return Err("timeout".into());
+                    }
+                    std::thread::sleep(left.min(Duration::from_millis(100)));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err("not_running".into()),
                 Err(_) => return Err("door_unavailable".into()),
@@ -454,7 +467,7 @@ mod imp {
             let result = std::io::BufReader::new((&pipe).take(MAX_REPLY)).read_until(b'\n', &mut answer).map(|_| answer);
             let _ = send.send(result);
         });
-        let answer = match receive.recv_timeout(CLIENT_TIMEOUT) {
+        let answer = match receive.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) => return Err("door_unavailable".into()),
             Err(_) => return Err("timeout".into()),
@@ -492,7 +505,7 @@ use imp::request_raw;
 pub use imp::serve;
 
 #[cfg(not(windows))]
-fn request_raw(_name: &str, _request: &Request) -> Result<Reply, String> {
+fn request_raw(_name: &str, _request: &Request, _limit: Duration) -> Result<Reply, String> {
     Err("unsupported_platform".into())
 }
 
@@ -563,7 +576,7 @@ mod tests {
 
     async fn blocking_call(name: &str, request: Request) -> Result<Reply, String> {
         let name = name.to_owned();
-        tokio::task::spawn_blocking(move || imp::request_raw(&name, &request)).await.unwrap()
+        tokio::task::spawn_blocking(move || imp::request_raw(&name, &request, CLIENT_TIMEOUT)).await.unwrap()
     }
 
     /// Serves a fake app: exports `file`, echoes every other operation, refuses removals.
