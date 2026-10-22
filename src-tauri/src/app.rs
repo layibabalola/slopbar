@@ -1997,6 +1997,22 @@ fn context() -> tauri::Context {
     context
 }
 
+/// Whether an exit request may end the app. Tauri asks with no code when its last window closes,
+/// which here only means the flyout was dismissed; an explicit exit (Quit, restart, update) carries one.
+fn exit_allowed(code: Option<i32>) -> bool {
+    code.is_some()
+}
+
+#[cfg(test)]
+mod exit_tests {
+    #[test]
+    fn closing_the_last_window_never_quits_but_an_explicit_exit_does() {
+        assert!(!super::exit_allowed(None), "dismissing the flyout must not quit SlopBar");
+        assert!(super::exit_allowed(Some(0)));
+        assert!(super::exit_allowed(Some(1)));
+    }
+}
+
 pub fn run() {
     migrate::run();
     let diagnostics = std::sync::Arc::new(diagnostics::Recorder::new(settings::app_dir().expect("config directory").join("diagnostics/history.bin")));
@@ -2196,6 +2212,15 @@ pub fn run() {
         .build(context())
         .expect("error while building slopbar")
         .run(|app, event| {
+            // The taskbar widget is native and every web window is built on demand, so closing
+            // the flyout can close the last Tauri window. Tauri then asks to exit (code None);
+            // SlopBar lives in the taskbar, so only an explicit exit (Quit, restart, update) ends it.
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = &event {
+                if !exit_allowed(*code) {
+                    api.prevent_exit();
+                }
+                return;
+            }
             // App::run exits the process directly: code after it cannot flush a journal.
             if matches!(event, tauri::RunEvent::Exit) {
                 // Other machines stop showing this one's accounts as in use.
