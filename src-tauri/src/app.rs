@@ -335,7 +335,10 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             let target = match window {
                 door::InspectTarget::Settings => inspect::Target::Settings,
                 door::InspectTarget::Flyout => inspect::Target::Flyout,
-                door::InspectTarget::Switcher => inspect::Target::Switcher,
+                door::InspectTarget::Switcher => {
+                    switcher_window(&app).await.ok_or("window not available")?;
+                    inspect::Target::Switcher
+                }
             };
             value(inspect::inspect(&app, target, page, screenshot).await?)
         }
@@ -715,27 +718,59 @@ async fn set_project_pin(app: AppHandle, folder: String, provider: Provider, id:
 // ---------------------------------------------------------------------------------------------
 // The quick switcher
 
-/// Shows the switcher in the middle of the screen, or hides it when it is open.
-pub(crate) fn toggle_switcher(app: &AppHandle) {
-    let Some(w) = app.get_webview_window(SWITCHER_LABEL) else { return };
-    if w.is_visible().unwrap_or(false) {
-        let _ = w.hide();
-        return;
+/// Like a launcher: clicking anywhere else hides it, and closing it (Alt+F4) only hides it, so
+/// the window lives as long as the app.
+fn watch_switcher(win: &tauri::WebviewWindow) {
+    #[cfg(windows)]
+    dock::exclude_from_peek(win);
+    let w = win.clone();
+    win.on_window_event(move |e| match e {
+        WindowEvent::Focused(false) => { let _ = w.hide(); }
+        WindowEvent::CloseRequested { api, .. } => {
+            api.prevent_close();
+            let _ = w.hide();
+        }
+        _ => {}
+    });
+}
+
+/// The switcher window, created again from its configuration if it is gone. Builds off the main
+/// thread: building a window there waits on the event loop the main thread runs.
+async fn switcher_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
+    if let Some(w) = app.get_webview_window(SWITCHER_LABEL) {
+        return Some(w);
     }
+    let config = app.config().app.windows.iter().find(|w| w.label == SWITCHER_LABEL)?.clone();
+    let h = app.clone();
+    let win = tauri::async_runtime::spawn_blocking(move || tauri::WebviewWindowBuilder::from_config(&h, &config).ok()?.build().ok())
+        .await.ok().flatten()?;
+    watch_switcher(&win);
+    Some(win)
+}
+
+fn show_switcher(app: &AppHandle, w: &tauri::WebviewWindow) {
     let _ = w.center();
     let _ = w.show();
     let _ = w.set_focus();
     let _ = app.emit_to(SWITCHER_LABEL, "switcher-open", ());
 }
 
+/// Shows the switcher in the middle of the screen, or hides it when it is open (the shortcut).
+pub(crate) fn toggle_switcher(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(w) = switcher_window(&app).await else { return };
+        if w.is_visible().unwrap_or(false) { let _ = w.hide(); } else { show_switcher(&app, &w); }
+    });
+}
+
 #[tauri::command]
-fn open_switcher(app: AppHandle) {
+async fn open_switcher(app: AppHandle) {
     if let Some(panel) = app.get_webview_window(panel::LABEL) {
         let _ = panel.hide();
     }
-    let visible = app.get_webview_window(SWITCHER_LABEL).is_some_and(|w| w.is_visible().unwrap_or(false));
-    if !visible {
-        toggle_switcher(&app);
+    if let Some(w) = switcher_window(&app).await {
+        if !w.is_visible().unwrap_or(false) { show_switcher(&app, &w); }
     }
 }
 
@@ -1301,15 +1336,7 @@ pub fn run() {
             }
 
             if let Some(win) = app.get_webview_window(SWITCHER_LABEL) {
-                #[cfg(windows)]
-                dock::exclude_from_peek(&win);
-                let w = win.clone();
-                // Like a launcher: clicking anywhere else closes it.
-                win.on_window_event(move |e| {
-                    if let WindowEvent::Focused(false) = e {
-                        let _ = w.hide();
-                    }
-                });
+                watch_switcher(&win);
             }
 
             apply_settings(handle);
