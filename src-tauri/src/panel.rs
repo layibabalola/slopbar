@@ -1,9 +1,10 @@
 //! The flyout: opens above the taskbar widget when it is clicked, like the flyouts of the
 //! built-in tray items (quick settings, calendar), and closes when it loses focus.
 //!
-//! It is built on the first click (`"create": false`, one of `app::ON_DEMAND`) and destroyed once
-//! it has stayed closed for `LINGER`, so with the native widget nothing keeps a WebView2 alive
-//! while only the widget shows; opening it again within `LINGER` is instant.
+//! A click must open it at once, like the shell's own flyouts. Building a WebView2 takes
+//! seconds, so the flyout is built hidden shortly after startup (`prepare`) and is only ever
+//! hidden, never destroyed. While hidden, its webview is asked to use as little memory as it can
+//! (WebView2's low memory target), which gives most of the footprint back without the wait.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -16,17 +17,54 @@ pub const LABEL: &str = "panel";
 const WIDTH: f64 = 380.0;
 /// Windows 11 flyouts keep 12 px from the taskbar and the screen edge.
 const MARGIN: f64 = 12.0;
-/// How long a closed flyout is kept for a quick reopen before its webview is released.
-const LINGER: Duration = Duration::from_secs(60);
 /// Longest wait for a new flyout's page to lay itself out before it is shown anyway.
 const FIRST_PAINT: Duration = Duration::from_millis(1500);
+/// How long after startup the hidden flyout is built, so it does not compete with the first
+/// refresh and the widget's first paint.
+const PREPARE_AFTER: Duration = Duration::from_secs(2);
 
 /// The page has reported its height since the window was built (see `page_ready`).
 static READY: AtomicBool = AtomicBool::new(false);
+/// A click arrived while the flyout was still being built: show it once it is.
+static SHOW_WHEN_BUILT: AtomicBool = AtomicBool::new(false);
+/// The flyout is being built (by `prepare` or a click), so a second build is not started.
+static BUILDING: AtomicBool = AtomicBool::new(false);
 
 /// The flyout's page has laid itself out (it reports its height through `set_panel_height`).
 pub fn page_ready() {
     READY.store(true, Ordering::Release);
+}
+
+/// Builds the flyout hidden, so the first click opens it at once.
+pub fn prepare(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(PREPARE_AFTER).await;
+        build(&app).await;
+    });
+}
+
+/// Builds the flyout if it is not there, then shows it if a click asked for it meanwhile, or
+/// otherwise leaves it hidden with its memory trimmed.
+async fn build(app: &AppHandle) {
+    if app.get_webview_window(LABEL).is_some() || BUILDING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    READY.store(false, Ordering::Release);
+    let built = crate::app::on_demand_window(app, LABEL).await;
+    if built.is_some() {
+        let started = Instant::now();
+        while !READY.load(Ordering::Acquire) && started.elapsed() < FIRST_PAINT {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    BUILDING.store(false, Ordering::Release);
+    let Some(win) = built else { return };
+    if SHOW_WHEN_BUILT.swap(false, Ordering::AcqRel) {
+        show(app);
+    } else if !win.is_visible().unwrap_or(false) {
+        set_low_memory(&win, true);
+    }
 }
 
 /// Set up a newly built flyout window: rounded, kept visible under Aero Peek, closed on blur.
@@ -79,21 +117,17 @@ pub fn place(app: &AppHandle) {
 
 pub fn toggle(app: &AppHandle) {
     let Some(win) = app.get_webview_window(LABEL) else {
-        // Not built yet (or released): build it, and show it once its page has laid out.
-        READY.store(false, Ordering::Release);
+        // Not built yet (a click within moments of startup, or the webview went away): build it
+        // and show it once its page has laid out.
+        SHOW_WHEN_BUILT.store(true, Ordering::Release);
         let app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            if crate::app::on_demand_window(&app, LABEL).await.is_none() {
-                return;
-            }
-            let started = Instant::now();
-            while !READY.load(Ordering::Acquire) && started.elapsed() < FIRST_PAINT {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            show(&app);
-        });
+        tauri::async_runtime::spawn(async move { build(&app).await });
         return;
     };
+    if BUILDING.load(Ordering::Acquire) {
+        SHOW_WHEN_BUILT.store(true, Ordering::Release);
+        return;
+    }
     if win.is_visible().unwrap_or(false) {
         hide(app);
         return;
@@ -113,6 +147,7 @@ pub fn toggle(app: &AppHandle) {
 
 fn show(app: &AppHandle) {
     let Some(win) = app.get_webview_window(LABEL) else { return };
+    set_low_memory(&win, false);
     // Flyouts follow the taskbar's theme ("Windows mode"), not the apps' one.
     let theme = if crate::dock::taskbar_is_light() { Theme::Light } else { Theme::Dark };
     let _ = win.set_theme(Some(theme));
@@ -125,21 +160,10 @@ fn show(app: &AppHandle) {
 fn hide(app: &AppHandle) {
     if let Some(win) = app.get_webview_window(LABEL) {
         let _ = win.hide();
+        set_low_memory(&win, true);
     }
     *app.state::<AppState>().panel_hidden_at.lock().unwrap() = Some(Instant::now());
     let _ = app.emit("panel-visible", false);
-    // Released unless it is opened again in the meantime.
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(LINGER).await;
-        let state = app.state::<AppState>();
-        let quiet = state.panel_hidden_at.lock().unwrap().is_some_and(|t| t.elapsed() >= LINGER);
-        if let Some(win) = app.get_webview_window(LABEL) {
-            if quiet && !win.is_visible().unwrap_or(true) {
-                let _ = win.destroy();
-            }
-        }
-    });
 }
 
 /// Esc in the flyout, like the shell's own flyouts.
@@ -150,6 +174,27 @@ pub fn close(app: &AppHandle) {
 pub fn on_blur(app: &AppHandle) {
     hide(app);
 }
+
+/// Asks the flyout's webview to trim its memory while hidden (WebView2's low memory target),
+/// and to use it normally again before it shows. Older WebView2 runtimes ignore it.
+#[cfg(windows)]
+fn set_low_memory(win: &tauri::WebviewWindow, low: bool) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
+    };
+    use windows::core::Interface;
+    let level = if low { COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW } else { COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL };
+    let _ = win.with_webview(move |w| unsafe {
+        if let Ok(core) = w.controller().CoreWebView2() {
+            if let Ok(core) = core.cast::<ICoreWebView2_19>() {
+                let _ = core.SetMemoryUsageTargetLevel(level);
+            }
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn set_low_memory(_win: &tauri::WebviewWindow, _low: bool) {}
 
 /// Rounded corners like every Windows 11 flyout (undecorated windows are square by default).
 #[cfg(windows)]
