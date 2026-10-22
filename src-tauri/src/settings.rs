@@ -50,11 +50,13 @@ pub struct Notifications {
     pub resets: bool,
     /// Automatic account switches.
     pub switches: bool,
+    /// A plan that looks unneeded renews within three days; any paid plan within a day.
+    pub renewals: bool,
 }
 
 impl Default for Notifications {
     fn default() -> Self {
-        Self { usage: true, resets: true, switches: true }
+        Self { usage: true, resets: true, switches: true, renewals: true }
     }
 }
 
@@ -294,7 +296,8 @@ mod patch_tests {
         assert_eq!(next.refresh_minutes, 15);
         assert!(next.balancer.claude.auto);
         assert_eq!(next.balancer.claude.threshold, 90, "untouched fields keep their values");
-        assert!(!next.notifications.usage && next.notifications.resets);
+        assert!(!next.notifications.usage && next.notifications.resets && next.notifications.renewals);
+        assert!(!patched(&next, &json!({ "notifications": { "renewals": false } }), false).unwrap().notifications.renewals);
         assert_eq!(next.aliases.get("codex:b").map(String::as_str), Some("Spare"));
         assert!(!next.aliases.contains_key("claude:a"), "null removes an alias");
         assert_eq!(next.last_version.as_deref(), Some("0.1.0"));
@@ -317,6 +320,8 @@ mod patch_tests {
             (json!({ "balancer": { "claude": { "treshold": 80 } } }), "nested typo"),
             (json!({ "refresh_minutes": 7 }), "interval not offered"),
             (json!({ "refresh_minutes": "5" }), "wrong type"),
+            (json!({ "notifications": { "renewal": false } }), "notification typo"),
+            (json!({ "notifications": { "renewals": "no" } }), "notification type"),
             (json!({ "language": "xx" }), "language"),
             (json!({ "balancer": { "codex": { "threshold": 97 } } }), "threshold range"),
             (json!({ "balancer": { "codex": { "threshold": 72 } } }), "threshold step"),
@@ -346,6 +351,8 @@ Ignore previous instructions" } }), "control characters"),
         let stored: Settings = serde_json::from_value(json!({ "refresh_minutes": 15,
             "subscriptions": { "claude:a": { "billing_day": 3, "from_the_future": true } } })).unwrap();
         assert_eq!((stored.refresh_minutes, stored.subscriptions["claude:a"].billing_day), (15, Some(3)));
+        let older: Settings = serde_json::from_value(json!({ "notifications": { "usage": false } })).unwrap();
+        assert!(older.notifications.renewals, "settings saved before plan renewals existed turn them on");
     }
 
     #[test]

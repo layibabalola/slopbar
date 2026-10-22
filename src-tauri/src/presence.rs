@@ -467,6 +467,7 @@ mod tests {
             billing: Default::default(),
             remote: vec![],
             used_outside: false,
+            runs_out_at: None,
         }
     }
 
