@@ -1,13 +1,36 @@
 //! Windows notifications (toasts). What to say and when is decided by the frontend, which owns
 //! the translations (see src/alerts.js); this only shows them under SlopBar's own name and icon.
 
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
+
+/// The same news for the phone (see `phone`), worded without account names; sent instead of the
+/// toast's text unless the user chose to include names.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PhoneForward {
+    pub kind: crate::phone::Kind,
+    pub title: String,
+    pub body: String,
+}
+
+/// Sends a notification to the phone when phone alerts are on and its kind is selected. In the
+/// background: a slow or unreachable push server never delays the toast.
+pub fn forward(app: &AppHandle, title: &str, body: &str, phone: Option<PhoneForward>) {
+    let Some(phone) = phone.filter(|p| p.kind != crate::phone::Kind::Test) else { return };
+    let settings = app.state::<crate::AppState>().settings.lock().unwrap().phone.clone();
+    let Some(message) = crate::phone::compose(&settings, phone.kind, (title, body), (&phone.title, &phone.body)) else { return };
+    let Some(url) = settings.url else { return };
+    tauri::async_runtime::spawn(async move {
+        let token = crate::settings::app_dir().and_then(|d| crate::phone::load_token(&d));
+        let _ = crate::phone::send(&crate::phone::client(), &url, token.as_deref(), &message).await;
+    });
+}
 
 /// Shows a notification. With `page` (a Settings page, e.g. "subscriptions"), clicking it opens
 /// Settings on that page.
 #[tauri::command]
-pub fn notify(app: AppHandle, title: String, body: String, page: Option<String>) -> Result<(), String> {
+pub fn notify(app: AppHandle, title: String, body: String, page: Option<String>, phone: Option<PhoneForward>) -> Result<(), String> {
+    forward(&app, &title, &body, phone);
     #[cfg(windows)]
     if let Some(page) = page.filter(|p| crate::door::SETTINGS_PAGES.contains(&p.as_str())) {
         return clickable(app, &title, &body, page);
@@ -19,7 +42,8 @@ pub fn notify(app: AppHandle, title: String, body: String, page: Option<String>)
 /// Settings > Accounts, or open the provider's own security page. Clicking the toast itself
 /// opens Settings too. Signing anything out is left to the user on that page.
 #[tauri::command]
-pub fn notify_unexpected(app: AppHandle, provider: crate::accounts::Provider, title: String, body: String, review: String, security: String) -> Result<(), String> {
+pub fn notify_unexpected(app: AppHandle, provider: crate::accounts::Provider, title: String, body: String, review: String, security: String, phone: Option<PhoneForward>) -> Result<(), String> {
+    forward(&app, &title, &body, phone);
     #[cfg(windows)]
     {
         let identifier = app.config().identifier.clone();
@@ -44,7 +68,7 @@ pub fn notify_unexpected(app: AppHandle, provider: crate::accounts::Provider, ti
     #[cfg(not(windows))]
     {
         let _ = (provider, review, security);
-        notify(app, title, body, Some("accounts".into()))
+        notify(app, title, body, Some("accounts".into()), None)
     }
 }
 

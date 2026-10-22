@@ -19,7 +19,19 @@ const save = () => { try { localStorage.setItem(STORE, JSON.stringify(state)); }
 
 const milestone = (p) => MILESTONES.filter((m) => p >= m).pop() ?? 0;
 const accountName = (a) => a.alias || a.email || t("unknownAccount");
-const notify = (title, body, page = null) => invoke("notify", { title, body, page }).catch(() => {});
+const notify = (title, body, page = null, phone = null) => invoke("notify", { title, body, page, phone }).catch(() => {});
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The same news for the phone, naming only the provider (see Settings > Notifications > Phone):
+ * the app sends it, or the toast's own text when the user chose to include account names, and
+ * only for the kinds they selected. Kinds: renewal, unexpected_use, runaway, limit_reached.
+ */
+export function phoneForward(kind, provider) {
+  const name = PROVIDER_NAME[provider] ?? provider;
+  const key = { renewal: "Renew", unexpected_use: "Unexpected", runaway: "Runaway", limit_reached: "Limit" }[kind];
+  return { kind, title: t(`p${key}Title`, { provider: name }), body: t(`p${key}Body`, { provider: name }) };
+}
 
 function newWindow(before, w) {
   if (!before.resets_at) return false;
@@ -45,7 +57,7 @@ export function checkUsage(snap, prefs) {
         }
       } else if (prefs.usage && now > before.milestone) {
         const usable = a.resets?.some((r) => r.usable && r.count > 0);
-        if (now >= 100) notify(t("nLimitTitle", { provider }), [details, usable ? t("nLimitHasReset") : ""].filter(Boolean).join("\n"));
+        if (now >= 100) notify(t("nLimitTitle", { provider }), [details, usable ? t("nLimitHasReset") : ""].filter(Boolean).join("\n"), null, phoneForward("limit_reached", a.provider));
         else notify(t("nUsageTitle", { provider, p: now }), details);
       }
     }
@@ -59,6 +71,7 @@ export function checkUsage(snap, prefs) {
         invoke("notify_unexpected", {
           provider: a.provider, title: t("nUnexpectedTitle", { provider: PROVIDER_NAME[a.provider] }),
           body: t("nUnexpectedBody", { account: accountName(a) }), review: t("nUnexpectedReview"), security: t("nUnexpectedSecurity"),
+          phone: phoneForward("unexpected_use", a.provider),
         }).catch(() => {});
       }
     }
@@ -103,7 +116,10 @@ export async function checkPlans() {
     }
     const body = [accountName(a), a.kind === "renewal_wasteful" && a.verdict ? t(`subVerdict_${a.verdict}`) : "",
       a.monthly_cost != null ? t("perMonth", { v: money(a.monthly_cost) }) : ""].filter(Boolean).join(" · ");
-    notify(t("nRenewTitle", { provider, t: until(a.at) }), a.kind === "renewal_wasteful" ? `${body}\n${t("nRenewWasteHint")}` : body, "subscriptions");
+    // Only a renewal within a day goes to the phone.
+    const tomorrow = new Date(a.at) - Date.now() <= DAY_MS + 60 * 60 * 1000;
+    notify(t("nRenewTitle", { provider, t: until(a.at) }), a.kind === "renewal_wasteful" ? `${body}\n${t("nRenewWasteHint")}` : body, "subscriptions",
+      tomorrow ? phoneForward("renewal", a.provider) : null);
   }
 }
 

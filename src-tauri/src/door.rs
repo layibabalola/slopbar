@@ -55,6 +55,20 @@ pub enum Request {
         #[serde(default)]
         folder: Option<String>,
     },
+    /// Settings, usage history and the spend ledger in one file encrypted with the user's
+    /// passphrase (see `backup`). No sign-ins.
+    ExportBackup {
+        #[serde(default)]
+        path: Option<String>,
+        passphrase: crate::backup::Passphrase,
+    },
+    /// Merge a backup file in; with `dry_run` (the default) only says what would change.
+    RestoreBackup {
+        path: String,
+        passphrase: crate::backup::Passphrase,
+        #[serde(default = "yes")]
+        dry_run: bool,
+    },
     /// An RFC 7386 merge patch over the current settings (see `settings::patched`).
     UpdateSettings { patch: Value },
     /// Used share, reset, pace and forecast per window for one account (or each provider's account
@@ -602,6 +616,9 @@ mod vet_tests {
         assert!(parse(r#"{"op":"switch_account","provider":"gemini","id":"x"}"#).is_err());
         assert!(parse(r#"{"op":"remove_account","provider":"claude","id":"x","force":true}"#).is_err());
         assert!(parse(r#"{"op":"read_vault"}"#).is_err());
+        assert!(matches!(parse(r#"{"op":"restore_backup","path":"C:\\b.slopbar-backup","passphrase":"correct horse"}"#), Ok(Request::RestoreBackup { dry_run: true, .. })), "restoring previews by default");
+        let export = parse(r#"{"op":"export_backup","passphrase":"correct horse"}"#).unwrap();
+        assert!(!format!("{export:?}").contains("correct horse"), "a passphrase never reaches debug output");
     }
 }
 

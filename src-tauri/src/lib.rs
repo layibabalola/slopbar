@@ -14,6 +14,8 @@ mod headroom;
 mod plan_alerts;
 mod advisor;
 mod ledger;
+mod backup;
+mod phone;
 mod codex_local;
 mod active_log;
 mod usage_index;
