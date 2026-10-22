@@ -122,6 +122,26 @@ impl Monitor {
         self.path(slot).is_file()
     }
 
+    /// Whether each connected account's session needs reconnecting and when the provider says its
+    /// refresh token runs out, keyed like `key`. Reads what is in memory, else the saved session;
+    /// never refreshes or contacts anything.
+    pub async fn health(&self, accounts: &[(Provider, String)]) -> HashMap<String, crate::health::MonitorState> {
+        let sessions = self.sessions.lock().await;
+        let mut found = HashMap::new();
+        for (provider, id) in accounts {
+            let slot = Slot { id: id.clone(), provider: *provider, email: None, plan: None, org: None, data: Value::Null };
+            let key = key(&slot);
+            let session = match sessions.get(&key) {
+                Some(state) => Some(state.session.clone()),
+                None => private_store::load_secret(&self.path(&slot)).ok().and_then(|b| serde_json::from_slice::<Session>(&b).ok()),
+            };
+            if let Some(s) = session.filter(|s| s.provider == *provider && s.id == *id) {
+                found.insert(key, crate::health::MonitorState { reconnect: s.reconnect, refresh_expires_at: s.refresh_expires_at });
+            }
+        }
+        found
+    }
+
     /// Cleanup must not revoke any login we own. An unreadable store disables
     /// cleanup revocation instead of assuming its tokens are unprotected.
     pub async fn protected_tokens(&self, slots: &[Slot]) -> Option<crate::login::ProtectedTokens> {

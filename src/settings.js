@@ -307,6 +307,28 @@ function adviceText(e) {
   return "";
 }
 
+const amount = (v) => Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+// What the plan costs for the use it gets: "$0.92 per 1% of the weekly limit used · $12.50 per thread (this PC only)".
+function costPerUseText(e) {
+  const c = e.cost_per_use;
+  if (!c) return "";
+  const parts = [];
+  if (c.per_percent != null) parts.push(t("subPerPercent", { v: money(c.per_percent) }));
+  if (c.per_local_thread != null) parts.push(t("subPerThread", { v: money(c.per_local_thread) }));
+  return parts.join(" · ");
+}
+
+// Purchased Codex credits, never priced: OpenAI does not publish one credit price.
+function creditsLine(c) {
+  if (!c) return "";
+  if (c.unlimited) return t("subCreditsUnlimited");
+  const parts = [];
+  if (c.balance != null) parts.push(t("subCredits", { v: amount(c.balance) }));
+  if (c.spent && c.since) parts.push(t("subCreditsSpent", { n: amount(c.spent), d: shortDate(c.since) }));
+  return parts.join(" · ");
+}
+
 function subscriptionRow(e) {
   const key = `${e.provider}:${e.id}`;
   const prefs = settings.subscriptions?.[key] ?? {};
@@ -321,6 +343,8 @@ function subscriptionRow(e) {
     ? t("subProviderStale", { d: shortDate(e.provider_until) }) : "";
   const advice = adviceText(e);
   const local = localText(e);
+  const perUse = costPerUseText(e);
+  const credits = creditsLine(e.credits);
   // Anything resting on this PC's history says what it cannot see.
   const caveat = e.local && (a.basis === "local_codex" || a.verdict === "insufficient_data") ? t("subLocalCaveat") : "";
   return `
@@ -342,7 +366,10 @@ function subscriptionRow(e) {
       <div class="monitor-state">
         <small>${esc(weekText)}${e.stale ? ` · ${t("lastReading")}` : ""}${week?.runs_out_at ? ` · <b class="runs-out">${esc(t("runsOut", { at: dayTime(week.runs_out_at) }))}</b>` : ""}</small>
         ${local ? `<small>${esc(local)}</small>` : ""}
+        ${perUse ? `<small>${esc(perUse)}</small>` : ""}
+        ${credits ? `<small>${esc(credits)}</small>` : ""}
         ${e.idle_now ? `<small>${t("subIdleNow")}</small>` : ""}
+        ${e.allowance_change?.would_hit_limit ? `<small class="advice">${esc(t("subProCut", { d: shortDate(`${e.allowance_change.last_day}T12:00:00`), p: Math.round(e.allowance_change.peak_percent), q: Math.round(e.allowance_change.projected_percent) }))}</small>` : ""}
         ${verdictLines(e).map((l) => `<small>${esc(l)}</small>`).join("")}
         ${providerDate ? `<small>${esc(providerDate)}</small>` : ""}
         ${kindNote ? `<small>${esc(kindNote)}</small>` : ""}
@@ -370,11 +397,32 @@ function providerSummary(p, s) {
   return parts.join(" · ");
 }
 
+// Pool sizing: how many plans the provider's usage needs, against how many are held.
+function poolText(s) {
+  const p = s?.pool;
+  if (!s?.paid || !p || !p.plans_held) return "";
+  const parts = [];
+  if (p.plans_needed == null) parts.push(t("subPoolInsufficient", { n: p.weeks_used, needed: p.weeks_needed }));
+  else {
+    parts.push(t("subPool", { n: p.plans_needed, unit: p.unit, spare: pct(p.spare_percent ?? 0), held: amount(p.plans_held) }));
+    parts.push(t("subPoolBasis", { n: p.weeks_used }) + (p.confidence === "low" ? ` (${t("subPoolEstimate")})` : ""));
+    if (p.basis === "local_codex") parts.push(t("subPoolLocal"));
+  }
+  if (p.unweighted) parts.push(t("subPoolUnweighted", { n: p.unweighted }));
+  const c = s.cost_per_use;
+  if (c?.per_plan_percent != null) parts.push(t("subBlendedPercent", { v: money(c.per_plan_percent), unit: p.unit }));
+  if (c?.per_local_thread != null) parts.push(t("subPerThread", { v: money(c.per_local_thread) }));
+  if (s.credit_balance != null) parts.push(t("subCredits", { v: amount(s.credit_balance) }));
+  return parts.join(" · ");
+}
+
 function renderSubscriptions() {
   if (!report || !settings) return;
   patch($("subscriptions"), PROVIDERS.filter(([p]) => settings.providers[p]).map(([p, name]) => {
     const list = report.accounts.filter((e) => e.provider === p);
-    const summary = providerSummary(p, report.providers.find((s) => s.provider === p));
+    const totals = report.providers.find((s) => s.provider === p);
+    const summary = providerSummary(p, totals);
+    const pool = poolText(totals);
     const since = list.find((e) => e.local)?.local.attributed_since;
     return `
       <div class="provider">
@@ -382,6 +430,7 @@ function renderSubscriptions() {
           <span class="logo ${p}">${MARK[p]}</span><h3>${name}</h3>
           ${summary ? `<small class="sub-summary">${esc(summary)}</small>` : ""}
         </div>
+        ${pool ? `<p class="hint sub-pool">${esc(pool)}</p>` : ""}
         <div class="group">
           ${list.length ? list.map(subscriptionRow).join("") : `<div class="empty">${t("noAccounts")}</div>`}
         </div>
@@ -458,6 +507,7 @@ async function render() {
   $("auto-update").checked = updatesEnabled && settings.auto_update;
   $("auto-update").disabled = !updatesEnabled;
   for (const kind of NOTIFY_KINDS) $(`notify-${kind}`).checked = settings.notifications[kind];
+  $("crash-records").checked = settings.crash_records;
   renderPresence();
   const version = await invoke("app_version");
   $("version").textContent = /^\d/.test(version) ? `v${version}` : version;
@@ -492,6 +542,69 @@ $("export-diagnostics").addEventListener("click", async () => {
   } catch { status.textContent = t("diagnosticsFailed"); }
   finally { button.disabled = false; }
 });
+$("crash-records").addEventListener("change", (e) => update({ crash_records: e.target.checked }));
+
+// ---------------------------------------------------------------------------------------------
+// Health: the backend's self-check (health.rs) with each check's fix wired to the matching action.
+
+let health = null;
+const FIX_PAGES = { data: "sData", notifications: "sNotifications", general: "sGeneral" };
+
+function fixButton(fix, i) {
+  if (!fix) return "";
+  const label = {
+    connect_monitoring: () => t("monitorConnect"),
+    refresh: () => t("healthFixRefresh"),
+    restart_app: () => t("healthFixRestart"),
+    open_settings: () => `${t("healthFixOpen")} ${t(FIX_PAGES[fix.page] ?? "settings")}`,
+  }[fix.action]?.();
+  return label ? `<button class="btn" data-fix="${i}">${esc(label)}</button>` : "";
+}
+
+function renderHealth() {
+  if (!health) return;
+  $("health").innerHTML = health.checks.map((c, i) => `
+    <div class="row health-check" data-key="${esc(c.id)}">
+      <div class="title"><label><span class="health-dot ${c.status}"></span>${esc(c.title)}</label><small>${esc(c.reason)}</small></div>
+      ${c.status === "ok" ? "" : fixButton(c.fix, i)}
+    </div>`).join("");
+  const badge = $("health-nav-badge");
+  badge.hidden = !health.problems;
+  badge.textContent = String(health.problems);
+}
+
+async function loadHealth() {
+  try { health = await invoke("get_health"); } catch { return; }
+  renderHealth();
+}
+
+$("health").addEventListener("click", async (e) => {
+  const button = e.target.closest("[data-fix]");
+  const fix = button && health?.checks[Number(button.dataset.fix)]?.fix;
+  if (!fix) return;
+  const status = $("health-status");
+  button.disabled = true;
+  try {
+    if (fix.action === "connect_monitoring") {
+      await invoke("connect_monitoring", { provider: fix.provider, id: fix.id });
+      status.textContent = t("monitorPending"); status.hidden = false;
+    } else if (fix.action === "refresh") {
+      snapshot = await invoke("refresh");
+      renderAccounts();
+    } else if (fix.action === "restart_app") {
+      status.textContent = t("healthRestarting"); status.hidden = false;
+      await invoke("restart_app");
+    } else if (fix.action === "open_settings") {
+      document.querySelector(`.nav[data-page="${fix.page}"]`)?.click();
+    }
+  } catch (err) { status.textContent = errorText("", String(err)); status.hidden = false; }
+  finally { button.disabled = false; }
+  loadHealth();
+});
+listen("usage-updated", loadHealth);
+listen("monitoring-login", loadHealth);
+document.querySelector('.nav[data-page="health"]').addEventListener("click", loadHealth);
+
 // Sharing in-use status: off, a detected sync folder (OneDrive, Dropbox, Google Drive…), an rclone
 // remote (any cloud, no sync app needed) or a typed folder.
 let syncFolders = [];
@@ -598,6 +711,7 @@ updatesEnabled = await invoke("updates_enabled");
 snapshot = await invoke("get_usage");
 await render();
 await loadSubscriptions();
+await loadHealth();
 let page = "accounts";
 try { page = localStorage.getItem("settings-page") || page; } catch {}
 showPage(page);

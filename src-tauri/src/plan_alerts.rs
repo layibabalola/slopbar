@@ -1,5 +1,6 @@
 //! Which plan notifications are due: renewals of plans that look unneeded, any paid plan renewing
-//! within a day, and the account in use running out of its week before it resets. Each is shown
+//! within a day, the account in use running out of its week before it resets, and Codex Pro 200
+//! accounts whose use would not fit the plan's smaller allowance after the cut. Each is shown
 //! once (per account and renewal date, or per weekly window), remembered across restarts in a small
 //! file. What the notification says is up to the frontend, which owns the translations.
 
@@ -36,6 +37,9 @@ pub enum Kind {
     RenewalSoon,
     /// The account in use reaches its weekly limit within a few hours, before the reset.
     RunsOut,
+    /// Codex Pro 200 accounts that would reach the limit under the allowance after the cut, named
+    /// together in `accounts`. Once, before the cut.
+    ProAllowanceCut,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,6 +57,9 @@ pub struct Alert {
     pub monthly_cost: Option<f64>,
     /// When the weekly window that runs out resets.
     pub resets_at: Option<DateTime<Utc>>,
+    /// Every account the notification is about, by alias or email, when there are several.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<String>,
 }
 
 pub fn load() -> Sent {
@@ -97,7 +104,17 @@ pub fn due(report: &Report, snapshot: &Snapshot, prefs: &Notifications, sent: &m
                 _ => continue,
             };
             out.push(Alert { kind, provider: e.provider, id: e.id.clone(), email: e.email.clone(), alias: e.alias.clone(),
-                at: renewal.at, source: Some(renewal.source), verdict: Some(e.assessment.verdict), monthly_cost: e.monthly_cost, resets_at: None });
+                at: renewal.at, source: Some(renewal.source), verdict: Some(e.assessment.verdict), monthly_cost: e.monthly_cost, resets_at: None, accounts: vec![] });
+        }
+        let cut: Vec<&crate::subscriptions::Entry> = report.accounts.iter()
+            .filter(|e| e.allowance_change.as_ref().is_some_and(|c| c.would_hit_limit) && e.ends_at.is_none()).collect();
+        if let (Some(first), Some(change)) = (cut.first(), cut.first().and_then(|e| e.allowance_change.as_ref())) {
+            if mark(format!("pro_allowance_cut:{}", change.last_day), sent) {
+                let at = change.last_day.and_hms_opt(23, 59, 59).map(|d| d.and_utc()).unwrap_or(now);
+                out.push(Alert { kind: Kind::ProAllowanceCut, provider: first.provider, id: first.id.clone(), email: first.email.clone(), alias: first.alias.clone(),
+                    at, source: None, verdict: None, monthly_cost: None, resets_at: None,
+                    accounts: cut.iter().map(|e| e.alias.clone().or_else(|| e.email.clone()).unwrap_or_else(|| e.id.clone())).collect() });
+            }
         }
     }
     if prefs.usage {
@@ -107,7 +124,7 @@ pub fn due(report: &Report, snapshot: &Snapshot, prefs: &Notifications, sent: &m
             // Once per weekly window: its reset, to the hour, absorbs jitter between readings.
             if !mark(format!("runs_out:{}:{}:{}", a.provider.name(), a.id, resets_at.timestamp() / 3600), sent) { continue; }
             out.push(Alert { kind: Kind::RunsOut, provider: a.provider, id: a.id.clone(), email: a.email.clone(), alias: a.alias.clone(),
-                at, source: None, verdict: None, monthly_cost: None, resets_at: Some(resets_at) });
+                at, source: None, verdict: None, monthly_cost: None, resets_at: Some(resets_at), accounts: vec![] });
         }
     }
     out
@@ -160,9 +177,11 @@ mod tests {
         World { snapshot: Snapshot { accounts, updated_at: Some(now) }, history, settings }
     }
 
+    /// The renewal and runs-out notifications due; the Pro 200 one has its own test.
     fn run(w: &World, sent: &mut Sent, now: DateTime<Utc>) -> Vec<(Kind, String)> {
         let r = report(&w.snapshot, &w.history, &w.settings, None, now);
-        due(&r, &w.snapshot, &w.settings.notifications, sent, now).into_iter().map(|a| (a.kind, a.id)).collect()
+        due(&r, &w.snapshot, &w.settings.notifications, sent, now).into_iter()
+            .filter(|a| a.kind != Kind::ProAllowanceCut).map(|a| (a.kind, a.id)).collect()
     }
 
     #[test]
@@ -238,5 +257,53 @@ mod tests {
         w.settings.notifications.usage = false;
         w.snapshot.accounts[1].windows[0].resets_at = Some(now + Duration::days(9));
         assert!(run(&w, &mut sent, now).is_empty(), "usage alerts off");
+    }
+
+    #[test]
+    fn pro_200_accounts_that_would_not_fit_half_the_allowance_are_named_once_before_the_cut() {
+        let now = at("2026-10-21T12:00:00Z");
+        let mut w = world(now);
+        w.settings.subscriptions.clear();
+        // Peaks of 0 and 80 in recent weeks; "gone" is cancelled. Add a Pro 200 at 50% this week
+        // (exactly the new limit), one at 40%, a Pro 100 at 90% and an aliased Pro 200 at 70%.
+        for (id, plan, used) in [("half", "pro", 50.0), ("light", "pro", 40.0), ("lite", "prolite", 90.0), ("named", "pro", 70.0)] {
+            let mut a = account(id, used, now + Duration::days(3));
+            a.plan = Some(plan.into());
+            a.fetched_at = Some(now);
+            w.snapshot.accounts.push(a);
+        }
+        w.snapshot.accounts[6].alias = Some("Spare".into());
+        let r = report(&w.snapshot, &w.history, &w.settings, None, now);
+        let change = |id: &str| r.accounts.iter().find(|e| e.id == id).unwrap().allowance_change.clone();
+        let busy = change("busy").unwrap();
+        assert_eq!((busy.peak_percent, busy.projected_percent, busy.would_hit_limit), (80.0, 160.0, true));
+        assert_eq!(busy.last_day.to_string(), "2026-10-29");
+        assert!(change("half").unwrap().would_hit_limit, "50% of the old allowance is all of the new one");
+        assert!(!change("light").unwrap().would_hit_limit);
+        assert!(!change("idle").unwrap().would_hit_limit);
+        assert!(change("lite").is_none(), "only Pro 200 changes");
+        let mut sent = Sent::default();
+        let alerts = due(&r, &w.snapshot, &w.settings.notifications, &mut sent, now);
+        let cut: Vec<&Alert> = alerts.iter().filter(|a| a.kind == Kind::ProAllowanceCut).collect();
+        assert_eq!(cut.len(), 1);
+        assert_eq!(cut[0].accounts, ["busy@example.invalid", "half@example.invalid", "Spare"]);
+        assert!(serde_json::to_string(cut[0]).unwrap().contains("pro_allowance_cut"));
+        // Once only, however often the widget asks.
+        assert!(due(&r, &w.snapshot, &w.settings.notifications, &mut sent, now + Duration::days(2)).iter().all(|a| a.kind != Kind::ProAllowanceCut));
+        // The last day still warns; the day after, nothing does and the report drops the note.
+        let last = at("2026-10-29T20:00:00Z");
+        let r = report(&w.snapshot, &w.history, &w.settings, None, last);
+        assert!(r.accounts.iter().find(|e| e.id == "busy").unwrap().allowance_change.is_some());
+        assert_eq!(due(&r, &w.snapshot, &w.settings.notifications, &mut Sent::default(), last).iter().filter(|a| a.kind == Kind::ProAllowanceCut).count(), 1);
+        let after = at("2026-10-30T00:30:00Z");
+        let r = report(&w.snapshot, &w.history, &w.settings, None, after);
+        assert!(r.accounts.iter().all(|e| e.allowance_change.is_none()));
+        assert!(due(&r, &w.snapshot, &w.settings.notifications, &mut Sent::default(), after).iter().all(|a| a.kind != Kind::ProAllowanceCut));
+        // Plan notifications off: not shown, and still pending.
+        w.settings.notifications.renewals = false;
+        let r = report(&w.snapshot, &w.history, &w.settings, None, now);
+        let mut fresh = Sent::default();
+        assert!(due(&r, &w.snapshot, &w.settings.notifications, &mut fresh, now).is_empty());
+        assert!(fresh.sent.is_empty());
     }
 }

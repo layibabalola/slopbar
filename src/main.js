@@ -258,6 +258,19 @@ listen("usage-updated", (e) => render(e.payload));
 invoke("get_usage").then(render);
 setInterval(() => invoke("get_usage").then(render), 60_000);
 
+// A warning sign in the flyout's header while any self-check (Settings > Health) has a problem.
+const $health = document.getElementById("health-badge");
+async function checkHealth() {
+  if (IS_DOCK) return;
+  const report = await invoke("get_health").catch(() => null);
+  $health.hidden = !report?.problems;
+  if (report?.problems) $health.title = t("healthIssues", { n: report.problems });
+}
+$health.addEventListener("click", () => invoke("open_settings", { page: "health" }));
+listen("usage-updated", checkHealth);
+listen("monitoring-login", checkHealth);
+checkHealth();
+
 // Replay the flyout's entrance each time it opens.
 if (!IS_DOCK) {
   window.addEventListener("focus", () => {

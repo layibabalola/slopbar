@@ -1,6 +1,10 @@
 //! Capacity for agents: how long each account's limits last at the pace it is being used, and
 //! which account suits a job of a given size. Everything here works from the last snapshot and
 //! a short in-memory trail of recent readings; nothing reaches a provider.
+//!
+//! This is SlopBar's one usage forecast: `headroom` for get_headroom, `runs_out_at` for
+//! get_usage, the subscription report and the runs-out notification, and `recommend` for
+//! recommend_account and automatic switching.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -8,7 +12,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
 use crate::accounts::Provider;
-use crate::model::{AccountUsage, UsageWindow};
+use crate::model::{AccountUsage, Snapshot, UsageWindow};
 use crate::settings::Settings;
 
 /// Readings older than this say nothing about the current pace.
@@ -186,6 +190,21 @@ pub fn headroom(acc: &AccountUsage, settings: &Settings, recent: &Recent, now: D
         provider: acc.provider, id: acc.id.clone(), label: label(acc), active: acc.active,
         fetched_at: acc.fetched_at, age_minutes: acc.fetched_at.map(|t| (now - t).num_minutes().max(0)),
         stale: is_stale, error: acc.error.clone(), windows, advice, binding_window,
+    }
+}
+
+/// When the weekly window reaches its limit at the current pace, when that comes before it
+/// resets. None for a stale, failed or spent reading, or one too early in its week to judge.
+pub fn runs_out_at(acc: &AccountUsage, settings: &Settings, recent: &Recent, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    headroom(acc, settings, recent, now).windows.into_iter()
+        .find(|w| w.kind == "weekly" && w.advice == Advice::WillRunOutBeforeReset)
+        .and_then(|w| w.limit_at)
+}
+
+/// Sets every account's `runs_out_at`.
+pub fn attach_forecasts(snapshot: &mut Snapshot, settings: &Settings, recent: &Recent, now: DateTime<Utc>) {
+    for acc in &mut snapshot.accounts {
+        acc.runs_out_at = runs_out_at(acc, settings, recent, now);
     }
 }
 
