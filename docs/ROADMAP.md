@@ -54,19 +54,19 @@ upstream PR.
 | 22 | **Auto-connect monitoring.** When an unmonitored account is the one in use, start its monitoring sign-in automatically (one browser approval), with backoff and a setting. Added by the owner on 2026-10-21. | done (7e7ba16) |
 | 19 | **Claude Code status line.** The active account's headroom and time-to-limit in the status line. | done (520049a) |
 
-## Wave 4: running (added by the owner on 2026-10-22)
+## Wave 4: done (added by the owner on 2026-10-22; merged at d4c2800, releases on ultra)
 
 | # | Item | Status |
 |---|---|---|
-| 23 | **Encrypt the account vault** with DPAPI like the monitoring store, with a safe one-time migration and rollback. | running |
-| 24 | **Green tests and CI**: fix the failing login-script test and the flaky http_diagnostics test; run cargo test on Windows in GitHub Actions for every PR. | running |
-| 25 | **Token health and revoke-all**: detect revoked sign-ins; one action revokes every SlopBar-held session of an account. | running |
-| 26 | **Plan change advisor**: concrete cancel/downgrade moves with projected savings and remaining headroom. | running |
-| 27 | **Claude extra usage**: track pay-as-you-go overage (extra_usage limit and credits used) and alert before it bills. | running |
-| 28 | **Spend ledger**: month-by-month cost per plan, year-to-date totals, optional tax rate and currency. | running |
-| 29 | **SlopBar Ultra releases and updates**: signed installers from the fork; Ultra's updater follows the fork's releases. | running |
+| 23 | **Encrypt the account vault** with DPAPI like the monitoring store, with a safe one-time migration and rollback. | done (da3ba6f) |
+| 24 | **Green tests and CI**: fix the failing login-script test and the flaky http_diagnostics test; run cargo test on Windows in GitHub Actions for every PR. | done (da3ba6f) |
+| 25 | **Token health and revoke-all**: detect revoked sign-ins; one action revokes every SlopBar-held session of an account. | done (da3ba6f) |
+| 26 | **Plan change advisor**: concrete cancel/downgrade moves with projected savings and remaining headroom. | done (d4c2800) |
+| 27 | **Claude extra usage**: track pay-as-you-go overage (extra_usage limit and credits used) and alert before it bills. | done (d4c2800) |
+| 28 | **Spend ledger**: month-by-month cost per plan, year-to-date totals, optional tax rate and currency. | done (d4c2800) |
+| 29 | **SlopBar Ultra releases and updates**: signed installers from the fork; Ultra's updater follows the fork's releases. | done (ultra-releases ac7e652) |
 
-## Wave 5: queued
+## Wave 5: next
 
 | # | Item |
 |---|---|
