@@ -308,3 +308,5 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
 .presence-path input:focus { outline: none; border-bottom: 2px solid var(--accent); }
 .chip.elsewhere { background: transparent; border-color: var(--ok); color: var(--ok); }
 .chip.outside { background: transparent; border-color: var(--warn); color: var(--warn); }
+.chip.unexpected { background: transparent; border-color: var(--bad); color: var(--bad); }
+.web-use { display: inline-flex; align-items: center; gap: 4px; align-self: flex-start; cursor: pointer; }

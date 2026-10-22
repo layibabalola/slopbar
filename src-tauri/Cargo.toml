@@ -12,7 +12,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 default = ["desktop"]
-desktop = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-autostart", "dep:tauri-plugin-single-instance", "dep:tauri-plugin-updater", "dep:tauri-plugin-notification", "dep:webview2-com"]
+desktop = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-autostart", "dep:tauri-plugin-single-instance", "dep:tauri-plugin-updater", "dep:tauri-plugin-notification", "dep:webview2-com", "dep:tauri-winrt-notification"]
 # Local fixes must not silently replace themselves with an upstream release.
 upstream-updates = ["desktop"]
 
@@ -56,3 +56,5 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphic
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_UI_Accessibility", "Win32_UI_Shell"] }
 # The webview Tauri already uses, to read and capture a window for agents without showing it.
 webview2-com = { version = "0.38", optional = true }
+# Toasts with buttons (the notification plugin has none on desktop); already in the plugin's tree.
+tauri-winrt-notification = { version = "0.8", optional = true }

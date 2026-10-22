@@ -398,23 +398,41 @@ pub struct Track {
 
 pub type Tracks = HashMap<(Provider, String), Track>;
 
+/// What counts as a surge: a weekly window rising by `min_rise` points or more between two
+/// fresh readings at most `max_gap` apart. Weekly windows move slowly, so a few points in one
+/// refresh is real work being done somewhere, not rounding.
+#[derive(Debug, Clone, Copy)]
+pub struct Surge {
+    pub min_rise: f64,
+    pub max_gap: Duration,
+}
+
 /// Flags monitored accounts that nobody SlopBar can see is using, yet whose usage rose between
 /// two consecutive fresh readings of the same window (same reset time) by at least one point.
-/// The flag clears once `hold` passes without another rise.
-pub fn infer(tracks: &mut Tracks, accounts: &mut [AccountUsage], hold: Duration, now: DateTime<Utc>) {
+/// The flag clears once `hold` passes without another rise. Returns the accounts whose weekly
+/// window surged (see `Surge`) in this reading, for `unexpected`.
+pub fn infer(tracks: &mut Tracks, accounts: &mut [AccountUsage], hold: Duration, surge: Surge, now: DateTime<Utc>) -> Vec<(Provider, String)> {
     tracks.retain(|(p, id), _| accounts.iter().any(|a| a.provider == *p && a.id == *id));
+    let mut surged = vec![];
     for a in accounts.iter_mut() {
         let unclaimed = a.monitor_connected && !a.active && !a.remote.iter().any(|r| r.live);
         let track = tracks.entry((a.provider, a.id.clone())).or_default();
         let fresh = !a.stale && a.error.is_none() && a.monitor_error.is_none() && a.fetched_at.is_some();
         if fresh && a.fetched_at != track.fetched_at {
-            let rose = unclaimed
-                && track.unclaimed
-                && a.windows.iter().any(|w| {
-                    track.windows.iter().any(|(kind, resets, before)| {
-                        *kind == w.kind && resets.is_some() && *resets == w.resets_at && w.used_percent - before >= 1.0
-                    })
-                });
+            let rise = |w: &crate::model::UsageWindow| {
+                track.windows.iter().find_map(|(kind, resets, before)| {
+                    (*kind == w.kind && resets.is_some() && *resets == w.resets_at).then(|| w.used_percent - before)
+                })
+            };
+            let comparable = unclaimed && track.unclaimed;
+            let rose = comparable && a.windows.iter().any(|w| rise(w).is_some_and(|r| r >= 1.0));
+            let close = match (track.fetched_at, a.fetched_at) {
+                (Some(before), Some(after)) => after - before <= surge.max_gap,
+                _ => false,
+            };
+            if comparable && close && a.windows.iter().any(|w| w.kind.starts_with("weekly") && rise(w).is_some_and(|r| r >= surge.min_rise)) {
+                surged.push((a.provider, a.id.clone()));
+            }
             if rose {
                 track.last_rise = a.fetched_at;
             }
@@ -432,6 +450,7 @@ pub fn infer(tracks: &mut Tracks, accounts: &mut [AccountUsage], hold: Duration,
         }
         a.used_outside = track.last_rise.is_some_and(|t| now - t <= hold);
     }
+    surged
 }
 
 #[cfg(test)]
@@ -466,7 +485,7 @@ mod tests {
             monitor_connected: true,
             billing: Default::default(),
             remote: vec![],
-            used_outside: false,
+            used_outside: false, unexpected: None,
         }
     }
 
@@ -641,25 +660,79 @@ mod tests {
         a.windows = vec![UsageWindow { kind: "session".into(), window_seconds: Some(18000), used_percent: percent, resets_at: Some(at(resets)) }];
     }
 
+    const SURGE: Surge = Surge { min_rise: 2.0, max_gap: Duration::minutes(16) };
+
+    fn weekly(a: &mut AccountUsage, minute: i64, percent: f64, resets: i64) {
+        a.fetched_at = Some(at(minute));
+        a.windows = vec![
+            UsageWindow { kind: "session".into(), window_seconds: Some(18000), used_percent: 50.0, resets_at: Some(at(300)) },
+            UsageWindow { kind: "weekly".into(), window_seconds: Some(604800), used_percent: percent, resets_at: Some(at(resets)) },
+        ];
+    }
+
+    #[test]
+    fn surges_are_weekly_rises_between_close_fresh_readings() {
+        let hold = Duration::minutes(11);
+        let mut tracks = Tracks::new();
+        let mut list = vec![account("x", false)];
+        weekly(&mut list[0], 0, 10.0, 9000);
+        assert!(infer(&mut tracks, &mut list, hold, SURGE, at(0)).is_empty(), "one reading");
+        weekly(&mut list[0], 5, 11.0, 9000);
+        assert!(infer(&mut tracks, &mut list, hold, SURGE, at(5)).is_empty(), "under two points");
+        weekly(&mut list[0], 10, 13.0, 9000);
+        assert_eq!(infer(&mut tracks, &mut list, hold, SURGE, at(10)), [(Provider::Claude, "x".to_string())]);
+        // Only the session window rising is not a surge.
+        reading(&mut list[0], 15, 90.0, 300);
+        infer(&mut tracks, &mut list, hold, SURGE, at(15));
+        reading(&mut list[0], 20, 99.0, 300);
+        assert!(infer(&mut tracks, &mut list, hold, SURGE, at(20)).is_empty(), "session window only");
+
+        // The weekly window resetting is not a rise, even when the new one starts higher.
+        let mut tracks = Tracks::new();
+        weekly(&mut list[0], 0, 1.0, 9000);
+        infer(&mut tracks, &mut list, hold, SURGE, at(0));
+        weekly(&mut list[0], 5, 6.0, 19000);
+        assert!(infer(&mut tracks, &mut list, hold, SURGE, at(5)).is_empty(), "new window");
+
+        // Readings too far apart (the PC slept) say nothing about how fast it was used.
+        let mut tracks = Tracks::new();
+        weekly(&mut list[0], 0, 10.0, 9000);
+        infer(&mut tracks, &mut list, hold, SURGE, at(0));
+        weekly(&mut list[0], 60, 30.0, 9000);
+        assert!(infer(&mut tracks, &mut list, hold, SURGE, at(60)).is_empty(), "gap");
+
+        // In use here or claimed by a live peer: not a surge. A stale peer claims nothing.
+        for (active, live) in [(true, false), (false, true), (false, false)] {
+            let mut tracks = Tracks::new();
+            let mut list = vec![account("x", active)];
+            list[0].remote = vec![RemoteSeat { machine: "P".into(), where_: vec![], seen_at: at(0), live }];
+            weekly(&mut list[0], 0, 10.0, 9000);
+            infer(&mut tracks, &mut list, hold, SURGE, at(0));
+            weekly(&mut list[0], 5, 20.0, 9000);
+            let surged = !infer(&mut tracks, &mut list, hold, SURGE, at(5)).is_empty();
+            assert_eq!(surged, !active && !live, "active {active}, live peer {live}");
+        }
+    }
+
     #[test]
     fn inference_flags_a_rise_and_clears_after_two_intervals() {
         let hold = Duration::minutes(10) + Duration::seconds(30);
         let mut tracks = Tracks::new();
         let mut list = vec![account("x", false)];
         reading(&mut list[0], 0, 10.0, 300);
-        infer(&mut tracks, &mut list, hold, at(0));
+        infer(&mut tracks, &mut list, hold, SURGE, at(0));
         assert!(!list[0].used_outside, "one reading is not a rise");
         reading(&mut list[0], 5, 10.5, 300);
-        infer(&mut tracks, &mut list, hold, at(5));
+        infer(&mut tracks, &mut list, hold, SURGE, at(5));
         assert!(!list[0].used_outside, "under one point");
         reading(&mut list[0], 10, 12.0, 300);
-        infer(&mut tracks, &mut list, hold, at(10));
+        infer(&mut tracks, &mut list, hold, SURGE, at(10));
         assert!(list[0].used_outside);
         reading(&mut list[0], 15, 12.0, 300);
-        infer(&mut tracks, &mut list, hold, at(15));
+        infer(&mut tracks, &mut list, hold, SURGE, at(15));
         assert!(list[0].used_outside, "still within two intervals");
         reading(&mut list[0], 21, 12.0, 300);
-        infer(&mut tracks, &mut list, hold, at(21));
+        infer(&mut tracks, &mut list, hold, SURGE, at(21));
         assert!(!list[0].used_outside, "cleared after two intervals without a rise");
     }
 
@@ -670,24 +743,24 @@ mod tests {
         let mut tracks = Tracks::new();
         let mut list = vec![account("x", false)];
         reading(&mut list[0], 0, 80.0, 60);
-        infer(&mut tracks, &mut list, hold, at(0));
+        infer(&mut tracks, &mut list, hold, SURGE, at(0));
         reading(&mut list[0], 5, 90.0, 360);
-        infer(&mut tracks, &mut list, hold, at(5));
+        infer(&mut tracks, &mut list, hold, SURGE, at(5));
         assert!(!list[0].used_outside);
 
         // A stale or failed reading in between does not count as consecutive fresh readings.
         reading(&mut list[0], 10, 95.0, 360);
         list[0].stale = true;
         list[0].error = Some("http_500".into());
-        infer(&mut tracks, &mut list, hold, at(10));
+        infer(&mut tracks, &mut list, hold, SURGE, at(10));
         assert!(!list[0].used_outside);
         list[0].stale = false;
         list[0].error = None;
         reading(&mut list[0], 15, 99.0, 360);
-        infer(&mut tracks, &mut list, hold, at(15));
+        infer(&mut tracks, &mut list, hold, SURGE, at(15));
         assert!(!list[0].used_outside, "the reading before the failure is not compared");
         reading(&mut list[0], 20, 100.0, 360);
-        infer(&mut tracks, &mut list, hold, at(20));
+        infer(&mut tracks, &mut list, hold, SURGE, at(20));
         assert!(list[0].used_outside, "two fresh readings in a row again");
 
         // In use here, or on a live machine that says so: not "outside".
@@ -698,9 +771,9 @@ mod tests {
                 list[0].remote = vec![RemoteSeat { machine: "P".into(), where_: vec![], seen_at: at(0), live: true }];
             }
             reading(&mut list[0], 0, 10.0, 300);
-            infer(&mut tracks, &mut list, hold, at(0));
+            infer(&mut tracks, &mut list, hold, SURGE, at(0));
             reading(&mut list[0], 5, 20.0, 300);
-            infer(&mut tracks, &mut list, hold, at(5));
+            infer(&mut tracks, &mut list, hold, SURGE, at(5));
             assert!(!list[0].used_outside);
         }
 
@@ -708,11 +781,11 @@ mod tests {
         let mut tracks = Tracks::new();
         let mut list = vec![account("x", true)];
         reading(&mut list[0], 0, 10.0, 300);
-        infer(&mut tracks, &mut list, hold, at(0));
+        infer(&mut tracks, &mut list, hold, SURGE, at(0));
         list[0].active = false;
         list[0].sources.clear();
         reading(&mut list[0], 5, 20.0, 300);
-        infer(&mut tracks, &mut list, hold, at(5));
+        infer(&mut tracks, &mut list, hold, SURGE, at(5));
         assert!(!list[0].used_outside);
 
         // Not monitored: SlopBar only reads it when it is in use, so nothing to infer.
@@ -720,9 +793,9 @@ mod tests {
         let mut list = vec![account("x", false)];
         list[0].monitor_connected = false;
         reading(&mut list[0], 0, 10.0, 300);
-        infer(&mut tracks, &mut list, hold, at(0));
+        infer(&mut tracks, &mut list, hold, SURGE, at(0));
         reading(&mut list[0], 5, 20.0, 300);
-        infer(&mut tracks, &mut list, hold, at(5));
+        infer(&mut tracks, &mut list, hold, SURGE, at(5));
         assert!(!list[0].used_outside);
     }
 }
