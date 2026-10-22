@@ -487,6 +487,136 @@ listen("usage-updated", loadSubscriptions);
 listen("show-page", ({ payload: page }) => document.querySelector(`.nav[data-page="${page}"]`)?.click());
 
 // ---------------------------------------------------------------------------------------------
+// Usage: the backend's index of the CLIs' files (usage_index.rs), by repository and by model.
+
+const USAGE_DAYS = [7, 28];
+let usage = null;
+let usageDays = 7;
+const heatPick = {};
+try { usageDays = Number(localStorage.getItem("usage-days")) || usageDays; } catch {}
+
+const accountName = (s) => s.alias || s.email || (s.id ? t("usageUnknown") : t("usageUnattributed"));
+
+function bars(groups, limit = 5) {
+  if (!groups?.length) return `<div class="usage-empty">${t("usageNone")}</div>`;
+  return `<ol class="bars">${groups.slice(0, limit).map((g) => `
+    <li title="${esc(t("usageSplit", { i: compact(g.tokens.input + g.tokens.cache_write), o: compact(g.tokens.output), c: compact(g.tokens.cached) }))}">
+      <span class="bar-key">${esc(g.key)}</span><span class="bar-value">${compact(g.tokens.total)} · ${g.share}%</span>
+      <span class="bar" style="--w:${Math.max(1, g.share)}%"></span>
+    </li>`).join("")}</ol>`;
+}
+
+function weekdayNames() {
+  // 2024-01-01 was a Monday.
+  return [...Array(7)].map((_, i) => new Date(2024, 0, 1 + i).toLocaleDateString(undefined, { weekday: "short" }));
+}
+
+function heatmap(grid) {
+  const max = Math.max(1, ...grid.flat());
+  const days = weekdayNames();
+  const hours = [...Array(24).keys()];
+  return `<div class="heat" role="img" aria-label="${esc(t("usageHeatmap"))}">
+    <span></span>${hours.map((h) => `<span class="heat-hour">${h % 6 === 0 ? h : ""}</span>`).join("")}
+    ${grid.map((row, d) => `<span class="heat-day">${esc(days[d])}</span>${row.map((v, h) =>
+      `<span class="heat-cell" style="--a:${v ? 0.12 + 0.88 * (v / max) : 0}" title="${esc(`${days[d]} ${h}:00 · ${compact(v)}`)}"></span>`).join("")}`).join("")}
+  </div>`;
+}
+
+function usageAccount(s, models) {
+  const note = s.id == null ? t("usageUnattributedHint") : !s.known ? t("usageUnknown")
+    : s.attribution === "inferred_from_active_account" ? t("usageInferred") : s.attribution === "mixed" ? t("usageMixed") : "";
+  const tok = s.tokens;
+  return `
+    <div class="row usage-account" data-key="${esc(`${s.provider}:${s.id ?? ""}`)}">
+      <div class="usage-who">
+        <label>${esc(accountName(s))}</label>
+        <small>${tok.total ? esc(`${t("usageTotal", { v: compact(tok.total) })} · ${t("usageSplit", { i: compact(tok.input + tok.cache_write), o: compact(tok.output), c: compact(tok.cached) })}`) : esc(t("usageNone"))}</small>
+        ${note && tok.total ? `<small class="usage-note">${esc(note)}</small>` : ""}
+      </div>
+      ${tok.total ? `<div class="usage-cols">
+        <div><h4>${t("usageTopRepos")}</h4>${bars(s.groups)}</div>
+        <div><h4>${t("usageTopModels")}</h4>${bars(models?.groups)}</div>
+      </div>` : ""}
+    </div>`;
+}
+
+function renderUsage() {
+  if (!settings) return;
+  const box = $("usage");
+  if (!usage) { box.innerHTML = `<p class="hint">${t("usageLoading")}</p>`; return; }
+  const [repos, models] = usage;
+  const slice = (b, s) => b.accounts.find((x) => x.provider === s.provider && x.id === s.id);
+  box.innerHTML = PROVIDERS.filter(([p]) => settings.providers[p]).map(([p, name]) => {
+    const total = repos.providers.find((x) => x.provider === p);
+    const accounts = repos.accounts.filter((s) => s.provider === p)
+      .sort((a, b) => (a.id == null) - (b.id == null) || b.tokens.total - a.tokens.total);
+    const pick = heatPick[p] ?? "";
+    const heatFrom = pick ? accounts.find((s) => (s.id ?? "-") === pick) : total;
+    const summary = [t("usageTotal", { v: compact(total?.tokens.total ?? 0) })];
+    if (total?.unattributed.total) summary.push(t("usageUnattributedTotal", { v: compact(total.unattributed.total) }));
+    return `
+      <div class="provider">
+        <div class="provider-head"><span class="logo ${p}">${MARK[p]}</span><h3>${name}</h3><small class="sub-summary">${esc(summary.join(" · "))}</small></div>
+        ${total?.tokens.total ? `<div class="row usage-overview">
+          <div><h4>${t("usageModelMix")}</h4>${bars(total.models)}</div>
+          <div>
+            <div class="usage-heat-head"><h4>${t("usageHeatmap")}</h4>
+              <div class="select"><select data-heat="${p}">
+                <option value="">${t("usageHeatmapAll")}</option>
+                ${accounts.filter((s) => s.tokens.total).map((s) => `<option value="${esc(s.id ?? "-")}" ${(s.id ?? "-") === pick ? "selected" : ""}>${esc(accountName(s))}</option>`).join("")}
+              </select></div>
+            </div>
+            ${heatmap((heatFrom ?? total).heatmap)}
+          </div>
+        </div>` : ""}
+        <div class="group">${accounts.length ? accounts.map((s) => usageAccount(s, slice(models, s))).join("") : `<div class="empty">${t("noAccounts")}</div>`}</div>
+      </div>`;
+  }).join("");
+}
+
+async function loadUsage() {
+  renderUsage();
+  try {
+    usage = await Promise.all(["repo", "model"].map((group_by) => invoke("get_usage_breakdown", { days: usageDays, groupBy: group_by })));
+  } catch { return; }
+  renderUsage();
+}
+
+$("usage-days").innerHTML = USAGE_DAYS.map((n) => `<option value="${n}">${t("usageDays", { n })}</option>`).join("");
+$("usage-days").value = String(usageDays);
+$("usage-days").addEventListener("change", (e) => {
+  usageDays = Number(e.target.value);
+  try { localStorage.setItem("usage-days", String(usageDays)); } catch {}
+  loadUsage();
+});
+$("usage").addEventListener("change", (e) => {
+  const p = e.target.dataset.heat;
+  if (p == null) return;
+  heatPick[p] = e.target.value;
+  renderUsage();
+});
+document.querySelector('.nav[data-page="usage"]').addEventListener("click", loadUsage);
+listen("usage-updated", () => { if ($("page-usage").classList.contains("active")) loadUsage(); });
+
+invoke("csv_default_folder").then((folder) => {
+  let saved = "";
+  try { saved = localStorage.getItem("export-folder") || ""; } catch {}
+  $("export-folder").value = saved || folder || "";
+}, () => {});
+$("export-csv").addEventListener("click", async () => {
+  const status = $("export-status");
+  const folder = $("export-folder").value.trim();
+  status.textContent = t("exportCsvSaving"); status.hidden = false;
+  try {
+    const written = await invoke("export_csv", { folder: folder || null });
+    try { localStorage.setItem("export-folder", folder); } catch {}
+    status.textContent = t("exportCsvSaved", { n: written.files.length, path: written.folder });
+  } catch {
+    status.textContent = t("exportCsvFailed");
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
 // Everything else
 
 async function render() {
@@ -715,3 +845,4 @@ await loadHealth();
 let page = "accounts";
 try { page = localStorage.getItem("settings-page") || page; } catch {}
 showPage(page);
+if (page === "usage") loadUsage();

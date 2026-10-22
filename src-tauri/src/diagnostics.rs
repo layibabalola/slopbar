@@ -689,6 +689,18 @@ impl Recorder {
             },
         );
     }
+    /// Every journaled reading of whether an account was the one signed in to its CLI: time,
+    /// provider, slot id and active. Local only, to seed `active_log` with the past week.
+    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+    pub fn active_marks(&self) -> Vec<(DateTime<Utc>, Provider, String, bool)> {
+        let s = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ids: HashMap<u32, &str> = s.history.accounts.iter()
+            .filter_map(|(key, n)| key.split_once(':').map(|(_, id)| (*n, id))).collect();
+        s.history.events.iter().filter_map(|r| match (&r.event, r.provider, r.account) {
+            (Event::Sample { active, .. }, Some(p), Some(n)) => ids.get(&n).map(|id| (r.at, p, id.to_string(), *active)),
+            _ => None,
+        }).collect()
+    }
     pub fn samples(&self, snapshot: &Snapshot) {
         for a in &snapshot.accounts {
             self.record(Some(a.provider), Some(&a.id), sample(a));

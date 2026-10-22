@@ -18,6 +18,7 @@ Your Claude Code and Codex plan limits, right in the Windows taskbar, next to th
 - **Lives in your taskbar**: a small widget next to the clock shows each provider's usage as a ring around its logo; hover for the exact number.
 - **One click for the details**: click the widget for a flyout with every account, its session and weekly limits, reset times, limit resets and credits. Right-click it to refresh, open Settings or quit.
 - **Multiple accounts**: add as many Claude and Codex accounts as you like and switch with one click, or let it switch for you when one hits its limit.
+- **Usage by project and model**: Settings > Usage shows each account's tokens by repository and model over the last 7 or 28 days, its busiest hours of the week, and each provider's model mix, read from Claude Code's and the Codex CLI's own files on this PC (token counts, models, times and folders only, never what was written). Claude use is credited to the account SlopBar saw signed in at the time. Export the weekly history, this breakdown and the subscription report as CSV files.
 - **Feels native**: follows the taskbar's light or dark theme, and steps aside while a fullscreen app is running.
 - **Speaks your language**: follows the system language (10 languages, English fallback).
 
@@ -88,6 +89,8 @@ command = 'C:\Users\<you>\AppData\Local\SlopBar\slopbar-mcp.exe'
 | `add_account`, `connect_monitoring`, `disconnect_monitoring` | Start the CLI's own sign-in for the user to complete, or revoke a monitoring sign-in. |
 | `check_for_updates`, `install_update`, `get_app_info`, `open_settings` | Updates (builds with automatic updates only), version and build, and showing the Settings window. |
 | `quit_app`, `restart_app` | Quit as the tray's Quit does, or quit and start the installed executable again. |
+| `get_usage_breakdown` | Tokens on this PC by account and repository, model or day, with each provider's model mix and an hour-of-week heatmap, and how each account's tokens were attributed. |
+| `export_csv` | Write the weekly history, the usage breakdown and the subscription report as CSV files (default `Documents\SlopBar Exports`) and return their paths. |
 | `export_diagnostics`, `list_diagnostic_exports` | Write a diagnostics export (a repeat within 30 seconds returns the same file) or list earlier ones; listing works while SlopBar is closed. |
 
 The server never starts SlopBar, reads credentials or contacts a provider itself: each tool asks the running app, which performs the same action as the matching Settings control. They talk over a named pipe that only the signed-in user and SYSTEM can open and that rejects remote clients. The server checks that the process answering runs as the same Windows user, connects so that process cannot act as the agent's, bounds every reply in size and time, and only passes on an export path inside the export folder. Sign-ins always happen in the CLI's own login, completed by the user. Usage results include account emails, so treat them like the Settings window. `slopbar-mcp.exe` is a separate executable so that app updates, which stop `slopbar.exe`, do not cut agents off mid-session.

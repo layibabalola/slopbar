@@ -37,6 +37,22 @@ pub enum Request {
     GetSettings,
     /// Each account's plan, weekly usage history, verdict and next renewal (see `subscriptions`).
     GetSubscriptions,
+    /// Tokens by account and repository, model or day from the CLIs' files here (see `usage_index`).
+    GetUsageBreakdown {
+        #[serde(default)]
+        provider: Option<Provider>,
+        #[serde(default)]
+        account: Option<String>,
+        #[serde(default)]
+        days: Option<u32>,
+        #[serde(default)]
+        group_by: Option<crate::usage_index::GroupBy>,
+    },
+    /// Weekly history, the usage breakdown and the subscription report as CSV files.
+    ExportCsv {
+        #[serde(default)]
+        folder: Option<String>,
+    },
     /// An RFC 7386 merge patch over the current settings (see `settings::patched`).
     UpdateSettings { patch: Value },
     /// Used share, reset, pace and forecast per window for one account (or each provider's account
@@ -109,7 +125,7 @@ fn set_state(state: u8) {
 }
 
 /// Settings pages `InspectWindow` can show (its sidebar's `data-page` values).
-pub const SETTINGS_PAGES: [&str; 6] = ["accounts", "subscriptions", "notifications", "data", "general", "health"];
+pub const SETTINGS_PAGES: [&str; 7] = ["accounts", "subscriptions", "usage", "notifications", "data", "general", "health"];
 
 /// A window `InspectWindow` can look at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
