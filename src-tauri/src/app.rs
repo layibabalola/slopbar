@@ -725,13 +725,15 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
         subscriptions::record(&mut history, &snapshot, &valid, chrono::Utc::now());
         history.clone()
     };
-    // A reading older than two refresh intervals is not the current rate.
-    let max_age = chrono::Duration::seconds(2 * interval as i64 + 300);
-    subscriptions::attach_forecasts(&mut snapshot, &history, max_age, chrono::Utc::now());
+    {
+        let mut recent = state.recent.lock().unwrap();
+        let now = chrono::Utc::now();
+        recent.record(&snapshot.accounts, now);
+        headroom::attach_forecasts(&mut snapshot, &settings, &recent, now);
+    }
     if subscriptions::save(&history).is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::HistorySave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
     state.diagnostics.record(None, None, diagnostics::Event::PollFinished { elapsed_ms: diagnostics::millis(started), accounts: snapshot.accounts.len(),
         native_sources: found.iter().filter(|s| s.distro.is_none()).count(), wsl_sources: found.iter().filter(|s| s.distro.is_some()).count() });
-    state.recent.lock().unwrap().record(&snapshot.accounts, chrono::Utc::now());
     *state.snapshot.lock().unwrap() = snapshot.clone();
     let _ = app.emit("usage-updated", &snapshot);
     if settings.providers.codex { scan_codex_local(app); }
