@@ -616,6 +616,43 @@ pub fn daily<Tz: TimeZone>(index: &Index, log: &active_log::Log, known: &[Known]
     }).collect()
 }
 
+/// One repository and model of one account on this PC: its tokens in the last window, and its
+/// usual tokens per window of that length in the time before, counting only windows it was used in.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LocalRate {
+    pub provider: Provider,
+    /// The slot id (or a Codex account id SlopBar does not know); None when unattributed.
+    pub id: Option<String>,
+    pub repo: String,
+    pub model: String,
+    pub recent: u64,
+    pub baseline: Option<f64>,
+    /// Windows of the baseline it was used in.
+    pub active_windows: u32,
+}
+
+/// Every repository and model used in the last `window` or the `baseline` before it, busiest
+/// recently first.
+pub fn local_rates(index: &Index, log: &active_log::Log, known: &[Known], window: Duration, baseline: Duration, now: DateTime<Utc>) -> Vec<LocalRate> {
+    let split = now - window;
+    let mut acc: HashMap<(Provider, Option<String>, String, String), (u64, HashMap<i64, u64>)> = HashMap::new();
+    let width = window.num_seconds().max(60);
+    resolve(index, log, known, split - baseline, &Utc, |r| {
+        let at = r.local.and_utc();
+        if at > now { return; }
+        let id = r.slot.as_ref().map(|s| match s { SlotKey::Known(id) | SlotKey::Unknown(id) => id.clone() });
+        let entry = acc.entry((r.provider, id, r.repo.to_string(), r.model.to_string())).or_default();
+        if at >= split { entry.0 += r.tokens.total; } else { *entry.1.entry((split - at).num_seconds() / width).or_default() += r.tokens.total; }
+    });
+    let mut out: Vec<LocalRate> = acc.into_iter().map(|((provider, id, repo, model), (recent, buckets))| {
+        let active = buckets.values().filter(|t| **t > 0).count() as u32;
+        LocalRate { provider, id, repo, model, recent, active_windows: active,
+            baseline: (active > 0).then(|| buckets.values().sum::<u64>() as f64 / active as f64) }
+    }).collect();
+    out.sort_by(|a, b| b.recent.cmp(&a.recent).then_with(|| (&a.repo, &a.model).cmp(&(&b.repo, &b.model))));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -808,6 +845,30 @@ mod tests {
         assert_eq!(repo_name(&dir.0.join("plain").join("folder").to_string_lossy()), "folder");
         assert_eq!(repo_name("/home/dev/project/"), "project");
         assert_eq!(repo_name(""), "(none)");
+    }
+
+    #[test]
+    fn local_rates_compare_the_last_window_with_the_windows_used_before() {
+        let dir = TempDir::new();
+        let project = dir.0.join("claude").join("C--work-app");
+        std::fs::create_dir_all(&project).unwrap();
+        let cwd = dir.0.join("app").to_string_lossy().into_owned();
+        let sent = [
+            ("m1", "2026-10-20T10:00:00Z", 100), ("m2", "2026-10-19T10:00:00Z", 300), ("m4", "2026-10-21T10:59:00Z", 200),
+            ("m3", "2026-10-21T11:30:00Z", 1000), ("m5", "2026-10-13T10:00:00Z", 5000), ("m6", "2026-10-21T12:30:00Z", 7),
+        ];
+        std::fs::write(project.join("s1.jsonl"), sent.iter().map(|(id, ts, n)| claude(id, ts, &cwd, "claude-opus-5-5", *n, 0, 0, 0)).collect::<String>()).unwrap();
+        let mut log = active_log::Log::default();
+        let mut times: Vec<_> = sent.iter().map(|(_, ts, _)| at(ts)).collect();
+        times.sort();
+        for t in times { for m in [-1, 1] { log.note(Provider::Claude, "slot-a", t + Duration::minutes(m), active_log::max_gap(5)); } }
+        let now = at("2026-10-21T12:00:00Z");
+        let (index, _) = Scanner::new(None).scan(&roots(&dir.0), now);
+        let rates = local_rates(&index, &log, &known(), Duration::minutes(60), Duration::days(7), now);
+        // The last hour has 1000; before it three hours of use (100, 300, 200), the one 8 days back
+        // outside the baseline and the one after `now` nowhere.
+        assert_eq!(rates, [LocalRate { provider: Provider::Claude, id: Some("slot-a".into()), repo: "app".into(), model: "claude-opus-5-5".into(),
+            recent: 1000, baseline: Some(200.0), active_windows: 3 }]);
     }
 
     #[test]

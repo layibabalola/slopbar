@@ -13,6 +13,8 @@ mod subscriptions;
 mod headroom;
 mod plan_alerts;
 mod advisor;
+mod burn;
+mod reset_credits;
 mod ledger;
 mod codex_local;
 mod active_log;

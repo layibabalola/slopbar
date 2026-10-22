@@ -59,11 +59,16 @@ pub struct Notifications {
     pub digest: bool,
     /// Claude extra usage reaching 75% and 90% of its monthly limit.
     pub extra_usage: bool,
+    /// An account burning through its week abnormally fast (see `burn`), at most every few hours.
+    pub burn: bool,
+    /// Codex reset credits: spend one or switch when an account hits its limit, and one about to
+    /// expire unused (see `reset_credits`).
+    pub reset_credits: bool,
 }
 
 impl Default for Notifications {
     fn default() -> Self {
-        Self { usage: true, resets: true, switches: true, renewals: true, unexpected_use: true, digest: true, extra_usage: true }
+        Self { usage: true, resets: true, switches: true, renewals: true, unexpected_use: true, digest: true, extra_usage: true, burn: true, reset_credits: true }
     }
 }
 
@@ -151,7 +156,29 @@ pub struct Settings {
     pub calendar: Calendar,
     /// How spend totals are shown (see `ledger`).
     pub spend: SpendDisplay,
+    /// What counts as abnormal burn (see `burn`).
+    pub burn: Burn,
 }
+
+/// Thresholds for the runaway-agent alert.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Burn {
+    /// Weekly percentage points that, used within `minutes`, are abnormal.
+    pub points: u8,
+    pub minutes: u16,
+    /// A repository and model on this PC using this many times its usual hourly tokens.
+    pub token_factor: u8,
+}
+
+impl Default for Burn {
+    fn default() -> Self { Self { points: 15, minutes: 60, token_factor: 3 } }
+}
+
+/// The values each `Burn` field accepts. Minutes stop at the three hours of readings kept in memory.
+pub const BURN_POINTS: std::ops::RangeInclusive<u8> = 2..=50;
+pub const BURN_MINUTES: std::ops::RangeInclusive<u16> = 15..=180;
+pub const BURN_TOKEN_FACTOR: std::ops::RangeInclusive<u8> = 2..=20;
 
 /// Display-only choices for the spend ledger: amounts stay US list prices unless the user
 /// entered costs, whatever these say.
@@ -197,6 +224,7 @@ impl Default for Settings {
             auto_connect_monitoring: true,
             calendar: Calendar::default(),
             spend: SpendDisplay::default(),
+            burn: Burn::default(),
         }
     }
 }
@@ -238,7 +266,7 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
 /// `project_pins` has its own operations (see `pins`).
-const PATCHABLE: [&str; 18] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "spend"];
+const PATCHABLE: [&str; 19] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "spend", "burn"];
 
 /// Modifier names a shortcut may use, as the Settings window writes them.
 const HOTKEY_MODIFIERS: [&str; 4] = ["Ctrl", "Alt", "Shift", "Win"];
@@ -393,6 +421,13 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
     }
     if next.unexpected_min_rise != current.unexpected_min_rise && !UNEXPECTED_MIN_RISE.contains(&next.unexpected_min_rise) {
         return Err(format!("unexpected_min_rise must be {}–{} points", UNEXPECTED_MIN_RISE.start(), UNEXPECTED_MIN_RISE.end()));
+    }
+    if next.burn != current.burn {
+        let b = &next.burn;
+        if !BURN_POINTS.contains(&b.points) || !BURN_MINUTES.contains(&b.minutes) || !BURN_TOKEN_FACTOR.contains(&b.token_factor) {
+            return Err(format!("burn needs points {}–{}, minutes {}–{} and token_factor {}–{}", BURN_POINTS.start(), BURN_POINTS.end(),
+                BURN_MINUTES.start(), BURN_MINUTES.end(), BURN_TOKEN_FACTOR.start(), BURN_TOKEN_FACTOR.end()));
+        }
     }
     if next.calendar.path != current.calendar.path {
         if let Some(path) = &mut next.calendar.path {
