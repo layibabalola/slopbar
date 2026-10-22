@@ -4,7 +4,11 @@ Installs this checkout's release build over the local SlopBar without anyone qui
   cargo build --locked --release --features tauri/custom-protocol --manifest-path src-tauri/Cargo.toml
   pwsh scripts/install-local-build.ps1
 
+0. Takes a machine-wide install lock: a second install started meanwhile refuses (non-zero exit)
+   instead of swapping executables and restarting SlopBar under the first.
 1. Checks the built slopbar.exe reports this checkout's commit and tree, clean, with no dev mode.
+   Refuses when more than one SlopBar is running: it asks the copy it reaches through the door to
+   quit, waits, and stops if more than one is still left.
 2. Moves the installed executables (even while running; Windows allows renaming a running image)
    into a rollback folder outside the repository, and copies the new ones in.
 3. Asks the running SlopBar to restart itself through its agent door (slopbar-mcp restart_app),
@@ -23,6 +27,14 @@ param(
   [switch]$StopAfterRefresh
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'install-guard.ps1')
+
+# 0. One install at a time.
+$lock = Enter-InstallLock
+if (-not $lock) { throw 'Another install of SlopBar is running on this machine; run this again once it has finished.' }
+# (The rest of the script runs inside this try; the lock is released however it ends.)
+try {
+
 $repo = Split-Path -Parent $PSScriptRoot
 $built = Join-Path $repo 'src-tauri\target\release'
 $names = 'slopbar.exe', 'slopbar-mcp.exe'
@@ -75,7 +87,24 @@ function Get-DoorError($result) {
   return 'SlopBar did not answer'
 }
 
-$running = Get-Process -Name slopbar -ErrorAction SilentlyContinue | Where-Object { $_.Path -and (Split-Path $_.Path) -ieq $InstallDir }
+# Exactly one SlopBar may be running: restarting one copy would leave the others renewing the same
+# monitoring sign-ins. Quit the one the door reaches; a copy of an older build may be left.
+$running = Get-SlopBarProcesses
+if ((Get-InstanceVerdict $running.Count) -eq 'refuse') {
+  $builtMcp = Join-Path $built 'slopbar-mcp.exe'
+  $info = Invoke-Door $builtMcp 'get_app_info'
+  $doorPid = if ($info -and -not $info.isError) { $info.structuredContent.pid } else { $null }
+  $null = Invoke-Door $builtMcp 'quit_app'
+  $deadline = (Get-Date).AddSeconds(30)
+  do {
+    Start-Sleep -Seconds 1
+    $gone = if ($doorPid) { -not (Get-Process -Id $doorPid -ErrorAction SilentlyContinue) } else { (Get-SlopBarProcesses).Count -lt $running.Count }
+  } until ($gone -or (Get-Date) -gt $deadline)
+  $running = Get-SlopBarProcesses
+  if ((Get-InstanceVerdict $running.Count) -eq 'refuse') {
+    throw "$($running.Count) copies of SlopBar are running (process ids $($running.Id -join ', ')). End them in Task Manager, then run this again; nothing was installed."
+  }
+}
 
 # 2. Swap executables; the running ones move aside intact.
 $backup = Join-Path $RollbackRoot (Get-Date -Format 'yyyyMMdd-HHmmss')
@@ -112,3 +141,7 @@ do {
 } until (($r -and -not $r.isError -and $r.structuredContent.build.commit -eq $head) -or (Get-Date) -gt $deadline)
 if (-not $r -or $r.isError -or $r.structuredContent.build.commit -ne $head) { throw 'The new build did not come up on the door within 60 seconds.' }
 Write-Output "SlopBar $head is running. Previous executables: $backup"
+
+} finally {
+  Exit-InstallLock $lock
+}

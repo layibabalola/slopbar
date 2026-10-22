@@ -41,6 +41,7 @@ function render() {
   selected = Math.min(selected, Math.max(0, shown.length - 1));
   if (!shown.length) {
     $results.innerHTML = `<li class="empty">${esc(snapshot.accounts.length ? t("switcherNoMatch") : t("noAccounts"))}</li>`;
+    $query.removeAttribute("aria-activedescendant");
     return;
   }
   $results.innerHTML = shown.map((a, i) => {
@@ -48,12 +49,14 @@ function render() {
     const room = w ? `<b>${Math.max(0, Math.round(100 - w.used_percent))}%</b><small>${esc(t("switcherLeft", { window: windowLabel(w) }))}</small>`
       : `<b>—</b><small>${esc(t("usageUnknown"))}</small>`;
     const meta = [PROVIDER_NAME[a.provider], a.alias ? a.email : "", a.plan].filter(Boolean).join(" · ");
-    return `<li role="option" data-i="${i}" aria-selected="${i === selected}">
+    return `<li role="option" id="option-${i}" data-i="${i}" aria-selected="${i === selected}">
       <span class="mark-box" title="${PROVIDER_NAME[a.provider]}">${MARK[a.provider]}</span>
       <span class="who"><b>${esc(name(a))}</b><small>${esc(meta)}</small></span>
       <span class="room">${a.active ? `<span class="in-use">${t("inUse")}</span><br>` : ""}${room}</span>
     </li>`;
   }).join("");
+  // The list follows the text field's focus, so screen readers announce the chosen row.
+  $query.setAttribute("aria-activedescendant", `option-${selected}`);
   $results.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: "nearest" });
 }
 
@@ -79,6 +82,8 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") { e.preventDefault(); invoke("hide_switcher"); }
   else if (e.key === "ArrowDown") { e.preventDefault(); selected = Math.min(selected + 1, shown.length - 1); render(); }
   else if (e.key === "ArrowUp") { e.preventDefault(); selected = Math.max(selected - 1, 0); render(); }
+  else if (e.key === "Home" && shown.length) { e.preventDefault(); selected = 0; render(); }
+  else if (e.key === "End" && shown.length) { e.preventDefault(); selected = shown.length - 1; render(); }
   else if (e.key === "Enter") { e.preventDefault(); choose(selected); }
 });
 $results.addEventListener("click", (e) => {
@@ -106,6 +111,7 @@ function applySettings(settings) {
   setLanguage(settings.language);
   translateDom();
   $query.placeholder = t("switcherPlaceholder");
+  $query.setAttribute("aria-label", t("switcherPlaceholder"));
   $hint.textContent = t("switcherHint");
   render();
 }

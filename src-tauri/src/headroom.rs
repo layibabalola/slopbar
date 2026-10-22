@@ -62,6 +62,15 @@ impl Recent {
         self.trails.retain(|k, _| live.contains(k));
     }
 
+    /// How far a window rose over the readings of the last `minutes`: (points, minutes between
+    /// the first of them and the newest). None without two readings in that time.
+    pub fn rise(&self, provider: Provider, id: &str, kind: &str, minutes: i64, now: DateTime<Utc>) -> Option<(f64, i64)> {
+        let trail = self.trails.get(&trail_key(provider, id, kind))?;
+        let first = trail.iter().find(|(t, _)| (now - *t).num_minutes() <= minutes)?;
+        let last = trail.back()?;
+        (last.0 > first.0).then(|| ((last.1 - first.1).max(0.0), (last.0 - first.0).num_minutes().max(1)))
+    }
+
     /// Percentage points per hour between the oldest recent reading and the newest.
     fn pace(&self, acc: &AccountUsage, kind: &str, now: DateTime<Utc>) -> Option<f64> {
         let trail = self.trails.get(&trail_key(acc.provider, &acc.id, kind))?;
@@ -336,6 +345,25 @@ pub fn recommend(accounts: &[AccountUsage], settings: &Settings, provider: Provi
         .then_with(|| if a.fits { a.use_before.unwrap_or(DateTime::<Utc>::MAX_UTC).cmp(&b.use_before.unwrap_or(DateTime::<Utc>::MAX_UTC)) } else { std::cmp::Ordering::Equal })
         .then_with(|| b.weekly_left_percent.unwrap_or(0.0).total_cmp(&a.weekly_left_percent.unwrap_or(0.0)))
         .then_with(|| b.active.cmp(&a.active)));
+    finish(provider, expected_percent, hours, ranking, excluded)
+}
+
+/// `rec` without the accounts someone else leased (`(id, purpose)`, see `leases`): they move to
+/// the excluded list and the recommendation is made again from the rest.
+pub fn without_leased(rec: Recommendation, leased: &[(String, String)]) -> Recommendation {
+    if leased.is_empty() {
+        return rec;
+    }
+    let Recommendation { provider, expected_percent, hours, ranking, mut excluded, .. } = rec;
+    let (taken, ranking): (Vec<_>, Vec<_>) = ranking.into_iter().partition(|c| leased.iter().any(|(id, _)| *id == c.id));
+    for c in taken {
+        let purpose = leased.iter().find(|(id, _)| *id == c.id).map_or("", |(_, p)| p.as_str());
+        excluded.push(Excluded { id: c.id, label: c.label, active: c.active, reason: format!("leased: {purpose}") });
+    }
+    finish(provider, expected_percent, hours, ranking, excluded)
+}
+
+fn finish(provider: Provider, expected_percent: Option<f64>, hours: Option<f64>, ranking: Vec<Candidate>, excluded: Vec<Excluded>) -> Recommendation {
     let best = ranking.first().filter(|c| c.fits);
     let (action, summary) = match best {
         Some(c) if c.active => (Action::Stay, format!("Keep using {}: it fits the job and should be used first.", name(&c.label, &c.id))),
@@ -366,7 +394,7 @@ mod tests {
             id: id.into(), provider: Provider::Claude, email: Some(format!("{id}@example.invalid")), alias: None, plan: Some("max".into()), org: None,
             active, sources: vec![], windows: vec![window("session", 10.0, 3), window("weekly", weekly, weekly_resets_in_hours)],
             credits: None, resets: vec![], error: None, monitor_error: None, stale: false,
-            fetched_at: Some(at(NOW) - Duration::minutes(2)), monitor_connected: true, billing: Default::default(), remote: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None,
+            fetched_at: Some(at(NOW) - Duration::minutes(2)), monitor_connected: true, billing: Default::default(), remote: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None,
         }
     }
 
@@ -413,6 +441,22 @@ mod tests {
         acc.fetched_at = Some(now);
         recent.record(&[acc.clone()], now);
         assert_eq!(recent.pace(&acc, "weekly", now), None);
+    }
+
+    #[test]
+    fn accounts_leased_by_others_are_excluded_and_the_next_one_recommended() {
+        let now = at(NOW);
+        let settings = Settings::default();
+        let accounts = [account("current", true, 40.0, 120), account("soon", false, 50.0, 20), account("roomy", false, 5.0, 150)];
+        let rec = recommend(&accounts, &settings, Provider::Claude, Some(30.0), Some(8.0), now);
+        let rec = without_leased(rec, &[("soon".into(), "nightly refactor".into())]);
+        assert_eq!(rec.ranking.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["current", "roomy"]);
+        assert_eq!((rec.action, rec.recommended.as_deref()), (Action::Stay, Some("current")));
+        let left_out = rec.excluded.iter().find(|e| e.id == "soon").unwrap();
+        assert_eq!(left_out.reason, "leased: nightly refactor");
+        let all = [("current".into(), "a".into()), ("roomy".into(), "b".into())];
+        let none = without_leased(rec, &all);
+        assert_eq!((none.action, none.recommended), (Action::None, None));
     }
 
     #[test]

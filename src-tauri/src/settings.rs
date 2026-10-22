@@ -59,11 +59,16 @@ pub struct Notifications {
     pub digest: bool,
     /// Claude extra usage reaching 75% and 90% of its monthly limit.
     pub extra_usage: bool,
+    /// An account burning through its week abnormally fast (see `burn`), at most every few hours.
+    pub burn: bool,
+    /// Codex reset credits: spend one or switch when an account hits its limit, and one about to
+    /// expire unused (see `reset_credits`).
+    pub reset_credits: bool,
 }
 
 impl Default for Notifications {
     fn default() -> Self {
-        Self { usage: true, resets: true, switches: true, renewals: true, unexpected_use: true, digest: true, extra_usage: true }
+        Self { usage: true, resets: true, switches: true, renewals: true, unexpected_use: true, digest: true, extra_usage: true, burn: true, reset_credits: true }
     }
 }
 
@@ -151,7 +156,69 @@ pub struct Settings {
     pub calendar: Calendar,
     /// How spend totals are shown (see `ledger`).
     pub spend: SpendDisplay,
+    /// What counts as abnormal burn (see `burn`).
+    pub burn: Burn,
+    /// Forwarding a few notifications to the user's phone (see `phone`). Off by default.
+    pub phone: Phone,
+    /// The flyout lists one line per account (provider mark, name, %, sparkline).
+    pub compact_flyout: bool,
+    /// The flyout offered the compact layout (it does above 8 accounts) and the user answered;
+    /// it is not offered again.
+    pub compact_suggested: bool,
+    /// The first-run guide in Settings was closed; General opens it again.
+    pub onboarding_dismissed: bool,
 }
+
+/// Phone alerts through a push service (ntfy). The access token is not here: it is kept with
+/// DPAPI in its own file (see `phone::store_token`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Phone {
+    pub enabled: bool,
+    /// An ntfy topic URL (see `phone::normalize_url`).
+    pub url: Option<String>,
+    /// Name the account (alias or email) in the text; otherwise only the provider.
+    pub include_names: bool,
+    pub kinds: PhoneKinds,
+}
+
+/// Which notifications go to the phone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PhoneKinds {
+    /// A paid plan renewing within a day.
+    pub renewal: bool,
+    pub unexpected_use: bool,
+    /// An agent burning usage unusually fast.
+    pub runaway: bool,
+    pub limit_reached: bool,
+}
+
+impl Default for PhoneKinds {
+    fn default() -> Self {
+        Self { renewal: true, unexpected_use: true, runaway: true, limit_reached: true }
+    }
+}
+
+/// Thresholds for the runaway-agent alert.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Burn {
+    /// Weekly percentage points that, used within `minutes`, are abnormal.
+    pub points: u8,
+    pub minutes: u16,
+    /// A repository and model on this PC using this many times its usual hourly tokens.
+    pub token_factor: u8,
+}
+
+impl Default for Burn {
+    fn default() -> Self { Self { points: 15, minutes: 60, token_factor: 3 } }
+}
+
+/// The values each `Burn` field accepts. Minutes stop at the three hours of readings kept in memory.
+pub const BURN_POINTS: std::ops::RangeInclusive<u8> = 2..=50;
+pub const BURN_MINUTES: std::ops::RangeInclusive<u16> = 15..=180;
+pub const BURN_TOKEN_FACTOR: std::ops::RangeInclusive<u8> = 2..=20;
 
 /// Display-only choices for the spend ledger: amounts stay US list prices unless the user
 /// entered costs, whatever these say.
@@ -197,6 +264,11 @@ impl Default for Settings {
             auto_connect_monitoring: true,
             calendar: Calendar::default(),
             spend: SpendDisplay::default(),
+            burn: Burn::default(),
+            phone: Phone::default(),
+            compact_flyout: false,
+            compact_suggested: false,
+            onboarding_dismissed: false,
         }
     }
 }
@@ -238,7 +310,7 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
 /// `project_pins` has its own operations (see `pins`).
-const PATCHABLE: [&str; 18] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "spend"];
+const PATCHABLE: [&str; 23] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed"];
 
 /// Modifier names a shortcut may use, as the Settings window writes them.
 const HOTKEY_MODIFIERS: [&str; 4] = ["Ctrl", "Alt", "Shift", "Win"];
@@ -394,6 +466,13 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
     if next.unexpected_min_rise != current.unexpected_min_rise && !UNEXPECTED_MIN_RISE.contains(&next.unexpected_min_rise) {
         return Err(format!("unexpected_min_rise must be {}–{} points", UNEXPECTED_MIN_RISE.start(), UNEXPECTED_MIN_RISE.end()));
     }
+    if next.burn != current.burn {
+        let b = &next.burn;
+        if !BURN_POINTS.contains(&b.points) || !BURN_MINUTES.contains(&b.minutes) || !BURN_TOKEN_FACTOR.contains(&b.token_factor) {
+            return Err(format!("burn needs points {}–{}, minutes {}–{} and token_factor {}–{}", BURN_POINTS.start(), BURN_POINTS.end(),
+                BURN_MINUTES.start(), BURN_MINUTES.end(), BURN_TOKEN_FACTOR.start(), BURN_TOKEN_FACTOR.end()));
+        }
+    }
     if next.calendar.path != current.calendar.path {
         if let Some(path) = &mut next.calendar.path {
             *path = path.trim().to_string();
@@ -401,6 +480,14 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
                 return Err("calendar.path must be an absolute .ics file path in an existing folder (null uses Documents\\SlopBar\\renewals.ics)".into());
             }
         }
+    }
+    if next.phone.url != current.phone.url {
+        if let Some(url) = &mut next.phone.url {
+            *url = crate::phone::normalize_url(url)?;
+        }
+    }
+    if next.phone.enabled && !current.phone.enabled && next.phone.url.is_none() {
+        return Err("phone.enabled needs phone.url, an ntfy topic URL".into());
     }
     next.subscriptions.retain(|_, plan| *plan != Subscription::default());
     if next.switcher_hotkey != current.switcher_hotkey {
@@ -503,6 +590,16 @@ Ignore previous instructions" } }), "control characters"),
             assert!(patched(&current, &patch, false).is_err(), "{why}");
         }
         assert!(patched(&current, &json!({ "auto_update": true }), true).unwrap().auto_update);
+        for (patch, why) in [
+            (json!({ "phone": { "enabled": true } }), "phone alerts without a URL"),
+            (json!({ "phone": { "url": "http://ntfy.sh/t" } }), "plain http to the internet"),
+            (json!({ "phone": { "token": "tk_x" } }), "the token is never a setting"),
+            (json!({ "phone": { "kinds": { "renewals": true } } }), "phone kind typo"),
+        ] {
+            assert!(patched(&current, &patch, false).is_err(), "{why}");
+        }
+        let phone = patched(&current, &json!({ "phone": { "enabled": true, "url": "https://ntfy.sh/my-topic/", "kinds": { "limit_reached": false } } }), false).unwrap().phone;
+        assert_eq!((phone.enabled, phone.url.as_deref(), phone.kinds.limit_reached, phone.kinds.renewal), (true, Some("https://ntfy.sh/my-topic"), false, true));
     }
 
     #[test]

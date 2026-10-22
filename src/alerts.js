@@ -19,7 +19,19 @@ const save = () => { try { localStorage.setItem(STORE, JSON.stringify(state)); }
 
 const milestone = (p) => MILESTONES.filter((m) => p >= m).pop() ?? 0;
 const accountName = (a) => a.alias || a.email || t("unknownAccount");
-const notify = (title, body, page = null) => invoke("notify", { title, body, page }).catch(() => {});
+const notify = (title, body, page = null, phone = null) => invoke("notify", { title, body, page, phone }).catch(() => {});
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The same news for the phone, naming only the provider (see Settings > Notifications > Phone):
+ * the app sends it, or the toast's own text when the user chose to include account names, and
+ * only for the kinds they selected. Kinds: renewal, unexpected_use, runaway, limit_reached.
+ */
+export function phoneForward(kind, provider) {
+  const name = PROVIDER_NAME[provider] ?? provider;
+  const key = { renewal: "Renew", unexpected_use: "Unexpected", runaway: "Runaway", limit_reached: "Limit" }[kind];
+  return { kind, title: t(`p${key}Title`, { provider: name }), body: t(`p${key}Body`, { provider: name }) };
+}
 
 function newWindow(before, w) {
   if (!before.resets_at) return false;
@@ -45,7 +57,7 @@ export function checkUsage(snap, prefs) {
         }
       } else if (prefs.usage && now > before.milestone) {
         const usable = a.resets?.some((r) => r.usable && r.count > 0);
-        if (now >= 100) notify(t("nLimitTitle", { provider }), [details, usable ? t("nLimitHasReset") : ""].filter(Boolean).join("\n"));
+        if (now >= 100) notify(t("nLimitTitle", { provider }), [details, usable ? t("nLimitHasReset") : ""].filter(Boolean).join("\n"), null, phoneForward("limit_reached", a.provider));
         else notify(t("nUsageTitle", { provider, p: now }), details);
       }
     }
@@ -59,6 +71,7 @@ export function checkUsage(snap, prefs) {
         invoke("notify_unexpected", {
           provider: a.provider, title: t("nUnexpectedTitle", { provider: PROVIDER_NAME[a.provider] }),
           body: t("nUnexpectedBody", { account: accountName(a) }), review: t("nUnexpectedReview"), security: t("nUnexpectedSecurity"),
+          phone: phoneForward("unexpected_use", a.provider),
         }).catch(() => {});
       }
     }
@@ -103,7 +116,10 @@ export async function checkPlans() {
     }
     const body = [accountName(a), a.kind === "renewal_wasteful" && a.verdict ? t(`subVerdict_${a.verdict}`) : "",
       a.monthly_cost != null ? t("perMonth", { v: money(a.monthly_cost) }) : ""].filter(Boolean).join(" · ");
-    notify(t("nRenewTitle", { provider, t: until(a.at) }), a.kind === "renewal_wasteful" ? `${body}\n${t("nRenewWasteHint")}` : body, "subscriptions");
+    // Only a renewal within a day goes to the phone.
+    const tomorrow = new Date(a.at) - Date.now() <= DAY_MS + 60 * 60 * 1000;
+    notify(t("nRenewTitle", { provider, t: until(a.at) }), a.kind === "renewal_wasteful" ? `${body}\n${t("nRenewWasteHint")}` : body, "subscriptions",
+      tomorrow ? phoneForward("renewal", a.provider) : null);
   }
 }
 
@@ -129,6 +145,37 @@ export async function checkDigest() {
     lines.push(t("nDigestPool", { provider: PROVIDER_NAME[p.provider], n: p.plans_needed, unit: p.unit, held: Math.round(p.plans_held * 10) / 10 }));
   }
   notify(t("nDigestTitle"), lines.join("\n"), "subscriptions");
+}
+
+/** What to do about a Codex account at its limit with a reset credit (see reset_credits.rs). */
+export function creditAdviceText(a) {
+  if (a.choice === "switch") return t("nCreditSwitch", { to: a.switch_to ? accountName(a.switch_to) : "", p: `${Math.round(a.switch_to?.left_percent ?? 0)}%` });
+  if (a.choice === "wait") return t("nCreditWait", { t: a.resets_at ? until(a.resets_at) : "" });
+  return a.reason === "expires_soon" && a.expires_at ? t("nCreditSpendExpires", { d: dayTime(a.expires_at) }) : t("nCreditSpendNoOther");
+}
+
+/**
+ * Runaway agents (see burn.rs) and Codex reset credits: spend or switch at the limit, and credits
+ * about to expire. The app decides what is due (honouring the notification settings); this only
+ * words it.
+ */
+export async function checkCapacity() {
+  let due;
+  try { due = await invoke("take_capacity_alerts"); } catch { return; }
+  for (const b of due?.burn ?? []) {
+    const lines = [b.trigger === "weekly_rise"
+      ? t("nBurnRise", { p: Math.round(b.rise_points ?? 0), m: b.rise_minutes ?? "" })
+      : t("nBurnLocal", { x: b.this_pc?.baseline ? Math.round(b.this_pc.tokens / b.this_pc.baseline) : "" })];
+    lines.push(b.limit_at ? t("nBurnLimit", { at: dayTime(b.limit_at) }) : t("nBurnLasts"));
+    const body = [lines.join(" · ")];
+    if (b.this_pc) body.push(t("nBurnThisPc", { repo: b.this_pc.repo, model: b.this_pc.model }));
+    notify(t("nBurnTitle", { provider: PROVIDER_NAME[b.provider], account: accountName(b) }), body.join("\n"), "usage");
+  }
+  for (const c of due?.credits ?? []) {
+    const provider = PROVIDER_NAME[c.provider];
+    if (c.kind === "expiring") notify(t("nCreditExpiringTitle", { provider, d: dayTime(c.expires_at) }), t("nCreditExpiringBody", { account: accountName(c), n: c.count }));
+    else notify(t("nCreditTitle", { provider, account: accountName(c) }), creditAdviceText(c));
+  }
 }
 
 /** An automatic switch (see the balancer) is worth a notification; a manual one isn't. */

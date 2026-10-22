@@ -78,6 +78,11 @@ fn hide(app: &AppHandle) {
     let _ = app.emit("panel-visible", false);
 }
 
+/// Esc in the flyout, like the shell's own flyouts.
+pub fn close(app: &AppHandle) {
+    hide(app);
+}
+
 pub fn on_blur(app: &AppHandle) {
     hide(app);
 }

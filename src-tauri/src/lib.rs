@@ -1,3 +1,5 @@
+// The MCP settings schema is one large json! literal; the default macro recursion limit (128) is too low.
+#![recursion_limit = "256"]
 #![cfg_attr(not(feature = "desktop"), allow(dead_code))]
 mod accounts;
 mod login;
@@ -13,7 +15,11 @@ mod subscriptions;
 mod headroom;
 mod plan_alerts;
 mod advisor;
+mod burn;
+mod reset_credits;
 mod ledger;
+mod backup;
+mod phone;
 mod codex_local;
 mod active_log;
 mod usage_index;
@@ -28,10 +34,16 @@ mod auto_monitor;
 mod calendar;
 mod digest;
 mod statusline;
+mod session_hook;
+mod leases;
+mod launcher;
+pub use session_hook::run as session_hook;
+pub use launcher::helper as launcher_helper;
 pub use statusline::run as statusline;
 pub use diagnostics::write_build_info;
 mod door;
-pub use door::wait_for_exit;
+mod instance;
+pub use instance::claim as claim_instance;
 mod mcp;
 pub use mcp::serve_stdio as serve_mcp;
 #[cfg(feature = "desktop")]

@@ -6,11 +6,14 @@
 //! contacts no provider: exports go through the running app's local door.
 //!
 //! With `--statusline` it instead prints one line for Claude Code's status line and exits (see
-//! `statusline`).
+//! `statusline`); with `--session-hook` it is Claude Code's SessionStart hook (see
+//! `session_hook`); `--pick` and `--release` serve the `slopbar-run` launcher (see `launcher`).
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--statusline") {
-        slopbar_lib::statusline();
-        return;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--statusline") => slopbar_lib::statusline(),
+        Some("--session-hook") => slopbar_lib::session_hook(),
+        Some("--pick" | "--release") => std::process::exit(slopbar_lib::launcher_helper(&args)),
+        _ => std::process::exit(if slopbar_lib::serve_mcp().is_ok() { 0 } else { 1 }),
     }
-    std::process::exit(if slopbar_lib::serve_mcp().is_ok() { 0 } else { 1 });
 }

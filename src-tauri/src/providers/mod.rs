@@ -120,7 +120,7 @@ pub async fn fetch_all(
                 billing: slot.billing(),
                 remote: vec![],
                 used_outside: false,
-                runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None,
+                runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None,
             };
             let entry = cache.entry(monitoring::key(slot)).or_default();
             match result {

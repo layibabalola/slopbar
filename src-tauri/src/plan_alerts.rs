@@ -174,7 +174,7 @@ pub(crate) mod tests {
             plan: Some("pro".into()), org: None, active: false, sources: vec![],
             windows: vec![UsageWindow { kind: "weekly".into(), window_seconds: Some(7 * 86400), used_percent: used, resets_at: Some(resets_at) }],
             credits: None, resets: vec![], error: None, monitor_error: None, stale: false, fetched_at: None,
-            monitor_connected: true, billing: BillingHints::default(), remote: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None,
+            monitor_connected: true, billing: BillingHints::default(), remote: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None,
         }
     }
 

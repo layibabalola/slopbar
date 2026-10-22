@@ -1,4 +1,4 @@
-use crate::{accounts, active_log, auto_monitor, balancer, ledger, bulk, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, migrate, model, monitoring, notify, panel, pins, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates, usage_index};
+use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, panel, phone, pins, plan_alerts, presence, providers, reset_credits, settings, sources, subscriptions, unexpected, updates, usage_index};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -56,6 +56,9 @@ pub struct AppState {
     unexpected_log: Mutex<unexpected::Log>,
     /// Plan notifications already shown (renewals, running out), so each is shown once.
     plan_alerts: Mutex<plan_alerts::Sent>,
+    /// Runaway agents seen in the past day (see `burn`), and notifications not yet shown.
+    burn_log: Mutex<burn::Log>,
+    burn_due: Mutex<Vec<burn::BurnAlert>>,
     /// What the plans have cost month by month (see `ledger`).
     ledger: Mutex<ledger::Ledger>,
     /// Connect monitoring automatically: how long accounts have been in use, and backoffs.
@@ -68,6 +71,8 @@ pub struct AppState {
     bulk_connect: Mutex<Option<BulkConnect>>,
     /// Why the switcher's shortcut could not be registered (taken by another app, say).
     hotkey_error: Mutex<Option<String>>,
+    /// Accounts reserved for jobs (see `leases`); in memory only.
+    pub(crate) leases: Mutex<leases::Leases>,
 }
 
 pub(crate) const SWITCHER_LABEL: &str = "switcher";
@@ -119,6 +124,7 @@ async fn health_report(app: &AppHandle) -> health::Report {
             any_wanted: n.usage || n.resets || n.switches || n.renewals || n.unexpected_use },
         auto_connect: settings.auto_connect_monitoring,
         vault_plaintext: accounts::plaintext_slots(),
+        processes: tauri::async_runtime::spawn_blocking(crate::instance::processes).await.ok().flatten(),
     }, chrono::Utc::now())
 }
 
@@ -129,11 +135,21 @@ async fn get_health(app: AppHandle) -> health::Report {
 
 /// Quits, then starts the installed executable again (the door's `restart_app`, Health's fix).
 fn restart(app: &AppHandle) -> Result<(), String> {
+    // One successor however many callers ask at once (parallel installs each ask).
+    static RESTARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if RESTARTING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return Ok(());
+    }
     // The installed executable, even if this one was renamed aside for an update.
     let exe = std::env::current_exe().map_err(|e| e.to_string())?
-        .with_file_name(if cfg!(windows) { "slopbar.exe" } else { "slopbar" });
-    std::process::Command::new(&exe).arg("--after").arg(std::process::id().to_string())
-        .spawn().map_err(|e| format!("restart failed: {e}"))?;
+        .with_file_name(crate::instance::APP_EXE);
+    // A duplicate of an older build ignores the instance lock and would take the door over once
+    // this one exits; it renews the same monitoring sessions, so it is ended rather than kept.
+    crate::instance::end_duplicates();
+    if let Err(e) = std::process::Command::new(&exe).arg("--after").arg(std::process::id().to_string()).spawn() {
+        RESTARTING.store(false, std::sync::atomic::Ordering::Release);
+        return Err(format!("restart failed: {e}"));
+    }
     let h = app.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -177,6 +193,19 @@ fn get_subscriptions(state: tauri::State<AppState>) -> subscriptions::Report {
     subscription_report(&state)
 }
 
+/// Each account's weekly usage over the last 7 days, for the sparklines (see
+/// `subscriptions::sparklines`), keyed `provider:id`.
+#[tauri::command]
+fn get_sparklines(state: tauri::State<AppState>) -> HashMap<String, Vec<(i64, f64)>> {
+    subscriptions::sparklines(&state.usage_history.lock().unwrap(), chrono::Utc::now())
+}
+
+/// Esc in the flyout closes it.
+#[tauri::command]
+fn hide_panel(app: AppHandle) {
+    panel::close(&app);
+}
+
 /// The plan notifications due now (see `plan_alerts`), each returned once. The taskbar widget
 /// asks after every refresh and words them in the user's language.
 #[tauri::command]
@@ -190,6 +219,28 @@ fn take_plan_alerts(state: tauri::State<AppState>) -> Vec<plan_alerts::Alert> {
     // Unsaved, they are still remembered until the app restarts.
     if !due.is_empty() { let _ = plan_alerts::save(&sent); }
     due
+}
+
+/// Runaway-agent (see `burn`) and reset-credit (see `reset_credits`) notifications due now, each
+/// returned once. The taskbar widget asks after every refresh and words them.
+#[tauri::command]
+fn take_capacity_alerts(state: tauri::State<AppState>) -> serde_json::Value {
+    let burn = std::mem::take(&mut *state.burn_due.lock().unwrap());
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    let enabled = state.settings.lock().unwrap().notifications.reset_credits;
+    let credits = if snapshot.updated_at.is_some() {
+        let mut sent = state.plan_alerts.lock().unwrap();
+        let due = reset_credits::due(&snapshot.accounts, enabled, &mut sent, chrono::Utc::now());
+        if !due.is_empty() { let _ = plan_alerts::save(&sent); }
+        due
+    } else { vec![] };
+    serde_json::json!({ "burn": burn, "credits": credits })
+}
+
+/// Spend or switch, per Codex account at its limit with a reset credit, for the flyout.
+#[tauri::command]
+fn get_credit_advice(state: tauri::State<AppState>) -> Vec<reset_credits::CreditAdvice> {
+    reset_credits::advise(&state.snapshot.lock().unwrap().accounts, chrono::Utc::now())
 }
 
 /// The Monday digest (see `digest`), once per week. The taskbar widget asks after every refresh
@@ -294,7 +345,14 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::GetSubscriptions => value(subscription_report(&app.state::<AppState>())),
         R::GetPlanAdvice => {
             let report = subscription_report(&app.state::<AppState>());
-            Ok(serde_json::json!({ "providers": report.advice, "generated_at": report.generated_at }))
+            let credits = reset_credits::advise(&app.state::<AppState>().snapshot.lock().unwrap().accounts, chrono::Utc::now());
+            Ok(serde_json::json!({ "providers": report.advice, "reset_credits": credits, "generated_at": report.generated_at }))
+        }
+        R::GetBurnAlerts => {
+            let state = app.state::<AppState>();
+            let settings = state.settings.lock().unwrap().clone();
+            let alerts = burn::seen(&state.burn_log.lock().unwrap(), chrono::Utc::now());
+            Ok(serde_json::json!({ "alerts": value(alerts)?, "thresholds": settings.burn, "notify": settings.notifications.burn, "notify_every_hours": burn::NOTIFY_EVERY_H }))
         }
         R::GetUsageBreakdown { provider, account, days, group_by } => {
             if days.is_some_and(|d| !(1..=usage_index::LOOKBACK_DAYS as u32).contains(&d)) {
@@ -303,6 +361,11 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             value(usage_breakdown(&app, usage_index::Filter { provider, account, days: days.unwrap_or(7), group_by: group_by.unwrap_or_default() }).await)
         }
         R::ExportCsv { folder } => value(write_csv(&app, folder).await?),
+        R::ExportBackup { path, passphrase } => write_backup(&app, path, passphrase).await,
+        R::RestoreBackup { path, passphrase, dry_run } => {
+            let bytes = tauri::async_runtime::spawn_blocking(move || backup::read(&path)).await.map_err(|_| "backup_unreadable".to_string())??;
+            value(apply_backup(&app, bytes, passphrase, dry_run).await?)
+        }
         R::UpdateSettings { patch } => {
             let state = app.state::<AppState>();
             let _held = state.settings_lock.lock().await;
@@ -337,16 +400,11 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             };
             Ok(serde_json::json!({ "accounts": value(accounts)?, "updated_at": snapshot.updated_at }))
         }
-        R::RecommendAccount { provider, expected_percent, hours, switch } => {
+        R::RecommendAccount { provider, expected_percent, hours, switch, lease_id } => {
             if expected_percent.is_some_and(|p| !(0.0..=100.0).contains(&p)) || hours.is_some_and(|h| !(0.0..=168.0).contains(&h)) {
                 return Err("expected_percent must be 0-100 and hours 0-168".into());
             }
-            let rec = {
-                let state = app.state::<AppState>();
-                let snapshot = state.snapshot.lock().unwrap().clone();
-                let settings = state.settings.lock().unwrap().clone();
-                headroom::recommend(&snapshot.accounts, &settings, provider, expected_percent, hours, chrono::Utc::now())
-            };
+            let rec = recommend_unleased(&app, provider, expected_percent, hours, lease_id.as_deref());
             let mut result = value(&rec)?;
             result["switched"] = false.into();
             if let (true, headroom::Action::Switch, Some(id)) = (switch, rec.action, rec.recommended.clone()) {
@@ -356,6 +414,47 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             }
             Ok(result)
         }
+        R::LeaseAccount { provider, purpose, minutes, expected_percent, id } => {
+            if expected_percent.is_some_and(|p| !(0.0..=100.0).contains(&p)) {
+                return Err("expected_percent must be 0-100".into());
+            }
+            lease_account(&app, provider, &purpose, minutes, expected_percent, id, None).await
+        }
+        R::ReleaseLease { lease_id } => {
+            let released = app.state::<AppState>().leases.lock().unwrap().release(&lease_id).ok_or("no_such_lease")?;
+            leases_changed(&app).await;
+            Ok(serde_json::json!({ "released": true, "lease": value(released)? }))
+        }
+        R::ListLeases => {
+            prune_leases(&app).await;
+            Ok(serde_json::json!({ "leases": value(app.state::<AppState>().leases.lock().unwrap().list())? }))
+        }
+        R::PickAccount { provider, pid, purpose, expected_percent } => {
+            if expected_percent.is_some_and(|p| !(0.0..=100.0).contains(&p)) {
+                return Err("expected_percent must be 0-100".into());
+            }
+            if !leases::process_alive(pid) {
+                return Err("pid_not_running".into());
+            }
+            prune_leases(&app).await;
+            let rec = recommend_unleased(&app, provider, expected_percent, None, None);
+            let Some(id) = rec.recommended.clone() else { return Err(format!("no_account_free: {}", rec.summary)) };
+            let label = rec.recommended_label.clone();
+            let at_default = rec.ranking.iter().any(|c| c.id == id && c.active);
+            if at_default && purpose.is_none() {
+                return Ok(serde_json::json!({ "id": id, "label": label, "dir": null, "env_var": pins::env_var(provider), "lease_id": null, "note": null }));
+            }
+            let mut leased = lease_account(&app, provider, purpose.as_deref().unwrap_or("slopbar-run"), None, expected_percent, Some(id), Some(pid)).await?;
+            leased["dir"] = leased["config_dir"].clone();
+            leased["lease_id"] = leased["lease"]["lease_id"].clone();
+            leased["note"] = if !at_default && leased["dir"].is_null() {
+                "the recommended account's profile is not signed in yet, so this runs on the CLI's current sign-in".into()
+            } else {
+                serde_json::Value::Null
+            };
+            Ok(leased)
+        }
+        R::RecordSession { session_id, cwd, config_dir } => record_session(&app, session_id, cwd, config_dir).await,
         R::AddAccount { provider } => {
             // One pending sign-in per provider, so a retrying agent cannot flood the desktop.
             let pending = app.state::<AppState>().account_operations.begin(provider, "add-account")?;
@@ -418,6 +517,8 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             "version": app_version(app.clone()),
             "updates_enabled": updates_enabled(),
             "build": diagnostics::build_info(),
+            // Which process answers the door (the installer quits exactly this one).
+            "pid": std::process::id(),
         })),
         R::InspectWindow { window, page, screenshot } => {
             let target = match window {
@@ -782,18 +883,128 @@ async fn remove_one(app: &AppHandle, provider: Provider, id: &str) -> Result<(),
 async fn sync_pins(app: &AppHandle, active: Option<accounts::Active>) {
     let state = app.state::<AppState>();
     let pins = state.settings.lock().unwrap().project_pins.clone();
+    let wanted = profile_accounts(&state);
     let found = state.sources.lock().unwrap().clone();
     let states = tauri::async_runtime::spawn_blocking(move || {
         // Never decide what is signed in by default from an empty source list.
         let found = if found.is_empty() { sources::discover() } else { found };
         let active = active.unwrap_or_else(|| accounts::capture(&found));
-        let states = accounts::sync_profiles(&pins::wanted(&pins), &active);
-        if !pins.is_empty() || pins::bin_dir().is_some_and(|d| d.exists()) {
-            let _ = pins::write_launcher(&pins);
-        }
+        let states = accounts::sync_profiles(&wanted, &active);
+        // The launcher also serves folders without pins (see `launcher`).
+        let _ = pins::write_launcher(&pins);
         states
     }).await.unwrap_or_default();
     *state.profile_states.lock().unwrap() = states;
+}
+
+/// The accounts whose project profiles stay signed in: pinned ones and leased ones (a leased
+/// account's job may run with its profile, see `leases`).
+fn profile_accounts(state: &AppState) -> Vec<(Provider, String)> {
+    let mut wanted = pins::wanted(&state.settings.lock().unwrap().project_pins);
+    for account in state.leases.lock().unwrap().accounts() {
+        if !wanted.contains(&account) { wanted.push(account); }
+    }
+    wanted
+}
+
+// ---------------------------------------------------------------------------------------------
+// Leases (see `leases`)
+
+/// recommend_account's answer without the accounts leased by anyone but `mine`.
+fn recommend_unleased(app: &AppHandle, provider: Provider, expected_percent: Option<f64>, hours: Option<f64>, mine: Option<&str>) -> headroom::Recommendation {
+    let state = app.state::<AppState>();
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    let settings = state.settings.lock().unwrap().clone();
+    let rec = headroom::recommend(&snapshot.accounts, &settings, provider, expected_percent, hours, chrono::Utc::now());
+    let leased = state.leases.lock().unwrap().others(provider, mine);
+    headroom::without_leased(rec, &leased)
+}
+
+/// Shows each account's lease on the snapshot (the flyout's "leased: <purpose>").
+fn mark_leases(state: &AppState, snapshot: &mut Snapshot) {
+    let leases = state.leases.lock().unwrap();
+    for a in &mut snapshot.accounts {
+        a.leased = leases.holder(a.provider, &a.id).map(|l| l.purpose.clone());
+    }
+}
+
+/// After leases change: the windows show them and leased accounts' profiles are signed in or out.
+async fn leases_changed(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let snapshot = {
+        let mut snapshot = state.snapshot.lock().unwrap().clone();
+        mark_leases(&state, &mut snapshot);
+        *state.snapshot.lock().unwrap() = snapshot.clone();
+        snapshot
+    };
+    let _ = app.emit("usage-updated", &snapshot);
+    sync_pins(app, None).await;
+}
+
+/// Ends expired leases and those whose process exited.
+async fn prune_leases(app: &AppHandle) {
+    let ended = app.state::<AppState>().leases.lock().unwrap().prune(chrono::Utc::now(), leases::process_alive);
+    if ended { leases_changed(app).await; }
+}
+
+/// Leases account `id` (else the recommended one among those nobody leased) for `purpose`, and
+/// says how to run on it: `config_dir` is its project profile, or null while it is the CLI's
+/// current sign-in.
+async fn lease_account(app: &AppHandle, provider: Provider, purpose: &str, minutes: Option<u32>, expected_percent: Option<f64>, id: Option<String>, pid: Option<u32>) -> Result<serde_json::Value, String> {
+    prune_leases(app).await;
+    let state = app.state::<AppState>();
+    let (id, label, active) = match id {
+        Some(id) => {
+            let snapshot = state.snapshot.lock().unwrap();
+            let account = snapshot.accounts.iter().find(|a| a.provider == provider && a.id == id).ok_or("monitor_wrong_account")?;
+            (id, account.alias.clone().or(account.email.clone()), account.active)
+        }
+        None => {
+            let rec = recommend_unleased(app, provider, expected_percent, None, None);
+            let id = rec.recommended.clone().ok_or_else(|| format!("no_account_free: {}", rec.summary))?;
+            let active = rec.ranking.iter().any(|c| c.id == id && c.active);
+            (id, rec.recommended_label.clone(), active)
+        }
+    };
+    let lease = state.leases.lock().unwrap().take(provider, &id, purpose, minutes, pid, chrono::Utc::now())?;
+    leases_changed(app).await;
+    let profile = accounts::profiles_root().map(|r| r.join(accounts::profile_name(provider, &id)));
+    let ready = state.profile_states.lock().unwrap().get(&(provider, id.clone())) == Some(&accounts::ProfileState::Ready);
+    let config_dir = profile.filter(|_| ready && !active).map(|p| p.to_string_lossy().into_owned());
+    Ok(serde_json::json!({
+        "lease": serde_json::to_value(&lease).map_err(|e| e.to_string())?,
+        "id": id, "label": label, "expires_at": lease.expires_at,
+        "env_var": pins::env_var(provider), "config_dir": config_dir, "at_default": active,
+        "next": "Run the job with env_var set to config_dir for that job only (null: the account is the CLI's current sign-in), then release_lease.",
+    }))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Exact Claude attribution (see `session_hook`)
+
+/// Records which Claude account a session started on: the account signed in to its config dir,
+/// or with none given (the default login), the account SlopBar sees signed in to Claude Code.
+async fn record_session(app: &AppHandle, session_id: String, cwd: Option<String>, config_dir: Option<String>) -> Result<serde_json::Value, String> {
+    if !crate::session_hook::valid_session_id(&session_id) {
+        return Err("bad_session_id".into());
+    }
+    let state = app.state::<AppState>();
+    let default = || {
+        let snapshot = state.snapshot.lock().unwrap();
+        active_log::active_ids(&snapshot.accounts).into_iter().find(|(p, _)| *p == Provider::Claude).map(|(_, id)| id.to_string())
+    };
+    let id = match config_dir.filter(|d| std::path::Path::new(d).is_absolute()) {
+        Some(dir) => tauri::async_runtime::spawn_blocking(move || accounts::login_at(Provider::Claude, std::path::Path::new(&dir))).await.ok().flatten(),
+        None => default(),
+    };
+    let Some(id) = id else { return Ok(serde_json::json!({ "recorded": false, "reason": "unknown_account" })) };
+    let now = chrono::Utc::now();
+    let changed = state.active_log.lock().unwrap().record_session(&session_id, &id, cwd.as_deref().unwrap_or(""), now);
+    if changed {
+        let log = state.active_log.lock().unwrap().clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || active_log::save(&log)).await;
+    }
+    Ok(serde_json::json!({ "recorded": true }))
 }
 
 fn pin_listing(app: &AppHandle) -> pins::Listing {
@@ -1056,6 +1267,17 @@ async fn store_settings(app: &AppHandle, settings: Settings) -> Result<(), Strin
     let settings = if settings.switcher_hotkey == stored { settings } else {
         Settings { switcher_hotkey: settings::normalize_hotkey(&settings.switcher_hotkey)?, ..settings }
     };
+    // And a changed phone-alert URL: only an ntfy topic URL, never plain http to the internet.
+    let stored_phone = app.state::<AppState>().settings.lock().unwrap().phone.url.clone();
+    let mut settings = settings;
+    if settings.phone.url != stored_phone {
+        if let Some(url) = settings.phone.url.as_deref().filter(|u| !u.trim().is_empty()) {
+            settings.phone.url = Some(phone::normalize_url(url)?);
+        } else {
+            settings.phone.url = None;
+        }
+    }
+    if settings.phone.url.is_none() { settings.phone.enabled = false; }
     settings::save(&settings)?;
     diagnostics::set_crash_records(settings.crash_records);
     let previous = std::mem::replace(&mut *app.state::<AppState>().settings.lock().unwrap(), settings.clone());
@@ -1180,47 +1402,61 @@ fn http_client() -> reqwest::Client {
 }
 
 /// Captures live logins into the vault, fetches every account's usage, then lets the balancer
-/// switch accounts that reached their threshold.
+/// switch accounts that reached their threshold. The widget gets the new numbers as soon as they
+/// are known; sharing and bookkeeping follow, and the index, calendar and Codex scans run after.
 async fn do_refresh(app: &AppHandle) -> Snapshot {
+    use diagnostics::RefreshPhase as P;
     let state = app.state::<AppState>();
     let _refresh = state.refresh_lock.lock().await;
+    // Ended leases free their accounts (and profiles) before this refresh decides anything.
+    state.leases.lock().unwrap().prune(chrono::Utc::now(), leases::process_alive);
     let started = Instant::now();
+    let mut phases = diagnostics::Phases::start();
     let settings = state.settings.lock().unwrap().clone();
     state.diagnostics.poll_started(settings.refresh_minutes);
     let found = tauri::async_runtime::spawn_blocking(sources::discover)
         .await
         .unwrap_or_default();
     *state.sources.lock().unwrap() = found.clone();
-    static CLEANUP_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let profiles = accounts::profile_sources(&pins::wanted(&settings.project_pins));
+    phases.end(P::Discover);
+    let profiles = accounts::profile_sources(&profile_accounts(&state));
     accounts::resolve_identities(&http_client(), &[found.clone(), profiles].concat()).await;
+    phases.end(P::Identities);
     let scan = found.clone();
     let active = tauri::async_runtime::spawn_blocking(move || accounts::capture(&scan))
         .await
         .unwrap_or_default();
+    phases.end(P::Capture);
     // Before reading the vault: renewals made in project profiles are synced into it.
     sync_pins(app, Some(active.clone())).await;
+    phases.end(P::Pins);
     let slots = tauri::async_runtime::spawn_blocking(accounts::load_slots).await.unwrap_or_default();
+    phases.end(P::Vault);
+    static CLEANUP_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !CLEANUP_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        let homes = found.clone();
-        let protected = state.monitor.protected_tokens(&slots).await;
-        let started = Instant::now();
-        let result = tauri::async_runtime::spawn_blocking(move || crate::login::cleanup(&homes, protected.as_ref())).await;
-        state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::Cleanup,
-            code: if result.is_ok() { diagnostics::Code::Ok } else { diagnostics::Code::Other }, elapsed_ms: diagnostics::millis(started) });
+        // Leftover sign-in folders from earlier runs: once, beside this refresh.
+        let (app, homes, slots) = (app.clone(), found.clone(), slots.clone());
+        tauri::async_runtime::spawn(async move {
+            let state = app.state::<AppState>();
+            let protected = state.monitor.protected_tokens(&slots).await;
+            let started = Instant::now();
+            let result = tauri::async_runtime::spawn_blocking(move || crate::login::cleanup(&homes, protected.as_ref())).await;
+            state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::Cleanup,
+                code: if result.is_ok() { diagnostics::Code::Ok } else { diagnostics::Code::Other }, elapsed_ms: diagnostics::millis(started) });
+        });
     }
 
     let mut cache = state.usage_cache.lock().unwrap().clone();
     let mut list = providers::fetch_all(&http_client(), &slots, &active, &mut cache, &settings, &state.monitor).await;
     let valid: HashSet<_> = slots.iter().map(monitoring::key).collect();
     cache.retain(|key, _| valid.contains(key));
-    let saved = providers::save_cache(&cache);
-    if saved.is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::CacheSave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
-    *state.usage_cache.lock().unwrap() = cache;
+    *state.usage_cache.lock().unwrap() = cache.clone();
+    phases.end(P::Fetch);
 
     let decisions = {
         let last = state.last_switch.lock().unwrap().clone();
-        balancer::decide(&list, &settings, &last)
+        let leased = state.leases.lock().unwrap().accounts();
+        balancer::decide_avoiding(&list, &settings, &last, &leased)
     };
     for (provider, id) in decisions {
         // Publish the current numbers first so the switch notice can name both accounts.
@@ -1239,6 +1475,21 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
                 }
             }
         }
+    }
+    phases.end(P::Balance);
+
+    // The widget redraws now: what sharing and forecasts add is carried over from the last
+    // refresh until they are worked out below.
+    {
+        let mut early = list.clone();
+        carry_over(&mut early, &state.snapshot.lock().unwrap().accounts);
+        let early = Snapshot { accounts: early, updated_at: Some(chrono::Utc::now()) };
+        *state.snapshot.lock().unwrap() = early.clone();
+        let _ = app.emit("usage-updated", &early);
+    }
+    phases.end(P::Publish);
+    if providers::save_cache(&cache).is_err() {
+        state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::CacheSave, code: diagnostics::Code::Storage, elapsed_ms: 0 });
     }
 
     // Other machines: what they share through the presence folder, then what rising usage implies.
@@ -1276,6 +1527,7 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     if let Some(log) = log {
         let _ = unexpected::save(&log);
     }
+    phases.end(P::Presence);
 
     let mut snapshot = Snapshot { accounts: list, updated_at: Some(chrono::Utc::now()) };
     state.diagnostics.samples(&snapshot);
@@ -1301,9 +1553,14 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
             seen.last_success = snapshot.updated_at;
         }
     }
+    mark_leases(&state, &mut snapshot);
+    phases.end(P::Bookkeeping);
     *state.snapshot.lock().unwrap() = snapshot.clone();
     record_spend(&state);
     let _ = app.emit("usage-updated", &snapshot);
+    phases.end(P::Final);
+    state.diagnostics.record(None, None, phases.event());
+    // Off the refresh: each runs one at a time on its own.
     if settings.providers.codex { scan_codex_local(app); }
     if settings.calendar.enabled {
         let app = app.clone();
@@ -1311,6 +1568,19 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     }
     scan_usage_index(app);
     snapshot
+}
+
+/// Gives freshly fetched accounts what the last refresh worked out from sharing and forecasts,
+/// so the early redraw does not blank them for a moment.
+fn carry_over(list: &mut [crate::model::AccountUsage], previous: &[crate::model::AccountUsage]) {
+    for a in list.iter_mut() {
+        if let Some(p) = previous.iter().find(|p| p.provider == a.provider && p.id == a.id) {
+            a.remote = p.remote.clone();
+            a.used_outside = p.used_outside;
+            a.runs_out_at = p.runs_out_at;
+            a.unexpected = p.unexpected.clone();
+        }
+    }
 }
 
 /// Records which account each CLI has signed in, seeding the log once from the diagnostics
@@ -1347,8 +1617,30 @@ fn scan_usage_index(app: &AppHandle) {
         let index = tauri::async_runtime::spawn_blocking(|| usage_index::scan(chrono::Utc::now())).await;
         SCANNING.store(false, std::sync::atomic::Ordering::Release);
         let Ok(index) = index else { return };
-        *app.state::<AppState>().usage_index.lock().unwrap() = Some(index);
+        *app.state::<AppState>().usage_index.lock().unwrap() = Some(index.clone());
+        let _ = tauri::async_runtime::spawn_blocking(move || check_burn(&app, &index)).await;
     });
+}
+
+/// Looks for runaway agents (see `burn`) with the index just read, queuing their notifications
+/// for the taskbar widget.
+fn check_burn(app: &AppHandle, index: &usage_index::Index) {
+    let state = app.state::<AppState>();
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    if snapshot.updated_at.is_none() { return; }
+    let settings = state.settings.lock().unwrap().clone();
+    let now = chrono::Utc::now();
+    let log = state.active_log.lock().unwrap().clone();
+    let window = chrono::Duration::minutes(settings.burn.minutes as i64);
+    let rates = usage_index::local_rates(index, &log, &usage_index::Known::from_snapshot(&snapshot), window, chrono::Duration::days(burn::BASELINE_DAYS), now);
+    let found = burn::detect(&snapshot.accounts, &state.recent.lock().unwrap(), &rates, &settings, now);
+    let (due, changed) = {
+        let mut log = state.burn_log.lock().unwrap();
+        let (due, changed) = burn::apply(&mut log, found, settings.notifications.burn, now);
+        (due, changed.then(|| log.clone()))
+    };
+    if let Some(log) = changed { let _ = burn::save(&log); }
+    state.burn_due.lock().unwrap().extend(due);
 }
 
 /// The last index, or a scan now when there is none yet.
@@ -1409,6 +1701,98 @@ async fn export_csv(app: AppHandle, folder: Option<String>) -> Result<csv_export
 #[tauri::command]
 fn csv_default_folder() -> Option<String> {
     csv_export::default_folder().map(|p| p.to_string_lossy().into_owned())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Backup and restore (see `backup`)
+
+/// Seals settings, the weekly history and the spend ledger into a backup file. Only the slots'
+/// provider, id and email are read from the vault.
+async fn write_backup(app: &AppHandle, path: Option<String>, passphrase: backup::Passphrase) -> Result<serde_json::Value, String> {
+    let state = app.state::<AppState>();
+    let settings = state.settings.lock().unwrap().clone();
+    let history = state.usage_history.lock().unwrap().clone();
+    let ledger = state.ledger.lock().unwrap().clone();
+    let version = app_version(app.clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        let accounts = accounts::load_slots().into_iter().map(|s| backup::Account { provider: s.provider, id: s.id, email: s.email });
+        let now = chrono::Utc::now();
+        let contents = backup::Contents::new(&settings, &history, &ledger, accounts, &version, now);
+        let stamp = now.with_timezone(&chrono::Local).format("%Y-%m-%d-%H%M%S").to_string();
+        let target = backup::target(path.as_deref(), csv_export::default_folder(), &stamp)?;
+        let bytes = backup::seal(&contents, &passphrase)?;
+        backup::write(&target, &bytes)?;
+        Ok(serde_json::json!({ "path": target, "bytes": bytes.len(), "note": backup::NOTE }))
+    }).await.map_err(|_| "backup_unwritable".to_string())?
+}
+
+/// Opens a backup and previews merging it; unless `dry_run`, also saves and applies the result.
+async fn apply_backup(app: &AppHandle, bytes: Vec<u8>, passphrase: backup::Passphrase, dry_run: bool) -> Result<backup::Preview, String> {
+    let contents = tauri::async_runtime::spawn_blocking(move || backup::open(&bytes, &passphrase))
+        .await.map_err(|_| "backup_unreadable".to_string())??;
+    let known: Vec<(Provider, String)> = tauri::async_runtime::spawn_blocking(|| accounts::load_slots().into_iter().map(|s| (s.provider, s.id)).collect())
+        .await.unwrap_or_default();
+    let state = app.state::<AppState>();
+    let held = state.settings_lock.lock().await;
+    let current = state.settings.lock().unwrap().clone();
+    let now = chrono::Utc::now();
+    let (merged_settings, preview, history, ledger) = {
+        let folder = |f: &str| pins::normalize_folder(f).ok();
+        let presence_ok = |f: &str| settings::valid_presence_folder(f);
+        let calendar_ok = |p: &str| calendar::valid_path(p);
+        let here = backup::Here { known: &known, updates_enabled: updates_enabled(), folder: &folder, presence_folder_ok: &presence_ok, calendar_path_ok: &calendar_ok };
+        // Both held while merging, so a refresh finishing meanwhile is not lost.
+        let mut history = state.usage_history.lock().unwrap();
+        let mut ledger = state.ledger.lock().unwrap();
+        let (merged, preview) = backup::merge(&current, &history, &ledger, &contents, &here, now);
+        if dry_run { return Ok(preview); }
+        *history = merged.history.clone();
+        *ledger = merged.ledger.clone();
+        (merged.settings, preview, merged.history, merged.ledger)
+    };
+    subscriptions::save(&history)?;
+    ledger::save(&ledger)?;
+    store_settings(app, merged_settings).await?;
+    drop(held);
+    sync_pins(app, None).await;
+    do_refresh(app).await;
+    Ok(preview)
+}
+
+#[tauri::command]
+async fn export_backup(app: AppHandle, path: Option<String>, passphrase: backup::Passphrase) -> Result<serde_json::Value, String> {
+    write_backup(&app, path, passphrase).await
+}
+
+/// The Settings window reads the chosen file itself and passes its contents.
+#[tauri::command]
+async fn restore_backup(app: AppHandle, contents: String, passphrase: backup::Passphrase, dry_run: bool) -> Result<backup::Preview, String> {
+    apply_backup(&app, contents.into_bytes(), passphrase, dry_run).await
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phone alerts (see `phone`)
+
+#[tauri::command]
+fn phone_token_saved() -> bool {
+    settings::app_dir().is_some_and(|d| phone::load_token(&d).is_some())
+}
+
+/// Saves the access token with DPAPI; null or empty deletes it.
+#[tauri::command]
+async fn set_phone_token(token: Option<String>) -> Result<(), String> {
+    let dir = settings::app_dir().ok_or("phone_token_storage")?;
+    tauri::async_runtime::spawn_blocking(move || phone::store_token(&dir, token.as_deref())).await.map_err(|_| "phone_token_storage".to_string())?
+}
+
+/// "Send test": the saved URL and token, whether or not phone alerts are on.
+#[tauri::command]
+async fn send_phone_test(app: AppHandle, title: String, body: String) -> Result<(), String> {
+    let phone_settings = app.state::<AppState>().settings.lock().unwrap().phone.clone();
+    let url = phone_settings.url.clone().ok_or("phone_url_missing")?;
+    let message = phone::compose(&phone_settings, phone::Kind::Test, (&title, &body), (&title, &body)).ok_or("phone_url_missing")?;
+    let token = settings::app_dir().and_then(|d| phone::load_token(&d));
+    phone::send(&phone::client(), &url, token.as_deref(), &message).await
 }
 
 /// Re-reads the Codex CLI's local history off the async runtime, one scan at a time, then has
@@ -1521,12 +1905,15 @@ pub fn run() {
         presence_tracks: Mutex::default(),
         unexpected_log: Mutex::new(unexpected::load()),
         plan_alerts: Mutex::new(plan_alerts::load()),
+        burn_log: Mutex::new(burn::load()),
+        burn_due: Mutex::default(),
         ledger: Mutex::new(ledger::load()),
         auto_monitor: Mutex::new(auto_monitor::Tracker::new(auto_monitor::load())),
         health: Mutex::default(),
         profile_states: Mutex::default(),
         bulk_connect: Mutex::default(),
         hotkey_error: Mutex::default(),
+        leases: Mutex::default(),
     };
     tauri::Builder::default()
         // Must come first: a second launch hands over to the running instance and exits.
@@ -1550,10 +1937,19 @@ pub fn run() {
             get_health,
             restart_app,
             get_subscriptions,
+            get_sparklines,
+            hide_panel,
             get_usage_breakdown,
             export_csv,
             csv_default_folder,
+            export_backup,
+            restore_backup,
+            phone_token_saved,
+            set_phone_token,
+            send_phone_test,
             take_plan_alerts,
+            take_capacity_alerts,
+            get_credit_advice,
             take_digest,
             export_calendar,
             check_calendar_path,
