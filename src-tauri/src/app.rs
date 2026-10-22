@@ -97,7 +97,7 @@ struct HealthSeen {
 }
 
 /// Settings > Health and the agents' `get_health`: computed from state the app already has.
-async fn health_report(app: &AppHandle) -> health::Report {
+pub(crate) async fn health_report(app: &AppHandle) -> health::Report {
     let state = app.state::<AppState>();
     let snapshot = state.snapshot.lock().unwrap().clone();
     let settings = state.settings.lock().unwrap().clone();
@@ -206,13 +206,17 @@ fn hide_panel(app: AppHandle) {
     panel::close(&app);
 }
 
-/// The plan notifications due now (see `plan_alerts`), each returned once. The taskbar widget
-/// asks after every refresh and words them in the user's language.
+/// The plan notifications due now (see `plan_alerts`), each returned once. The app asks after
+/// every refresh and words them (see `alerts`).
 #[tauri::command]
 fn take_plan_alerts(state: tauri::State<AppState>) -> Vec<plan_alerts::Alert> {
+    plan_alerts_due(&state)
+}
+
+pub(crate) fn plan_alerts_due(state: &AppState) -> Vec<plan_alerts::Alert> {
     let snapshot = state.snapshot.lock().unwrap().clone();
     if snapshot.updated_at.is_none() { return vec![]; }
-    let report = subscription_report(&state);
+    let report = subscription_report(state);
     let prefs = state.settings.lock().unwrap().notifications.clone();
     let mut sent = state.plan_alerts.lock().unwrap();
     let due = plan_alerts::due(&report, &snapshot, &prefs, &mut sent, chrono::Utc::now());
@@ -222,9 +226,13 @@ fn take_plan_alerts(state: tauri::State<AppState>) -> Vec<plan_alerts::Alert> {
 }
 
 /// Runaway-agent (see `burn`) and reset-credit (see `reset_credits`) notifications due now, each
-/// returned once. The taskbar widget asks after every refresh and words them.
+/// returned once. The app asks after every refresh and words them (see `alerts`).
 #[tauri::command]
 fn take_capacity_alerts(state: tauri::State<AppState>) -> serde_json::Value {
+    capacity_alerts_due(&state)
+}
+
+pub(crate) fn capacity_alerts_due(state: &AppState) -> serde_json::Value {
     let burn = std::mem::take(&mut *state.burn_due.lock().unwrap());
     let snapshot = state.snapshot.lock().unwrap().clone();
     let enabled = state.settings.lock().unwrap().notifications.reset_credits;
@@ -243,15 +251,19 @@ fn get_credit_advice(state: tauri::State<AppState>) -> Vec<reset_credits::Credit
     reset_credits::advise(&state.snapshot.lock().unwrap().accounts, chrono::Utc::now())
 }
 
-/// The Monday digest (see `digest`), once per week. The taskbar widget asks after every refresh
-/// and words it in the user's language.
+/// The Monday digest (see `digest`), once per week. The app asks after every refresh and words
+/// it (see `alerts`).
 #[tauri::command]
 fn take_digest(state: tauri::State<AppState>) -> Option<digest::Digest> {
+    digest_due(&state)
+}
+
+pub(crate) fn digest_due(state: &AppState) -> Option<digest::Digest> {
     if state.snapshot.lock().unwrap().updated_at.is_none() { return None; }
     let enabled = state.settings.lock().unwrap().notifications.digest;
     let local = chrono::Local::now().naive_local();
     digest::week_due(local)?;
-    let report = subscription_report(&state);
+    let report = subscription_report(state);
     let history = state.usage_history.lock().unwrap().clone();
     let mut sent = state.plan_alerts.lock().unwrap();
     let digest = digest::take(&report, &history, enabled, &mut sent, local, chrono::Utc::now());
@@ -524,6 +536,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             let target = match window {
                 door::InspectTarget::Settings => inspect::Target::Settings,
                 door::InspectTarget::Flyout => inspect::Target::Flyout,
+                door::InspectTarget::Widget => inspect::Target::Widget,
                 door::InspectTarget::Switcher => {
                     switcher_window(&app).await.ok_or("window not available")?;
                     inspect::Target::Switcher
@@ -621,6 +634,7 @@ async fn switch_to(app: &AppHandle, provider: Provider, id: String, auto: bool) 
         to: account_label(app, provider, &id),
         auto,
     };
+    crate::alerts::on_switch(app, event.provider, event.to.as_deref(), event.auto);
     let _ = app.emit("account-switched", event);
     Ok(())
 }
@@ -694,6 +708,7 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
     if auto {
         let name = app.state::<AppState>().snapshot.lock().unwrap().accounts.iter()
             .find(|a| a.provider == provider && a.id == id).and_then(|a| a.alias.clone().or_else(|| a.email.clone()));
+        crate::alerts::on_monitor_auto_started(&app, name.as_deref());
         let _ = app.emit("monitoring-auto-started", serde_json::json!({ "provider": provider, "id": id, "name": name }));
     }
     Ok(tauri::async_runtime::spawn(async move {
@@ -938,6 +953,7 @@ async fn leases_changed(app: &AppHandle) {
         snapshot
     };
     let _ = app.emit("usage-updated", &snapshot);
+    crate::alerts::on_snapshot(&app);
     sync_pins(app, None).await;
 }
 
@@ -1322,15 +1338,11 @@ fn set_dock_width(app: AppHandle, width: f64) {
     *app.state::<AppState>().dock_width.lock().unwrap() = width;
 }
 
+/// A click on the taskbar widget (web or native) opens the flyout above it.
 #[tauri::command]
-fn dock_clicked(app: AppHandle) {
-    if let Some(w) = app.get_webview_window(dock::LABEL) {
-        if let (Ok(pos), Ok(size)) = (w.outer_position(), w.outer_size()) {
-            *app.state::<AppState>().panel_anchor.lock().unwrap() = Some((
-                pos.x as f64 + size.width as f64 / 2.0,
-                pos.y as f64 + size.height as f64 / 2.0,
-            ));
-        }
+pub(crate) fn dock_clicked(app: AppHandle) {
+    if let Some(anchor) = dock::anchor(&app) {
+        *app.state::<AppState>().panel_anchor.lock().unwrap() = Some(anchor);
     }
     panel::toggle(&app);
 }
@@ -1383,6 +1395,19 @@ pub(crate) fn show_settings(app: &AppHandle) {
     }
 }
 
+/// The widget's right-click menu (the web widget's Tauri menu, or the native widget's own).
+pub(crate) fn menu_event(app: &AppHandle, id: &str) {
+    match id {
+        "refresh" => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move { do_refresh(&app).await });
+        }
+        "settings" => show_settings(app),
+        "quit" => app.exit(0),
+        _ => {}
+    }
+}
+
 /// Applies the settings that live outside the webviews.
 pub(crate) fn apply_settings(app: &AppHandle) {
     let settings = app.state::<AppState>().settings.lock().unwrap().clone();
@@ -1390,6 +1415,7 @@ pub(crate) fn apply_settings(app: &AppHandle) {
     if autolaunch.is_enabled().unwrap_or(false) != settings.launch_at_login {
         let _ = if settings.launch_at_login { autolaunch.enable() } else { autolaunch.disable() };
     }
+    dock::apply_mode(app, settings.native_widget);
     let _ = app.emit("settings-changed", &settings);
 }
 
@@ -1486,6 +1512,7 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
         let early = Snapshot { accounts: early, updated_at: Some(chrono::Utc::now()) };
         *state.snapshot.lock().unwrap() = early.clone();
         let _ = app.emit("usage-updated", &early);
+        crate::alerts::on_snapshot(&app);
     }
     phases.end(P::Publish);
     if providers::save_cache(&cache).is_err() {
@@ -1558,6 +1585,7 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     *state.snapshot.lock().unwrap() = snapshot.clone();
     record_spend(&state);
     let _ = app.emit("usage-updated", &snapshot);
+    crate::alerts::on_snapshot(&app);
     phases.end(P::Final);
     state.diagnostics.record(None, None, phases.event());
     // Off the refresh: each runs one at a time on its own.
@@ -1809,6 +1837,7 @@ fn scan_codex_local(app: &AppHandle) {
         *state.codex_local.lock().unwrap() = Some(std::sync::Arc::new(local));
         let snapshot = state.snapshot.lock().unwrap().clone();
         let _ = app.emit("usage-updated", &snapshot);
+        crate::alerts::on_snapshot(&app);
     });
 }
 
@@ -2021,15 +2050,7 @@ pub fn run() {
             let menu = Menu::with_items(app, &[&items[0], &items[1], &separator, &items[2]])?;
             *app.state::<AppState>().menu.lock().unwrap() = Some(menu);
             *app.state::<AppState>().menu_items.lock().unwrap() = items;
-            app.on_menu_event(|app, event| match event.id().as_ref() {
-                "refresh" => {
-                    let app = app.clone();
-                    tauri::async_runtime::spawn(async move { do_refresh(&app).await });
-                }
-                "settings" => show_settings(app),
-                "quit" => app.exit(0),
-                _ => {}
-            });
+            app.on_menu_event(|app, event| menu_event(app, event.id().as_ref()));
 
             #[cfg(windows)]
             for label in [dock::LABEL, panel::LABEL] {

@@ -10,21 +10,6 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "label": "dock",
-        "title": "SlopBar",
-        "url": "index.html",
-        "width": 160,
-        "height": 48,
-        "visible": false,
-        "decorations": false,
-        "transparent": true,
-        "shadow": false,
-        "resizable": false,
-        "skipTaskbar": true,
-        "alwaysOnTop": true,
-        "focus": false
-      },
-      {
         "label": "panel",
         "title": "SlopBar",
         "url": "index.html",

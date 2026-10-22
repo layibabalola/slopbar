@@ -400,31 +400,155 @@ pub fn dock_left(bar: Rect, tray: Rect, widgets: Option<Rect>, width: i32) -> i3
     right - width - GAP
 }
 
-/// Docks the widget over the taskbar, left of the notification area. `raise` brings it back
-/// above the taskbar (only needed when the taskbar has just been activated).
-fn place_docked(app: &AppHandle, win: &WebviewWindow, raise: bool) -> bool {
-    let Some((bar, tray)) = win::taskbar() else { return false };
-    let scale = win.scale_factor().unwrap_or(1.0);
-    let width = (*app.state::<AppState>().dock_width.lock().unwrap() * scale).ceil() as i32;
-    let height = bar.bottom - bar.top;
-    let widgets = *WIDGETS.lock().unwrap();
-    let pos = PhysicalPosition::new(dock_left(bar, tray, widgets, width), bar.top);
-    let size = PhysicalSize::new(width as u32, height as u32);
-    if win.outer_position().ok() != Some(pos) {
-        let _ = win.set_position(pos);
+/// Which widget is up: the native one (setting `native_widget`, the default) or the web one.
+enum Host {
+    Web(WebviewWindow),
+    #[cfg(windows)]
+    Native,
+}
+
+impl Host {
+    fn visible(&self) -> bool {
+        match self {
+            Host::Web(w) => w.is_visible().unwrap_or(false),
+            #[cfg(windows)]
+            Host::Native => crate::widget_win::visible(),
+        }
     }
-    if win.outer_size().ok() != Some(size) {
-        let _ = win.set_size(size);
+    fn show(&self) {
+        match self {
+            Host::Web(w) => {
+                let _ = w.show();
+            }
+            #[cfg(windows)]
+            Host::Native => crate::widget_win::show(),
+        }
+    }
+    fn hide(&self) {
+        match self {
+            Host::Web(w) => {
+                let _ = w.hide();
+            }
+            #[cfg(windows)]
+            Host::Native => crate::widget_win::hide(),
+        }
+    }
+}
+
+/// Whether the native widget is the one wanted (Windows only; elsewhere the web one).
+pub fn native_wanted(app: &AppHandle) -> bool {
+    cfg!(windows) && app.state::<AppState>().settings.lock().unwrap().native_widget
+}
+
+fn host(app: &AppHandle) -> Option<Host> {
+    #[cfg(windows)]
+    if native_wanted(app) {
+        return crate::widget_win::running().then_some(Host::Native);
+    }
+    window(app).map(Host::Web)
+}
+
+/// The widget's center on screen, where the flyout opens above it.
+pub fn anchor(app: &AppHandle) -> Option<(f64, f64)> {
+    match host(app)? {
+        Host::Web(w) => {
+            let (pos, size) = (w.outer_position().ok()?, w.outer_size().ok()?);
+            Some((pos.x as f64 + size.width as f64 / 2.0, pos.y as f64 + size.height as f64 / 2.0))
+        }
+        #[cfg(windows)]
+        Host::Native => crate::widget_win::anchor(),
+    }
+}
+
+/// Puts up the widget the settings ask for, and takes the other one down: switching needs no
+/// restart. The web widget's window is created only when it is wanted, so the native one runs
+/// without a WebView2 behind it.
+pub fn apply_mode(app: &AppHandle, native: bool) {
+    #[cfg(windows)]
+    if native {
+        if let Some(w) = window(app) {
+            let _ = w.destroy();
+        }
+        crate::widget_win::start(app);
+        return;
     }
     #[cfg(windows)]
-    if let Ok(hwnd) = win.hwnd() {
+    crate::widget_win::hide();
+    let _ = native;
+    if window(app).is_some() {
+        return;
+    }
+    // Not on the calling thread: creating a webview from a command's thread can deadlock.
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if window(&app).is_some() {
+            return;
+        }
+        // As the "dock" window was configured in tauri.conf.json before the native widget.
+        let built = tauri::WebviewWindowBuilder::new(&app, LABEL, tauri::WebviewUrl::App("index.html".into()))
+            .title("SlopBar")
+            .inner_size(160.0, 48.0)
+            .visible(false)
+            .decorations(false)
+            .transparent(true)
+            .shadow(false)
+            .resizable(false)
+            .skip_taskbar(true)
+            .always_on_top(true)
+            .focused(false)
+            .build();
+        #[cfg(windows)]
+        if let Ok(w) = &built {
+            exclude_from_peek(w);
+        }
+        #[cfg(not(windows))]
+        let _ = built;
+    });
+}
+
+/// Docks the widget over the taskbar, left of the notification area. `raise` brings it back
+/// above the taskbar (only needed when the taskbar has just been activated).
+fn place_docked(app: &AppHandle, host: &Host, raise: bool) -> bool {
+    let Some((bar, tray)) = win::taskbar() else { return false };
+    let height = bar.bottom - bar.top;
+    let widgets = *WIDGETS.lock().unwrap();
+    #[allow(unused_variables)]
+    let hwnd: Option<isize> = match host {
+        Host::Web(win) => {
+            let scale = win.scale_factor().unwrap_or(1.0);
+            let width = (*app.state::<AppState>().dock_width.lock().unwrap() * scale).ceil() as i32;
+            let pos = PhysicalPosition::new(dock_left(bar, tray, widgets, width), bar.top);
+            let size = PhysicalSize::new(width as u32, height as u32);
+            if win.outer_position().ok() != Some(pos) {
+                let _ = win.set_position(pos);
+            }
+            if win.outer_size().ok() != Some(size) {
+                let _ = win.set_size(size);
+            }
+            #[cfg(windows)]
+            let hwnd = win.hwnd().ok().map(|h| h.0 as isize);
+            #[cfg(not(windows))]
+            let hwnd = None;
+            hwnd
+        }
+        #[cfg(windows)]
+        Host::Native => {
+            use crate::widget_win as native;
+            let dpi = native::dpi_at(bar);
+            let width = native::width_px(dpi);
+            native::place(native::Place { x: dock_left(bar, tray, widgets, width), y: bar.top, w: width, h: height, dpi });
+            native::hwnd().map(|h| h as isize)
+        }
+    };
+    #[cfg(windows)]
+    if let Some(hwnd) = hwnd {
         // Owned by the taskbar, the widget stays above it on its own; raising by hand is only
         // a fallback (it lags a tick behind and flickers when the tray is toggled quickly).
-        let owned = win::own_by_taskbar(hwnd.0 as _);
+        let owned = win::own_by_taskbar(hwnd as _);
         if raise && !owned {
-            win::raise(hwnd.0 as _);
+            win::raise(hwnd as _);
         }
-        win::stay_above_taskbar(hwnd.0 as _);
+        win::stay_above_taskbar(hwnd as _);
     }
     #[cfg(not(windows))]
     let _ = raise;
@@ -436,32 +560,32 @@ pub fn keep_docked(app: AppHandle) {
     std::thread::spawn(watch_widgets);
     loop {
         std::thread::sleep(Duration::from_millis(100));
-        let Some(win) = window(&app) else { continue };
+        let Some(host) = host(&app) else { continue };
         let covered = match (win::fullscreen_monitor(), win::taskbar()) {
             (Some(fs), Some((bar, _))) => fs.contains(((bar.left + bar.right) / 2) as f64, bar.top as f64 - 1.0),
             _ => false,
         };
         if covered {
-            if win.is_visible().unwrap_or(false) {
-                let _ = win.hide();
+            if host.visible() {
+                host.hide();
             }
             continue;
         }
-        if place_docked(&app, &win, win::taskbar_focused()) {
-            if !win.is_visible().unwrap_or(false) {
-                let _ = win.show();
+        if place_docked(&app, &host, win::taskbar_focused()) {
+            if !host.visible() {
+                host.show();
             }
-        } else if win.is_visible().unwrap_or(false) {
+        } else if host.visible() {
             // Taskbar hidden (auto-hide or a fullscreen app).
-            let _ = win.hide();
+            host.hide();
         }
     }
 }
 
 pub fn show_docked(app: &AppHandle) {
-    if let Some(win) = window(app) {
-        if place_docked(app, &win, true) {
-            let _ = win.show();
+    if let Some(host) = host(app) {
+        if place_docked(app, &host, true) {
+            host.show();
         }
     }
 }

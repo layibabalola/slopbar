@@ -223,6 +223,8 @@ pub enum InspectTarget {
     Flyout,
     /// The quick switcher (Ctrl+Alt+S by default).
     Switcher,
+    /// The taskbar widget (the native one is drawn by the same code as on screen).
+    Widget,
 }
 
 fn yes() -> bool { true }
