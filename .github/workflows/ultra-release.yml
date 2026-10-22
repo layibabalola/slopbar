@@ -1,0 +1,104 @@
+name: Ultra release
+
+# SlopBar Ultra (fork-only). Pushing a tag ultra-v<package version>-ultra.<build>, for example
+# ultra-v0.1.0-ultra.1, on a commit of the ultra branch builds the Windows installer with
+# automatic updates (ultra-updates), signs the update artifacts with the fork's key, publishes a
+# release, and moves the update channel (the ultra-latest release) to it. See docs/ULTRA-RELEASES.md.
+
+on:
+  push:
+    tags: ['ultra-v*']
+
+concurrency:
+  group: ultra-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Check tag, branch and update channel
+        id: version
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^ultra-v(\d+\.\d+\.\d+)-ultra\.(\d+)$') {
+            throw "Tag $tag must look like ultra-v<package version>-ultra.<build>, e.g. ultra-v0.1.0-ultra.1."
+          }
+          $package = $Matches[1]
+          $version = "$package-ultra.$($Matches[2])"
+          $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          if ($conf.version -ne $package) { throw "Tag says $package but the package version is $($conf.version)." }
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/ultra
+          if ($LASTEXITCODE -ne 0) { throw "$env:GITHUB_SHA is not on the ultra branch." }
+          $endpoints = @($conf.plugins.updater.endpoints)
+          if ($endpoints.Count -ne 1 -or $endpoints[0] -ne 'https://github.com/layibabalola/slopbar-ultra/releases/download/ultra-latest/latest.json') {
+            throw "The updater must point only at the Ultra update channel."
+          }
+          $conf.version = $version
+          $conf | ConvertTo-Json -Depth 20 | Set-Content src-tauri/tauri.conf.json
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: lts/*
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: pnpm install --frozen-lockfile
+
+      # Includes ultra_release's check that the updater config is the Ultra channel and key.
+      - name: Test
+        run: cargo test --locked --no-default-features --lib --manifest-path src-tauri/Cargo.toml
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The fork's own key (not upstream's TAURI_SIGNING_PRIVATE_KEY secret name, so the
+          # upstream Release workflow on this fork can never sign with it).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.ULTRA_TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.ULTRA_TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          args: --features ultra-updates
+          tagName: ${{ github.ref_name }}
+          releaseName: SlopBar Ultra ${{ steps.version.outputs.version }}
+          releaseBody: SlopBar Ultra ${{ steps.version.outputs.version }}, built from ${{ github.sha }} on the ultra branch. Installs update themselves from this fork only.
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+
+      # Installs read latest.json from the fixed ultra-latest release, never releases/latest, so
+      # no other release on this fork can become an Ultra update.
+      - name: Move the update channel to this release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $version = '${{ steps.version.outputs.version }}'
+          New-Item -ItemType Directory channel | Out-Null
+          gh release download $tag --pattern latest.json --dir channel
+          if ($LASTEXITCODE -ne 0) { throw "The release has no latest.json." }
+          $manifest = Get-Content channel/latest.json -Raw | ConvertFrom-Json
+          if ($manifest.version -ne $version) { throw "latest.json says $($manifest.version), expected $version." }
+          if (-not $manifest.platforms.'windows-x86_64'.signature) { throw "latest.json has no signed Windows update." }
+          gh release view ultra-latest *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create ultra-latest --target $env:GITHUB_SHA --prerelease --title 'SlopBar Ultra update channel' --notes 'Holds latest.json for automatic updates of SlopBar Ultra. Download the installer from the newest ultra-v release instead.'
+            if ($LASTEXITCODE -ne 0) { throw "Could not create the ultra-latest release." }
+          }
+          gh release upload ultra-latest channel/latest.json --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Could not update the channel." }

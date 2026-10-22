@@ -21,14 +21,29 @@ pub struct UpdateInfo {
 pub async fn check(app: &AppHandle) -> Result<UpdateInfo, String> {
     if !cfg!(feature = "upstream-updates") { return Err("Manual updates only in this build".into()); }
     let current = app.package_info().version.to_string();
-    let update = app.updater().map_err(|e| e.to_string())?.check().await.map_err(|e| e.to_string())?;
+    let update = updater(app)?.check().await.map_err(|e| e.to_string())?;
     Ok(UpdateInfo { current, latest: update.map(|u| u.version) })
+}
+
+/// Ultra release builds pin the fork's channel and key in code, so a merged config change cannot
+/// point them back at upstream, and accept only newer Ultra versions.
+fn updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+    let builder = app.updater_builder();
+    #[cfg(feature = "ultra-updates")]
+    let builder = builder
+        .endpoints(vec![crate::ultra_release::UPDATE_ENDPOINT.parse::<tauri::Url>().map_err(|e| e.to_string())?])
+        .map_err(|e| e.to_string())?
+        .pubkey(crate::ultra_release::PUBKEY)
+        .version_comparator(|current, remote| {
+            crate::ultra_release::is_ultra_version(&remote.version.to_string()) && remote.version > current
+        });
+    builder.build().map_err(|e| e.to_string())
 }
 
 /// Downloads and installs the newest release, then restarts into it.
 pub async fn install(app: &AppHandle) -> Result<(), String> {
     if !cfg!(feature = "upstream-updates") { return Err("Manual updates only in this build".into()); }
-    let Some(update) = app.updater().map_err(|e| e.to_string())?.check().await.map_err(|e| e.to_string())? else {
+    let Some(update) = updater(app)?.check().await.map_err(|e| e.to_string())? else {
         return Ok(());
     };
     let _ = app.emit("update-installing", &update.version);
