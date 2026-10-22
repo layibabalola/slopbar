@@ -1,4 +1,4 @@
-use crate::{accounts, balancer, codex_local, diagnostics, dock, door, headroom, health, inspect, migrate, model, monitoring, notify, panel, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates};
+use crate::{accounts, auto_monitor, balancer, codex_local, diagnostics, dock, door, headroom, health, inspect, migrate, model, monitoring, notify, panel, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -51,6 +51,8 @@ pub struct AppState {
     unexpected_log: Mutex<unexpected::Log>,
     /// Plan notifications already shown (renewals, running out), so each is shown once.
     plan_alerts: Mutex<plan_alerts::Sent>,
+    /// Connect monitoring automatically: how long accounts have been in use, and backoffs.
+    auto_monitor: Mutex<auto_monitor::Tracker>,
     /// What refreshes and startup learned for Settings > Health.
     health: Mutex<HealthSeen>,
 }
@@ -89,6 +91,7 @@ async fn health_report(app: &AppHandle) -> health::Report {
         journal: state.diagnostics.health(),
         notifications: health::Notifications { registered: seen.notifications_registered, app_enabled, system_enabled,
             any_wanted: n.usage || n.resets || n.switches || n.renewals || n.unexpected_use },
+        auto_connect: settings.auto_connect_monitoring,
     }, chrono::Utc::now())
 }
 
@@ -424,6 +427,13 @@ async fn start_add_account(app: AppHandle, provider: Provider, pending: Option<m
 /// A one-time login owns its own refresh-token chain; it never changes the active CLI.
 #[tauri::command]
 async fn connect_monitoring(app: AppHandle, provider: Provider, id: String) -> Result<(), String> {
+    let key = format!("{}:{id}", provider.name());
+    auto_monitor_saved(&app, |t| t.manual(&key, true));
+    start_monitoring_login(app, provider, id, false).await
+}
+
+/// Connect monitoring's sign-in, started by the user or on its own (`auto`, see `auto_monitor`).
+async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, auto: bool) -> Result<(), String> {
     let operation = app.state::<AppState>().account_operations.begin(provider, &id)?;
     let expected = accounts::load_slots().into_iter().find(|s| s.provider == provider && s.id == id)
         .ok_or("monitor_wrong_account")?;
@@ -440,6 +450,11 @@ async fn connect_monitoring(app: AppHandle, provider: Provider, id: String) -> R
             return Err("monitor_login_failed".into());
         }
     };
+    if auto {
+        let name = app.state::<AppState>().snapshot.lock().unwrap().accounts.iter()
+            .find(|a| a.provider == provider && a.id == id).and_then(|a| a.alias.clone().or_else(|| a.email.clone()));
+        let _ = app.emit("monitoring-auto-started", serde_json::json!({ "provider": provider, "id": id, "name": name }));
+    }
     tauri::async_runtime::spawn(async move {
         let operation = operation;
         let outcome = match job.wait_isolated(&http_client()).await {
@@ -457,6 +472,10 @@ async fn connect_monitoring(app: AppHandle, provider: Provider, id: String) -> R
             None => Err("monitor_login_failed".into()),
         };
         drop(operation);
+        if auto {
+            let ok = outcome.is_ok();
+            auto_monitor_saved(&app, |t| t.finished(&key, ok, chrono::Utc::now()));
+        }
         app.state::<AppState>().diagnostics.record(Some(provider), Some(&id), diagnostics::Event::Action { action: diagnostics::Action::ConnectFinished,
             code: diagnostics::Code::from_error(outcome.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) });
         let _ = app.emit("monitoring-login", serde_json::json!({ "provider": provider, "id": id, "error": outcome.err() }));
@@ -504,6 +523,7 @@ async fn disconnect_monitoring(app: AppHandle, provider: Provider, id: String) -
     app.state::<AppState>().diagnostics.record(Some(provider), Some(&id), diagnostics::Event::Action { action: diagnostics::Action::Disconnect,
         code: diagnostics::Code::from_error(result.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) });
     let revoked = result?;
+    auto_monitor_saved(&app, |t| t.manual(&monitoring::key(&slot), false));
     {
         let state = app.state::<AppState>();
         let _refresh = state.refresh_lock.lock().await;
@@ -836,13 +856,52 @@ fn scan_codex_local(app: &AppHandle) {
     });
 }
 
+/// Changes the automatic-connect state, saving it when `change` says it changed.
+fn auto_monitor_saved(app: &AppHandle, change: impl FnOnce(&mut auto_monitor::Tracker) -> bool) {
+    let state = app.state::<AppState>();
+    let saved = {
+        let mut tracker = state.auto_monitor.lock().unwrap();
+        change(&mut tracker).then(|| tracker.saved.clone())
+    };
+    if let Some(saved) = saved {
+        let _ = auto_monitor::save(&saved);
+    }
+}
+
+/// Starts monitoring's sign-in for the account in use when it is due (see `auto_monitor`). Reads
+/// the last snapshot, so it is cheap to call often.
+fn auto_connect_tick(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let enabled = state.settings.lock().unwrap().auto_connect_monitoring;
+    let seen: Vec<_> = state.snapshot.lock().unwrap().accounts.iter().map(auto_monitor::Seen::of).collect();
+    let fullscreen = enabled && dock::fullscreen();
+    let busy = |key: &str| state.account_operations.busy(key);
+    let guards = auto_monitor::Guards { enabled, fullscreen, busy: &busy };
+    let decision = state.auto_monitor.lock().unwrap().decide(&seen, &guards, chrono::Utc::now());
+    let auto_monitor::Decision::Start { provider, id } = decision else { return };
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let key = format!("{}:{id}", provider.name());
+        if let Err(e) = start_monitoring_login(app.clone(), provider, id, true).await {
+            // Someone else started on it meanwhile: no reason to wait a day.
+            let ok = e == "monitor_busy";
+            auto_monitor_saved(&app, |t| t.finished(&key, ok, chrono::Utc::now()));
+        }
+    });
+}
+
 /// Refreshes on the interval from settings, re-reading it so changes apply without a restart.
 async fn refresh_loop(app: AppHandle) {
     loop {
         do_refresh(&app).await;
+        auto_connect_tick(&app);
         let started = Instant::now();
+        let mut seconds = 0u32;
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
+            seconds += 1;
+            // Every half minute, so an account is connected soon after its 3 minutes in use.
+            if seconds % 30 == 0 { auto_connect_tick(&app); }
             let minutes = app.state::<AppState>().settings.lock().unwrap().refresh_minutes.max(1);
             if started.elapsed() >= Duration::from_secs(minutes as u64 * 60) {
                 break;
@@ -882,6 +941,7 @@ pub fn run() {
         presence_tracks: Mutex::default(),
         unexpected_log: Mutex::new(unexpected::load()),
         plan_alerts: Mutex::new(plan_alerts::load()),
+        auto_monitor: Mutex::new(auto_monitor::Tracker::new(auto_monitor::load())),
         health: Mutex::default(),
     };
     tauri::Builder::default()

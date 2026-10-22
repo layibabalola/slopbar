@@ -33,7 +33,11 @@ Add accounts in **Settings → Accounts**: SlopBar opens the CLI's own sign-in (
 
 ### Monitoring accounts you aren't using
 
-Choose **Connect monitoring** next to each account in Settings or the flyout. Complete the official CLI's sign-in for that same account and organization. This creates a separate monitoring session in a temporary configuration folder; it is never imported into the switching vault or written to the active CLI's files. The temporary folder is removed when sign-in completes, fails, or times out.
+While an account is the one signed in to the CLI, SlopBar reads its usage with the CLI's own access token. That stops when you switch away: the CLI's refresh token rotates every time it is used, so SlopBar can't keep renewing a copy of it in the background without signing the CLI out. To keep reading an account you aren't using, SlopBar needs its own sign-in for it, a separate session it alone renews.
+
+SlopBar starts that sign-in for you. Once an account without monitoring has been the one in use for 3 minutes, it opens the sign-in and shows a notification, **Finish connecting monitoring for** that account; your browser is usually already signed in to it, so one approval is enough. It runs one sign-in at a time, waits while a fullscreen app is in front, never retries a cancelled or failed sign-in for that account within 24 hours, and leaves alone an account whose monitoring you disconnected. Turn it off with **Settings → Data → Connect monitoring automatically**.
+
+You can also choose **Connect monitoring** next to each account in Settings or the flyout. Complete the official CLI's sign-in for that same account and organization. This creates a separate monitoring session in a temporary configuration folder; it is never imported into the switching vault or written to the active CLI's files. The temporary folder is removed when sign-in completes, fails, or times out.
 
 SlopBar renews this separate session automatically when its access token is about to expire, and polls the provider's usage endpoint. No prompt or model request is sent. Existing accounts need this one-time sign-in because their copied CLI refresh tokens cannot safely be shared with an independent background refresher.
 

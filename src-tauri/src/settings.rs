@@ -126,6 +126,9 @@ pub struct Settings {
     /// Keep a redacted record of crashes (where in SlopBar's code, never the message) in the local
     /// diagnostics journal, so exports include them. Off unless the user turns it on.
     pub crash_records: bool,
+    /// Start the monitoring sign-in on its own for an account without one once it has been in use
+    /// for a few minutes (see `auto_monitor`). On unless the user turns it off.
+    pub auto_connect_monitoring: bool,
 }
 
 impl Default for Settings {
@@ -146,6 +149,7 @@ impl Default for Settings {
             web_use: HashMap::new(),
             unexpected_min_rise: 2,
             crash_records: false,
+            auto_connect_monitoring: true,
         }
     }
 }
@@ -186,7 +190,7 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 /// The interface languages (see `LANGUAGES` in i18n.js).
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
-const PATCHABLE: [&str; 14] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records"];
+const PATCHABLE: [&str; 15] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring"];
 /// The values `unexpected_min_rise` accepts.
 pub const UNEXPECTED_MIN_RISE: std::ops::RangeInclusive<u8> = 1..=20;
 
@@ -333,6 +337,9 @@ mod patch_tests {
         let crash = patched(&next, &json!({ "crash_records": true }), false).unwrap();
         assert!(crash.crash_records && crash.refresh_minutes == 15);
         assert!(patched(&crash, &json!({ "crash_records": "yes" }), false).is_err());
+        assert!(next.auto_connect_monitoring, "monitoring connects automatically by default");
+        assert!(!patched(&next, &json!({ "auto_connect_monitoring": false }), false).unwrap().auto_connect_monitoring);
+        assert!(serde_json::from_str::<Settings>("{}").unwrap().auto_connect_monitoring, "older settings files turn it on");
         assert!(!web.notifications.unexpected_use && web.notifications.switches);
         assert!(patched(&web, &json!({ "web_use": { "claude:a": null } }), false).unwrap().web_use.is_empty());
         let planned = patched(&next, &json!({ "subscriptions": { "claude:a": { "billing_day": 3, "monthly_cost": 100, "cancel_after": "2026-11-02" } } }), false).unwrap();
