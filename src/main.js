@@ -2,6 +2,7 @@ import { t, windowResetText, windowLabel, errorText, creditsText, time, dayTime,
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { checkUsage, checkSwitch, checkPlans, checkDigest } from "./alerts.js";
+import { sparkline } from "./sparkline.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -21,6 +22,12 @@ document.body.classList.add(IS_DOCK ? "dock" : "panel");
 let lastSnap = { accounts: [], updated_at: null };
 /** Which notifications to show (from settings); only the widget sends them. */
 let notifications = null;
+/** The whole settings, for the flyout's layout choice. */
+let current = null;
+/** Each account's weekly usage over the last 7 days, keyed `provider:id` (get_sparklines). */
+let trails = {};
+/** The compact layout is offered above this many accounts. */
+const COMPACT_OFFER_ABOVE = 8;
 
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`);
 const color = (p) => (p >= 90 ? "var(--bad)" : p >= 70 ? "var(--warn)" : "var(--ok)");
@@ -40,7 +47,7 @@ const peak = (a) => a.windows.reduce((m, w) => (w.used_percent > (m?.used_percen
 const chip = (a) => {
   const w = a.stale || a.error ? null : peak(a);
   const tip = w ? `${PROVIDER_NAME[a.provider]} ${Math.round(w.used_percent)}%` : `${PROVIDER_NAME[a.provider]} — ${t("usageUnknown")}`;
-  return `<span class="chip" title="${esc(tip)}"><span class="ring-mark">${w ? ring(w.used_percent) : '<span class="unknown-mark">?</span>'}${MARK[a.provider]}</span></span>`;
+  return `<span class="chip" role="img" aria-label="${esc(tip)}" title="${esc(tip)}"><span class="ring-mark">${w ? ring(w.used_percent) : '<span class="unknown-mark">?</span>'}${MARK[a.provider]}</span></span>`;
 };
 
 let toast = null;
@@ -74,6 +81,7 @@ function renderCompact(snap) {
     items = shown.map(chip);
   }
   $compact.innerHTML = items.join("");
+  $widget.setAttribute("aria-label", t("title"));
 }
 
 const PROVIDER_NAME = { claude: "Claude", codex: "Codex" };
@@ -91,7 +99,8 @@ function bars(a) {
   return a.windows.map((w) => `
     <div class="win">
       <div class="row"><span>${esc(windowLabel(w))}</span><b>${Math.round(w.used_percent)}%</b></div>
-      <div class="bar"><div style="width:${Math.min(100, w.used_percent)}%;background:${color(w.used_percent)}"></div></div>
+      <div class="bar" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(Math.min(100, w.used_percent))}"
+        aria-label="${esc(`${windowLabel(w)} ${t("used")}`)}"><div style="width:${Math.min(100, w.used_percent)}%;background:${color(w.used_percent)}"></div></div>
       ${resetWindows.has(w) && !a.stale ? `<div class="reset" title="${esc(w.resets_at)}">${esc(windowResetText(w, false, a.fetched_at))}</div>` : ""}
     </div>`).join("");
 }
@@ -102,10 +111,15 @@ function renderDetails(snap) {
   notice.textContent = toast ?? "";
   notice.hidden = !toast;
   $updated.textContent = snap.updated_at ? time(snap.updated_at) : "";
+  renderCompactOffer(snap);
   if (!snap.accounts.length) {
     $accounts.innerHTML = `<p class="empty">${snap.updated_at ? t("noCredentials") : t("searching")}</p>`;
     return;
   }
+  // Rows are patched in place only within one layout (see patch).
+  const layout = current?.compact_flyout ? "compact" : "full";
+  if ($accounts.dataset.layout !== layout) { $accounts.replaceChildren(); $accounts.dataset.layout = layout; }
+  if (layout === "compact") { renderCompactList(snap); return; }
   const groups = ["claude", "codex"]
     .map((p) => [p, snap.accounts.filter((a) => a.provider === p)])
     .filter(([, list]) => list.length);
@@ -127,6 +141,7 @@ function renderDetails(snap) {
             <span class="provider-mark ${provider}" title="${PROVIDER_NAME[provider]}">${MARK[provider]}</span>
             <span class="who">${esc(accountName(a))}</span>
             ${a.plan ? `<span class="plan">${esc(a.plan)}</span>` : ""}
+            ${sparkline(trails[`${provider}:${a.id}`])}
             ${a.active
               ? `<span class="in-use ${a.pending ? "pending" : ""}">${t("inUse")}</span>`
               : `<button class="use" data-provider="${provider}" data-id="${esc(a.id)}">${t("use")}</button>`}
@@ -144,6 +159,46 @@ function renderDetails(snap) {
       }).join("")}
     </section>`).join(""));
 }
+
+/** One line per account: provider mark, name, the binding window's %, the sparkline, and Use. */
+function renderCompactList(snap) {
+  const list = ["claude", "codex"].flatMap((p) => snap.accounts.filter((a) => a.provider === p));
+  patch($accounts, `<div class="compact-list" role="list" aria-label="${esc(t("title"))}">${list.map((a) => {
+    const w = a.stale || a.error ? null : peak(a);
+    const problem = a.error || a.monitor_error ? errorText(PROVIDER_NAME[a.provider], a.error ?? a.monitor_error) : "";
+    const used = w ? `${Math.round(w.used_percent)}%` : "—";
+    const usedText = w ? `${windowLabel(w)}: ${used} ${t("used")}` : t("usageUnknown");
+    return `
+      <div class="acct line ${a.active ? "active" : ""}" role="listitem" data-key="${a.provider}:${esc(a.id)}">
+        <span class="provider-mark ${a.provider}" role="img" aria-label="${PROVIDER_NAME[a.provider]}" title="${PROVIDER_NAME[a.provider]}">${MARK[a.provider]}</span>
+        <span class="who" title="${esc([accountName(a), a.alias ? a.email : "", a.plan].filter(Boolean).join(" · "))}">${esc(accountName(a))}</span>
+        ${problem ? `<span class="problem" role="img" aria-label="${esc(problem)}" title="${esc(problem)}">!</span>` : ""}
+        ${sparkline(trails[`${a.provider}:${a.id}`])}
+        <b class="pct" style="color:${w ? color(w.used_percent) : "var(--text-2)"}" title="${esc(usedText)}" aria-label="${esc(usedText)}">${used}</b>
+        ${a.active
+          ? `<span class="in-use ${a.pending ? "pending" : ""}">${t("inUse")}</span>`
+          : `<button class="use" data-provider="${a.provider}" data-id="${esc(a.id)}" aria-label="${esc(`${t("use")} ${accountName(a)}`)}">${t("use")}</button>`}
+      </div>`;
+  }).join("")}</div>`);
+}
+
+/** Above 8 accounts the full cards make a long flyout: offer the compact layout once. */
+function renderCompactOffer(snap) {
+  const offer = document.getElementById("compact-offer");
+  const show = !!current && !current.compact_flyout && !current.compact_suggested && snap.accounts.length > COMPACT_OFFER_ABOVE;
+  offer.hidden = !show;
+  if (show) document.getElementById("compact-offer-text").textContent = t("compactOffer", { n: snap.accounts.length });
+}
+
+async function answerCompactOffer(compact) {
+  if (!current) return;
+  const settings = { ...current, compact_suggested: true, compact_flyout: compact || current.compact_flyout };
+  current = settings;
+  render(lastSnap);
+  await invoke("save_settings", { settings }).catch(() => {});
+}
+document.getElementById("compact-offer-yes").addEventListener("click", () => answerCompactOffer(true));
+document.getElementById("compact-offer-no").addEventListener("click", () => answerCompactOffer(false));
 
 /**
  * Updates the account list in place: when the same accounts are shown, only rows whose markup
@@ -234,6 +289,7 @@ document.getElementById("open-settings").addEventListener("click", () => invoke(
 document.getElementById("open-switcher").addEventListener("click", () => invoke("open_switcher"));
 
 function applySettings(settings) {
+  current = settings;
   notifications = settings.notifications;
   setLanguage(settings.language);
   translateDom();
@@ -260,6 +316,13 @@ listen("monitoring-auto-started", ({ payload }) => invoke("notify", {
 }).catch(() => {}));
 listen("monitoring-login", ({ payload }) => showToast(payload.error ? errorText("", payload.error) : t("monitorConnected")));
 listen("usage-updated", (e) => render(e.payload));
+// The sparklines' readings: the backend records them on every refresh.
+function loadTrails() {
+  if (IS_DOCK) return;
+  invoke("get_sparklines").then((found) => { trails = found ?? {}; render(lastSnap); }, () => {});
+}
+listen("usage-updated", loadTrails);
+loadTrails();
 invoke("get_usage").then(render);
 setInterval(() => invoke("get_usage").then(render), 60_000);
 
@@ -269,12 +332,19 @@ async function checkHealth() {
   if (IS_DOCK) return;
   const report = await invoke("get_health").catch(() => null);
   $health.hidden = !report?.problems;
-  if (report?.problems) $health.title = t("healthIssues", { n: report.problems });
+  if (report?.problems) { $health.title = t("healthIssues", { n: report.problems }); $health.setAttribute("aria-label", $health.title); }
 }
 $health.addEventListener("click", () => invoke("open_settings", { page: "health" }));
 listen("usage-updated", checkHealth);
 listen("monitoring-login", checkHealth);
 checkHealth();
+
+// Esc closes the flyout, as it does the shell's own.
+if (!IS_DOCK) {
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); invoke("hide_panel"); }
+  });
+}
 
 // Replay the flyout's entrance each time it opens.
 if (!IS_DOCK) {

@@ -128,8 +128,7 @@ export async function checkDigest() {
   for (const p of d.pools) {
     lines.push(t("nDigestPool", { provider: PROVIDER_NAME[p.provider], n: p.plans_needed, unit: p.unit, held: Math.round(p.plans_held * 10) / 10 }));
   }
-  notify(t("nDigestTitle"), lines.join("
-"), "subscriptions");
+  notify(t("nDigestTitle"), lines.join("\n"), "subscriptions");
 }
 
 /** An automatic switch (see the balancer) is worth a notification; a manual one isn't. */

@@ -1,5 +1,6 @@
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
+import { sparkline } from "./sparkline.js";
 import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetText, errorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
@@ -15,12 +16,17 @@ const color = (p) => (p >= 90 ? "var(--bad)" : p >= 70 ? "var(--warn)" : "var(--
 let settings;
 let updatesEnabled = false;
 let snapshot = { accounts: [] };
+/** Each account's weekly usage over the last 7 days, keyed `provider:id` (get_sparklines). */
+let trails = {};
 
 // ---------------------------------------------------------------------------------------------
 // Navigation
 
 function showPage(page) {
-  document.querySelectorAll(".nav").forEach((b) => b.classList.toggle("active", b.dataset.page === page));
+  document.querySelectorAll(".nav").forEach((b) => {
+    b.classList.toggle("active", b.dataset.page === page);
+    if (b.dataset.page === page) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
+  });
   document.querySelectorAll(".page").forEach((p) => p.classList.toggle("active", p.id === `page-${page}`));
   try { localStorage.setItem("settings-page", page); } catch {}
 }
@@ -28,6 +34,23 @@ document.querySelectorAll(".nav").forEach((b) => b.addEventListener("click", () 
   showPage(b.dataset.page);
   if (b.dataset.page === "subscriptions") loadSubscriptions();
 }));
+// The navigation pane moves with the arrow keys, Home and End, like the Settings app's.
+document.querySelector(".sidebar").addEventListener("keydown", (e) => {
+  const navs = [...document.querySelectorAll(".nav")];
+  const i = navs.indexOf(document.activeElement);
+  if (i < 0) return;
+  const next = { ArrowDown: i + 1, ArrowUp: i - 1, Home: 0, End: navs.length - 1 }[e.key];
+  if (next == null) return;
+  e.preventDefault();
+  navs[(next + navs.length) % navs.length].focus();
+});
+// Esc leaves a text field being edited, and otherwise closes the window.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || e.defaultPrevented) return;
+  const el = document.activeElement;
+  if (el && el.matches("input:not([type=checkbox]):not([type=range]), textarea")) { el.blur(); return; }
+  window.__TAURI__.window.getCurrentWindow().close();
+});
 
 // ---------------------------------------------------------------------------------------------
 // Accounts
@@ -48,7 +71,8 @@ function accountRow(p, a) {
   const timedWindows = visibleResetWindows(a.windows);
   const meter = usage == null
     ? `<div class="meter none"><b>—</b></div>`
-    : `<div class="meter ${a.stale ? "stale" : ""}" title="${esc(a.windows.map(w => `${windowLabel(w)}: ${w.used_percent}% ${t("used")}${w.resets_at ? ` · ${w.resets_at}` : ""}`).join("\n"))}"><b>${Math.round(usage)}%</b><small class="window-label">${esc(windowLabel(top))} · ${t("used")}</small><div class="track"><i style="width:${Math.min(100, usage)}%;background:${color(usage)}"></i></div>
+    : `<div class="meter ${a.stale ? "stale" : ""}" title="${esc(a.windows.map(w => `${windowLabel(w)}: ${w.used_percent}% ${t("used")}${w.resets_at ? ` · ${w.resets_at}` : ""}`).join("\n"))}"><b>${Math.round(usage)}%</b><small class="window-label">${esc(windowLabel(top))} · ${t("used")}</small><div class="track" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(Math.min(100, usage))}" aria-label="${esc(`${windowLabel(top)} ${t("used")}`)}"><i style="width:${Math.min(100, usage)}%;background:${color(usage)}"></i></div>
+        ${sparkline(trails[key], { width: 140, height: 18 })}
         ${a.stale ? `<small>${t("lastReading")}</small>` : ""}</div>`;
   // A zero-usage session can lack a reset while its weekly window has one.
   // Never hide that weekly timestamp behind the headline's tie-breaking.
@@ -60,7 +84,7 @@ function accountRow(p, a) {
   const held = a.resets ?? [];
   const total = held.reduce((n, r) => n + r.count, 0);
   const resets = total > 0
-    ? `<em class="chip resets ${held.some((r) => r.usable) ? "live" : ""}"
+    ? `<em class="chip resets ${held.some((r) => r.usable) ? "live" : ""}" aria-label="${esc(t("resetsHeld", { n: total }))}"
         title="${esc([t("resetsTitle"), ...held.map(resetText)].join("\n"))}">↺ ${total}</em>`
     : "";
   return `
@@ -97,8 +121,8 @@ function accountRow(p, a) {
       ${a.active
         // Holds the button's place so every row's meter lines up.
         ? `<span class="btn use" aria-hidden="true" style="visibility:hidden">${t("use")}</span>`
-        : `<button class="btn use" data-use="${p}" data-id="${esc(a.id)}">${t("use")}</button>`}
-      <button class="remove" data-remove="${p}" data-id="${esc(a.id)}" ${a.active ? "disabled" : ""} title="${t("remove")}">
+        : `<button class="btn use" data-use="${p}" data-id="${esc(a.id)}" aria-label="${esc(t("onAccount", { action: t("use"), name: a.alias || a.email || t("unknownAccount") }))}">${t("use")}</button>`}
+      <button class="remove" data-remove="${p}" data-id="${esc(a.id)}" ${a.active ? "disabled" : ""} title="${t("remove")}" aria-label="${esc(t("removeAccountNamed", { name: a.alias || a.email || t("unknownAccount") }))}">
         <svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>
       </button>
     </div>`;
@@ -152,7 +176,7 @@ function renderAccounts() {
         <div class="group balancer">
           <div class="row">
             <label class="title" for="auto-${p}">${t("autoSwitch")}</label>
-            <input type="checkbox" class="switch" id="auto-${p}" data-auto="${p}" ${rule.auto ? "checked" : ""} />
+            <input type="checkbox" class="switch" role="switch" id="auto-${p}" data-auto="${p}" ${rule.auto ? "checked" : ""} />
           </div>
           <div class="row ${rule.auto ? "" : "disabled"}">
             <label for="at-${p}">${t("switchAt")}</label>
@@ -269,7 +293,13 @@ listen("usage-updated", (e) => {
   snapshot = e.payload;
   // Don't rebuild the list under someone typing a nickname.
   if (settings && !document.activeElement?.dataset?.alias) renderAccounts();
+  if (settings) renderGuide();
+  loadTrails();
 });
+async function loadTrails() {
+  trails = await invoke("get_sparklines").catch(() => trails) ?? {};
+  if (settings && !document.activeElement?.dataset?.alias) renderAccounts();
+}
 listen("monitoring-login", ({ payload }) => {
   $("add-hint").textContent = payload.error ? errorText("", payload.error) : t("monitorConnected");
   $("add-hint").hidden = false;
@@ -357,15 +387,6 @@ function creditsLine(c) {
   if (c.balance != null) parts.push(t("subCredits", { v: amount(c.balance) }));
   if (c.spent && c.since) parts.push(t("subCreditsSpent", { n: amount(c.spent), d: shortDate(c.since) }));
   return parts.join(" · ");
-}
-
-// Claude extra usage this month, when turned on: "Extra usage: $73.47 of $400 (18%)".
-function extraUsageLine(x) {
-  if (!x || x.enabled !== true) return "";
-  const used = x.used != null ? money(x.used) : "—";
-  return x.monthly_limit != null
-    ? t("subExtraUsage", { v: used, limit: money(x.monthly_limit), p: x.utilization != null ? pct(x.utilization) : "—" })
-    : t("subExtraUsageNoLimit", { v: used });
 }
 
 // Claude extra usage this month, when turned on: "Extra usage: $73.47 of $400 (18%)".
@@ -757,6 +778,11 @@ async function render() {
   for (const kind of NOTIFY_KINDS) $(`notify-${kind}`).checked = settings.notifications[kind];
   $("crash-records").checked = settings.crash_records;
   $("auto-monitoring").checked = settings.auto_connect_monitoring;
+  $("compact-flyout").checked = settings.compact_flyout;
+  $("compact-flyout-hint").textContent = snapshot.accounts.length > COMPACT_SUGGEST_ABOVE && !settings.compact_flyout
+    ? t("compactFlyoutSuggested", { n: snapshot.accounts.length }) : t("compactFlyoutHint");
+  document.querySelectorAll("input.switch").forEach((el) => el.setAttribute("role", "switch"));
+  renderGuide();
   renderCalendar();
   renderPresence();
   const version = await invoke("app_version");
@@ -797,6 +823,116 @@ $("export-diagnostics").addEventListener("click", async () => {
 });
 $("crash-records").addEventListener("change", (e) => update({ crash_records: e.target.checked }));
 $("auto-monitoring").addEventListener("change", (e) => update({ auto_connect_monitoring: e.target.checked }));
+$("compact-flyout").addEventListener("change", (e) => update({ compact_flyout: e.target.checked, compact_suggested: true }));
+
+// ---------------------------------------------------------------------------------------------
+// The first-run guide (Accounts): shown while no account is found or none is monitored, until
+// closed; General opens it again. Every sign-in it offers is the existing flow the user finishes.
+
+const COMPACT_SUGGEST_ABOVE = 8;
+const GUIDE_NOTIFY = ["usage", "renewals", "unexpected_use"];
+const NOTIFY_LABEL = { usage: "notifyUsage", renewals: "notifyRenewals", unexpected_use: "notifyUnexpected" };
+let guideForced = false;
+
+const guideShown = () => guideForced || (!settings.onboarding_dismissed
+  && (!snapshot.accounts.length || !snapshot.accounts.some((a) => a.monitor_connected)));
+
+function guideStep(n, title, state, body) {
+  const label = t({ done: "guideStepDone", todo: "guideStepTodo", optional: "guideStepOptional" }[state]);
+  return `
+    <li class="guide-step ${state}">
+      <div class="guide-step-head"><span class="guide-num" aria-hidden="true">${state === "done" ? "✓" : n}</span><h3>${esc(title)}</h3><em class="chip ${state === "done" ? "elsewhere" : ""}">${esc(label)}</em></div>
+      <div class="guide-body">${body}</div>
+    </li>`;
+}
+
+function renderGuide() {
+  const box = $("guide");
+  const show = guideShown();
+  box.hidden = !show;
+  // Not under an open dropdown; elsewhere the focused control keeps focus across the rebuild.
+  const el = box.contains(document.activeElement) ? document.activeElement : null;
+  if (!show || el?.tagName === "SELECT") return;
+  const focused = !el ? null : el.id ? `#${CSS.escape(el.id)}`
+    : el.dataset.guideNotify ? `[data-guide-notify="${el.dataset.guideNotify}"]`
+    : el.dataset.guideMonitor ? `[data-guide-monitor][data-id="${CSS.escape(el.dataset.id)}"]` : null;
+  const list = snapshot.accounts.filter((a) => settings.providers[a.provider]);
+  const count = (p) => list.filter((a) => a.provider === p).length;
+  const monitored = list.filter((a) => a.monitor_connected);
+  const waiting = list.filter((a) => !a.monitor_connected);
+  const name = (a) => a.alias || a.email || t("unknownAccount");
+  const presence = presenceChoices();
+  box.innerHTML = `
+    <div class="guide-head">
+      <h2 id="guide-title" tabindex="-1">${t("guideTitle")}</h2>
+      <button class="remove guide-close" id="guide-close" title="${esc(t("guideClose"))}" aria-label="${esc(t("guideClose"))}"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
+    </div>
+    <p class="hint guide-intro">${t("guideIntro")}</p>
+    <ol class="guide-steps">
+      ${guideStep(1, t("guideFindTitle"), list.length ? "done" : "todo",
+        `<p>${esc(list.length ? t("guideFound", { claude: count("claude"), codex: count("codex") }) : t("guideFoundNone"))}</p>`)}
+      ${guideStep(2, t("guideMonitorTitle"), list.length && !waiting.length ? "done" : "todo", `
+        <p>${t("guideMonitorBody")} ${esc(list.length ? (waiting.length ? t("guideMonitorCount", { n: monitored.length, total: list.length }) : t("guideMonitorAll")) : "")}</p>
+        ${waiting.length ? `<ul class="guide-accounts">${waiting.map((a) => `
+          <li><span class="logo ${a.provider}" role="img" aria-label="${a.provider === "claude" ? "Claude" : "Codex"}">${MARK[a.provider]}</span><span class="guide-name">${esc(name(a))}</span>
+            <button class="btn" data-guide-monitor="${a.provider}" data-id="${esc(a.id)}" aria-label="${esc(t("onAccount", { action: t("monitorConnect"), name: name(a) }))}">${t("monitorConnect")}</button></li>`).join("")}</ul>` : ""}
+        <p class="hint">${t(settings.auto_connect_monitoring ? "guideAutoOn" : "guideAutoOff")}</p>`)}
+      ${guideStep(3, t("guideShareTitle"), settings.presence_folder || settings.presence_remote ? "done" : "optional", `
+        <p>${t("guideShareBody")}</p>
+        <div class="guide-share">
+          <label for="guide-presence">${t("guideShareLabel")}</label>
+          <div class="select"><select id="guide-presence">${presence.html}</select></div>
+          <button class="btn" id="guide-presence-other">${t("guideShareOther")}</button>
+        </div>`)}
+      ${guideStep(4, t("guideNotifyTitle"), GUIDE_NOTIFY.every((k) => settings.notifications[k]) ? "done" : "todo", `
+        <p>${t("guideNotifyBody")}</p>
+        <div class="guide-notify">${GUIDE_NOTIFY.map((k) => `
+          <label><input type="checkbox" class="switch" role="switch" data-guide-notify="${k}" ${settings.notifications[k] ? "checked" : ""} /> ${t(NOTIFY_LABEL[k])}</label>`).join("")}</div>`)}
+    </ol>
+    <div class="guide-foot"><button class="btn accent" id="guide-done">${t("guideDone")}</button></div>
+    <p class="hint" id="guide-status" role="status" hidden></p>`;
+  $("guide-presence").value = presence.known ? presence.value : "";
+  if (focused) box.querySelector(focused)?.focus();
+}
+
+async function closeGuide() {
+  guideForced = false;
+  await update({ onboarding_dismissed: true });
+  // Focus stays on the page the guide was on.
+  const heading = document.querySelector("#page-accounts h1");
+  heading.setAttribute("tabindex", "-1");
+  heading.focus();
+}
+$("guide").addEventListener("click", async (e) => {
+  if (e.target.closest("#guide-close, #guide-done")) { closeGuide(); return; }
+  if (e.target.closest("#guide-presence-other")) {
+    showPage("data");
+    $("presence").value = "__other__";
+    $("presence").dispatchEvent(new Event("change"));
+    return;
+  }
+  const monitor = e.target.closest("[data-guide-monitor]");
+  if (!monitor) return;
+  monitor.disabled = true;
+  const status = $("guide-status");
+  try {
+    await invoke("connect_monitoring", { provider: monitor.dataset.guideMonitor, id: monitor.dataset.id });
+    status.textContent = t("monitorPending");
+  } catch (err) { status.textContent = errorText("", String(err)); monitor.disabled = false; }
+  status.hidden = false;
+});
+$("guide").addEventListener("change", (e) => {
+  const el = e.target;
+  if (el.id === "guide-presence") choosePresence(el.value);
+  else if (el.dataset.guideNotify) update({ notifications: { ...settings.notifications, [el.dataset.guideNotify]: el.checked } });
+});
+$("guide-reopen").addEventListener("click", async () => {
+  guideForced = true;
+  showPage("accounts");
+  await update({ onboarding_dismissed: false });
+  $("guide-title")?.focus();
+  $("guide").scrollIntoView({ block: "start" });
+});
 
 // The plan-renewal calendar (calendar.rs): an .ics file calendar apps can subscribe to.
 let calendarDefault = "";
@@ -846,7 +982,7 @@ function renderHealth() {
   if (!health) return;
   $("health").innerHTML = health.checks.map((c, i) => `
     <div class="row health-check" data-key="${esc(c.id)}">
-      <div class="title"><label><span class="health-dot ${c.status}"></span>${esc(c.title)}</label><small>${esc(c.reason)}</small></div>
+      <div class="title"><label><span class="health-dot ${c.status}" role="img" aria-label="${esc(t({ ok: "healthOk", warning: "healthWarning", problem: "healthProblem" }[c.status] ?? "healthOk"))}"></span>${esc(c.title)}</label><small>${esc(c.reason)}</small></div>
       ${c.status === "ok" ? "" : fixButton(c.fix, i)}
     </div>`).join("");
   const badge = $("health-nav-badge");
@@ -892,16 +1028,25 @@ let syncFolders = [];
 let rclone = { installed: true, remotes: [] };
 let presenceOther = false;
 const REMOTE = "rclone:";
-function renderPresence() {
+/** The sharing choices: off, detected sync folders and rclone remotes (as list_sharing_locations). */
+function presenceChoices() {
   const remote = settings.presence_remote ?? "";
-  const current = remote ? REMOTE + remote : settings.presence_folder ?? "";
+  const value = remote ? REMOTE + remote : settings.presence_folder ?? "";
   const remotes = rclone.remotes.some((r) => r.name === remote) || !remote ? rclone.remotes : [...rclone.remotes, { name: remote, provider: "rclone" }];
-  const known = remote !== "" || syncFolders.some((f) => f.path === current);
-  const other = presenceOther || (current !== "" && !known);
-  $("presence").innerHTML = `<option value="">${t("presenceOff")}</option>`
+  const known = remote !== "" || value === "" || syncFolders.some((f) => f.path === value);
+  const html = `<option value="">${t("presenceOff")}</option>`
     + syncFolders.map((f) => `<option value="${esc(f.path)}">${esc(f.name)} · ${esc(f.path)}</option>`).join("")
-    + remotes.map((r) => `<option value="${esc(REMOTE + r.name)}">${esc(t("presenceViaRclone", { provider: r.provider }))} · ${esc(r.name)}:</option>`).join("")
-    + `<option value="__other__">${t("presenceOther")}</option>`;
+    + remotes.map((r) => `<option value="${esc(REMOTE + r.name)}">${esc(t("presenceViaRclone", { provider: r.provider }))} · ${esc(r.name)}:</option>`).join("");
+  return { html, value, known };
+}
+function choosePresence(value) {
+  if (value.startsWith(REMOTE)) return update({ presence_remote: value.slice(REMOTE.length), presence_folder: null });
+  return update({ presence_folder: value || null, presence_remote: null });
+}
+function renderPresence() {
+  const { html, value: current, known } = presenceChoices();
+  const other = presenceOther || !known;
+  $("presence").innerHTML = html + `<option value="__other__">${t("presenceOther")}</option>`;
   $("presence").value = other ? "__other__" : current;
   $("presence-custom").hidden = !other;
   $("presence-path").placeholder = t("presenceFolderPlaceholder");
@@ -913,8 +1058,7 @@ $("presence").addEventListener("change", (e) => {
   const value = e.target.value;
   presenceOther = value === "__other__";
   if (presenceOther) { renderPresence(); $("presence-path").focus(); return; }
-  if (value.startsWith(REMOTE)) update({ presence_remote: value.slice(REMOTE.length), presence_folder: null });
-  else update({ presence_folder: value || null, presence_remote: null });
+  choosePresence(value);
 });
 async function savePresencePath() {
   const folder = $("presence-path").value.trim();
@@ -929,8 +1073,8 @@ async function savePresencePath() {
 }
 $("presence-save").addEventListener("click", savePresencePath);
 $("presence-path").addEventListener("keydown", (e) => { if (e.key === "Enter") savePresencePath(); });
-invoke("sync_folders").then((folders) => { syncFolders = folders ?? []; if (settings) renderPresence(); }, () => {});
-invoke("rclone_remotes").then((found) => { rclone = found ?? rclone; if (settings) renderPresence(); }, () => {});
+invoke("sync_folders").then((folders) => { syncFolders = folders ?? []; if (settings) { renderPresence(); renderGuide(); } }, () => {});
+invoke("rclone_remotes").then((found) => { rclone = found ?? rclone; if (settings) { renderPresence(); renderGuide(); } }, () => {});
 
 for (const kind of NOTIFY_KINDS) {
   $(`notify-${kind}`).addEventListener("change", (e) => update({ notifications: { ...settings.notifications, [kind]: e.target.checked } }));
@@ -1134,6 +1278,7 @@ try { setSystemLocale(await invoke("system_locale")); } catch {}
 settings = await invoke("get_settings");
 updatesEnabled = await invoke("updates_enabled");
 snapshot = await invoke("get_usage");
+trails = await invoke("get_sparklines").catch(() => ({})) ?? {};
 await render();
 await loadSubscriptions();
 await loadHealth();

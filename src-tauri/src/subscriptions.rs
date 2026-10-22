@@ -56,7 +56,20 @@ pub struct AccountHistory {
     /// read one (see `note_credits`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits: Option<CreditMark>,
+    /// The weekly window's share used over the last `TRAIL_DAYS` days, at most one reading per
+    /// clock hour (the latest), for the sparklines in the flyout and Settings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trail: Vec<TrailPoint>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TrailPoint {
+    pub at: DateTime<Utc>,
+    pub used: f64,
+}
+
+/// Days of readings the sparklines show.
+pub const TRAIL_DAYS: i64 = 7;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreditMark {
@@ -121,6 +134,7 @@ pub fn observe(h: &mut AccountHistory, acc: &AccountUsage, now: DateTime<Utc>) {
     if acc.stale || acc.error.is_some() { return; }
     h.first_seen.get_or_insert(now);
     if let Some(balance) = acc.credits.as_deref().and_then(parse_balance) { note_credits(h, balance, now); }
+    note_trail(h, acc, now);
     for w in &acc.windows {
         if !KINDS.contains(&w.kind.as_str()) { continue; }
         // Codex says how long a window is; only a true week is a weekly record.
@@ -148,6 +162,33 @@ pub fn observe(h: &mut AccountHistory, acc: &AccountUsage, now: DateTime<Utc>) {
                 first_obs: now, last_obs: now, hours: 1, days: 1, idle: false, local: false }, now),
         }
     }
+}
+
+/// Adds this reading of the overall weekly window (or, without one, the fullest weekly window)
+/// to the sparkline trail, replacing an earlier reading from the same clock hour.
+fn note_trail(h: &mut AccountHistory, acc: &AccountUsage, now: DateTime<Utc>) {
+    let weekly = |w: &&crate::model::UsageWindow| KINDS.contains(&w.kind.as_str()) && w.window_seconds.map_or(true, |s| s == WEEK_SECONDS);
+    let window = acc.windows.iter().filter(weekly).find(|w| w.kind == "weekly")
+        .or_else(|| acc.windows.iter().filter(weekly).max_by(|a, b| a.used_percent.total_cmp(&b.used_percent)));
+    let Some(w) = window else { return };
+    let used = w.used_percent.clamp(0.0, 100.0);
+    let hour = |t: DateTime<Utc>| t.timestamp().div_euclid(3600);
+    match h.trail.last_mut() {
+        Some(last) if hour(last.at) == hour(now) => *last = TrailPoint { at: now, used },
+        _ => h.trail.push(TrailPoint { at: now, used }),
+    }
+    let cutoff = now - chrono::Duration::days(TRAIL_DAYS);
+    h.trail.retain(|p| p.at > cutoff);
+}
+
+/// Every account's trail as `[milliseconds since 1970, percent used]` pairs, keyed like the
+/// history (`provider:id`).
+pub fn sparklines(history: &History, now: DateTime<Utc>) -> HashMap<String, Vec<(i64, f64)>> {
+    let cutoff = now - chrono::Duration::days(TRAIL_DAYS);
+    history.accounts.iter()
+        .map(|(k, h)| (k.clone(), h.trail.iter().filter(|p| p.at > cutoff).map(|p| (p.at.timestamp_millis(), p.used)).collect::<Vec<_>>()))
+        .filter(|(_, v)| !v.is_empty())
+        .collect()
 }
 
 fn observe_idle(h: &mut AccountHistory, kind: &str, now: DateTime<Utc>) {
@@ -1006,6 +1047,29 @@ mod tests {
         let mut end = at("2026-09-07T00:00:00Z");
         for p in peaks { week(&mut h, "weekly", end, *p, hours); end += days(7); }
         (h, end - days(7) + Duration::hours(1))
+    }
+
+    #[test]
+    fn the_sparkline_trail_keeps_one_reading_per_hour_for_a_week() {
+        let mut h = AccountHistory::default();
+        let start = at("2026-10-01T10:05:00Z");
+        let resets = start + days(5);
+        observe(&mut h, &reading("weekly", 10.0, resets), start);
+        // A later reading in the same hour replaces the first; a session window is ignored.
+        observe(&mut h, &reading("weekly", 12.0, resets), start + Duration::minutes(30));
+        observe(&mut h, &reading("session", 80.0, resets), start + Duration::minutes(40));
+        observe(&mut h, &reading("weekly", 20.0, resets), start + Duration::hours(2));
+        assert_eq!(h.trail.iter().map(|p| p.used).collect::<Vec<_>>(), [12.0, 20.0]);
+        // Stale readings add nothing; a week later the old points are gone.
+        observe(&mut h, &AccountUsage { stale: true, ..reading("weekly", 50.0, resets) }, start + Duration::hours(3));
+        assert_eq!(h.trail.len(), 2);
+        let later = start + days(7) + Duration::hours(1);
+        observe(&mut h, &reading("weekly", 3.0, later + days(6)), later);
+        assert_eq!(h.trail.iter().map(|p| p.used).collect::<Vec<_>>(), [20.0, 3.0]);
+        let mut history = History::default();
+        history.accounts.insert("claude:a1".into(), h);
+        assert_eq!(sparklines(&history, later)["claude:a1"].len(), 2);
+        assert!(sparklines(&history, later + days(8)).is_empty());
     }
 
     #[test]
