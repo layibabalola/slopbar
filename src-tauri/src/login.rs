@@ -112,8 +112,11 @@ pub fn command(
             if visible {
                 // The cwd is set by CreateProcess, not parsed by cmd. Keeping the
                 // script argument constant also protects profile paths containing
-                // cmd metacharacters or paired %environment-variable% text.
-                c.arg("login.cmd");
+                // cmd metacharacters or paired %environment-variable% text. The explicit
+                // `.\` matters: with NoDefaultCurrentDirectoryInExePath set (Claude Code sets
+                // it, and SlopBar inherits it when an agent starts it), cmd does not look for a
+                // bare `login.cmd` in the current directory and the sign-in never starts.
+                c.arg(r".\login.cmd");
             } else {
                 c.arg(action);
             }

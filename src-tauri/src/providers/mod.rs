@@ -118,7 +118,7 @@ pub async fn fetch_all(
                 billing: slot.billing(),
                 remote: vec![],
                 used_outside: false,
-                runs_out_at: None, unexpected: None,
+                runs_out_at: None, unexpected: None, cli_rejected: false,
             };
             let entry = cache.entry(monitoring::key(slot)).or_default();
             match result {
@@ -148,6 +148,7 @@ pub async fn fetch_all(
             acc.stale = !entry.verified || entry.error.is_some();
             acc.error = entry.error.clone();
             acc.monitor_error = entry.monitor_error.clone();
+            acc.cli_rejected = cli_rejected(slot);
             if let Some(b) = &entry.billing { acc.billing = acc.billing.clone().overlay(b); }
             if let Some(p) = &acc.billing.plan_type { acc.plan = Some(p.clone()); }
             // The account record names the Pro tiers too, for when usage has not said.
@@ -171,6 +172,40 @@ pub(crate) fn billing_due(key: &str) -> bool {
     let due = last.get(key).map_or(true, |t| t.elapsed() >= Duration::from_secs(12 * 3600));
     if due { last.insert(key.to_string(), Instant::now()); }
     due
+}
+
+/// CLI logins the provider rejected, per account: a fingerprint of the access token that got the
+/// 401. The account counts as rejected only while its saved login still has that token, so a
+/// renewal by the CLI clears it without another request.
+fn cli_rejections() -> &'static std::sync::Mutex<HashMap<String, u64>> {
+    static REJECTED: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u64>>> = std::sync::OnceLock::new();
+    REJECTED.get_or_init(Default::default)
+}
+
+fn fingerprint(token: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut h);
+    h.finish()
+}
+
+/// Notes how a usage read with the CLI's own access token went.
+fn note_cli_login(slot: &Slot, token: &str, result: &Result<Fetched, String>) {
+    let mut rejected = cli_rejections().lock().unwrap_or_else(|e| e.into_inner());
+    match result {
+        Err(e) if e == "token_invalid" => { rejected.insert(monitoring::key(slot), fingerprint(token)); }
+        Ok(_) => { rejected.remove(&monitoring::key(slot)); }
+        Err(_) => {}
+    }
+}
+
+/// Whether the provider rejected this saved CLI login (see `note_cli_login`).
+pub fn cli_rejected(slot: &Slot) -> bool {
+    let rejected = cli_rejections().lock().unwrap_or_else(|e| e.into_inner());
+    match (rejected.get(&monitoring::key(slot)), slot.access()) {
+        (Some(bad), Some((token, _))) => *bad == fingerprint(&token),
+        _ => false,
+    }
 }
 
 pub fn alias_key(provider: Provider, id: &str) -> String {
@@ -253,6 +288,9 @@ async fn observed_usage(usage: &impl Usage, monitor: &Monitor, slot: &Slot, toke
     let started = std::time::Instant::now();
     let observe = |evidence| monitor.record(slot, Event::ProviderEvidence { origin, evidence });
     let result = usage.fetch(slot.provider, token, account, &observe).await;
+    if matches!(origin, Origin::Cli | Origin::ActiveCliFallback) {
+        note_cli_login(slot, token, &result);
+    }
     monitor.record(slot, Event::Usage { origin, code: Code::from_error(result.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) });
     result
 }

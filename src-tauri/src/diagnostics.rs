@@ -239,6 +239,13 @@ pub enum Event {
         outcome: RevokeOutcome,
         elapsed_ms: u64,
     },
+    /// Encrypting the plaintext account vault of earlier releases (see `accounts::migrate_vault`):
+    /// counts only. Recorded when anything was found.
+    Vault {
+        migrated: u32,
+        failed: u32,
+        unreadable: u32,
+    },
     /// A panic, recorded only when the user turned crash records on (see `crash_event`): where in
     /// SlopBar's own source it happened and on which kind of thread, never its message.
     Crash {
@@ -1064,7 +1071,7 @@ mod tests {
             billing: crate::model::BillingHints { tier: Some(canary.into()), billing_type: Some(canary.into()), ..Default::default() },
             remote: vec![crate::model::RemoteSeat { machine: canary.into(), where_: vec![canary.into()], seen_at: chrono::Utc::now(), live: true }],
             used_outside: true,
-            runs_out_at: None, unexpected: None,
+            runs_out_at: None, unexpected: None, cli_rejected: false,
         };
         let snapshot = Snapshot {
             accounts: vec![a],

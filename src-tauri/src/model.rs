@@ -59,6 +59,10 @@ pub struct AccountUsage {
     /// there was any this week.
     #[serde(default)]
     pub unexpected: Option<UnexpectedUse>,
+    /// The provider rejected the CLI's own saved login (its access token got a 401). Cleared as
+    /// soon as that login is renewed or works again; the CLI signs in again on its own.
+    #[serde(default)]
+    pub cli_rejected: bool,
 }
 
 /// A monitored account's weekly usage jumped while every computer sharing its status said it

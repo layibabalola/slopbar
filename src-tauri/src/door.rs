@@ -79,6 +79,16 @@ pub enum Request {
     ConnectMonitoring { provider: Provider, id: String },
     DisconnectMonitoring { provider: Provider, id: String },
     RemoveAccount { provider: Provider, id: String },
+    /// Revoke every sign-in SlopBar holds for the account (see `app::revoke_sessions`). Without
+    /// `confirm` only says what that would do.
+    RevokeAccountSessions {
+        provider: Provider,
+        id: String,
+        #[serde(default)]
+        confirm: bool,
+        #[serde(default)]
+        remove_slot: bool,
+    },
     /// Monitoring sign-ins for every account without one, one after another. Without `confirm`
     /// only says which accounts that would be.
     ConnectMonitoringAll {

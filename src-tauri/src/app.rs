@@ -116,6 +116,7 @@ async fn health_report(app: &AppHandle) -> health::Report {
         notifications: health::Notifications { registered: seen.notifications_registered, app_enabled, system_enabled,
             any_wanted: n.usage || n.resets || n.switches || n.renewals || n.unexpected_use },
         auto_connect: settings.auto_connect_monitoring,
+        vault_plaintext: accounts::plaintext_slots(),
     }, chrono::Utc::now())
 }
 
@@ -348,6 +349,15 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         }
         R::DisconnectMonitoring { provider, id } => value(disconnect_monitoring(app.clone(), provider, id).await?),
         R::RemoveAccount { provider, id } => value(remove_account(app.clone(), provider, id).await?),
+        R::RevokeAccountSessions { provider, id, confirm, remove_slot } => {
+            if !confirm {
+                let (connected, active) = session_facts(&app, provider, &id).ok_or("monitor_wrong_account")?;
+                return Ok(serde_json::json!({ "revoked": false, "monitoring_connected": connected, "in_use": active,
+                    "would_revoke_monitoring": connected, "would_remove_slot": remove_slot && !active, "cli_login": "managed_by_cli",
+                    "next": "Nothing was revoked. confirm: true revokes SlopBar's monitoring sign-in for this account at the provider and forgets it here; remove_slot: true also removes the saved CLI login from SlopBar (not while in use). The CLI's own sign-in is managed by the CLI: sign it out there (claude /logout, codex logout)." }));
+            }
+            value(revoke_sessions(&app, provider, &id, remove_slot).await?)
+        }
         R::ConnectMonitoringAll { confirm } => {
             if !confirm {
                 let to_connect = bulk::unmonitored(&app.state::<AppState>().snapshot.lock().unwrap());
@@ -892,6 +902,55 @@ struct Disconnected { snapshot: Snapshot, revoked: bool }
 
 #[tauri::command]
 async fn disconnect_monitoring(app: AppHandle, provider: Provider, id: String) -> Result<Disconnected, String> {
+    let revoked = disconnect_one(&app, provider, &id).await?;
+    Ok(Disconnected { snapshot: do_refresh(&app).await, revoked })
+}
+
+/// What "Revoke all SlopBar sessions" did for one account.
+#[derive(Serialize)]
+struct RevokedSessions {
+    snapshot: Snapshot,
+    /// "revoked" (the provider confirmed), "unconfirmed" (forgotten here, the provider did not
+    /// confirm) or "none" (no monitoring sign-in was connected).
+    monitoring: &'static str,
+    slot_removed: bool,
+    /// Always "managed_by_cli": the CLI's own sign-in is the CLI's to end (its logout).
+    cli_login: &'static str,
+}
+
+/// Whether the account has monitoring connected, and whether it is in use.
+fn session_facts(app: &AppHandle, provider: Provider, id: &str) -> Option<(bool, bool)> {
+    let snapshot = app.state::<AppState>().snapshot.lock().unwrap().clone();
+    snapshot.accounts.iter().find(|a| a.provider == provider && a.id == id).map(|a| (a.monitor_connected, a.active))
+}
+
+/// Revokes every sign-in SlopBar itself holds for an account: its monitoring session, at the
+/// provider and here. The CLI's own login stays the CLI's; with `remove_slot` the saved copy of it
+/// in the vault goes too (as Remove does), which needs the account not to be in use.
+async fn revoke_sessions(app: &AppHandle, provider: Provider, id: &str, remove_slot: bool) -> Result<RevokedSessions, String> {
+    let (connected, active) = session_facts(app, provider, id).ok_or("monitor_wrong_account")?;
+    if remove_slot && active {
+        return Err("active".into());
+    }
+    let monitoring = match (connected, disconnect_one(app, provider, id).await?) {
+        (_, true) => "revoked",
+        (true, false) => "unconfirmed",
+        (false, false) => "none",
+    };
+    if remove_slot {
+        remove_one(app, provider, id).await?;
+    }
+    Ok(RevokedSessions { snapshot: do_refresh(app).await, monitoring, slot_removed: remove_slot, cli_login: "managed_by_cli" })
+}
+
+#[tauri::command]
+async fn revoke_account_sessions(app: AppHandle, provider: Provider, id: String, remove_slot: bool) -> Result<RevokedSessions, String> {
+    revoke_sessions(&app, provider, &id, remove_slot).await
+}
+
+/// Revokes and forgets the account's monitoring sign-in; whether the provider confirmed it.
+async fn disconnect_one(app: &AppHandle, provider: Provider, id: &str) -> Result<bool, String> {
+    let id = id.to_string();
     let operation = app.state::<AppState>().account_operations.begin(provider, &id)?;
     let slot = accounts::load_slots().into_iter().find(|s| s.provider == provider && s.id == id)
         .ok_or("monitor_wrong_account")?;
@@ -900,14 +959,14 @@ async fn disconnect_monitoring(app: AppHandle, provider: Provider, id: String) -
     app.state::<AppState>().diagnostics.record(Some(provider), Some(&id), diagnostics::Event::Action { action: diagnostics::Action::Disconnect,
         code: diagnostics::Code::from_error(result.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) });
     let revoked = result?;
-    auto_monitor_saved(&app, |t| t.manual(&monitoring::key(&slot), false));
+    auto_monitor_saved(app, |t| t.manual(&monitoring::key(&slot), false));
     {
         let state = app.state::<AppState>();
         let _refresh = state.refresh_lock.lock().await;
         providers::retry_now(&mut state.usage_cache.lock().unwrap(), &monitoring::key(&slot));
     }
     drop(operation);
-    Ok(Disconnected { snapshot: do_refresh(&app).await, revoked })
+    Ok(revoked)
 }
 
 #[tauri::command]
@@ -1498,6 +1557,7 @@ pub fn run() {
             add_account,
             connect_monitoring,
             disconnect_monitoring,
+            revoke_account_sessions,
             remove_account,
             connect_monitoring_all,
             remove_lapsed_accounts,
@@ -1518,6 +1578,14 @@ pub fn run() {
         ])
         .setup(|app| {
             app.state::<AppState>().diagnostics.start();
+            // Before the first refresh reads the vault; a slot that fails stays readable as plaintext.
+            let vault = accounts::migrate_vault();
+            if !vault.is_empty() {
+                let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+                app.state::<AppState>().diagnostics.record(None, None, diagnostics::Event::Vault {
+                    migrated: count(vault.migrated), failed: count(vault.failed), unreadable: count(vault.unreadable),
+                });
+            }
             let handle = app.handle();
             #[cfg(windows)]
             {

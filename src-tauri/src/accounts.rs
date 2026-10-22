@@ -300,31 +300,61 @@ fn installed(provider: Provider, source: &Source) -> bool {
 
 // ---------------------------------------------------------------------------------------------
 // The vault
+//
+// One file per slot, encrypted with Windows DPAPI for the signed-in Windows user (see
+// `private_store::save_secret`): `<provider>-<id>.slot`. Releases before the encrypted vault
+// wrote the same login as plaintext `<provider>-<id>.json`; `migrate_vault` encrypts those on
+// startup. For one release a plaintext slot is still read (whichever file is newer wins), so a
+// slot whose migration failed is never lost, only left unencrypted until the next attempt.
 
 fn vault_dir() -> Option<PathBuf> {
     crate::settings::app_dir().map(|d| d.join("accounts"))
 }
 
-fn slot_path(provider: Provider, id: &str) -> Option<PathBuf> {
-    vault_dir().map(|d| slot_path_in(&d, provider, id))
+fn slot_stem(provider: Provider, id: &str) -> String {
+    let safe: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+    format!("{}-{safe}", provider.key())
 }
 
 fn slot_path_in(vault: &Path, provider: Provider, id: &str) -> PathBuf {
-    let safe: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
-    vault.join(format!("{}-{safe}.json", provider.key()))
+    vault.join(format!("{}.{SLOT_EXT}", slot_stem(provider, id)))
 }
+
+const SLOT_EXT: &str = "slot";
+/// The plaintext slots of earlier releases, read for one release as a fallback.
+const PLAIN_EXT: &str = "json";
 
 pub fn load_slots() -> Vec<Slot> {
     vault_dir().map(|d| load_slots_in(&d)).unwrap_or_default()
 }
 
+fn modified(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn read_slot(path: &Path) -> Option<Slot> {
+    let bytes = match path.extension().and_then(|e| e.to_str()) {
+        Some(SLOT_EXT) => crate::private_store::load_secret(path).ok()?,
+        Some(PLAIN_EXT) => std::fs::read(path).ok()?,
+        _ => return None,
+    };
+    serde_json::from_slice(&bytes).ok()
+}
+
 fn load_slots_in(dir: &Path) -> Vec<Slot> {
     let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
-    let mut slots: Vec<Slot> = entries
-        .flatten()
-        .filter_map(|e| serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok())
-        .collect();
-    slots.sort_by(|a, b| (a.provider.key(), &a.email).cmp(&(b.provider.key(), &b.email)));
+    // Per file stem, the newest readable copy: an encrypted slot, or a plaintext one written by an
+    // earlier release (after a downgrade, the plaintext copy is the newer login).
+    let mut newest: HashMap<String, (Option<std::time::SystemTime>, Slot)> = HashMap::new();
+    for path in entries.flatten().map(|e| e.path()) {
+        let (Some(stem), Some(slot)) = (path.file_stem().and_then(|s| s.to_str()).map(String::from), read_slot(&path)) else { continue };
+        let at = modified(&path);
+        if newest.get(&stem).map_or(true, |(t, _)| at > *t) {
+            newest.insert(stem, (at, slot));
+        }
+    }
+    let mut slots: Vec<Slot> = newest.into_values().map(|(_, s)| s).collect();
+    slots.sort_by(|a, b| (a.provider.key(), &a.email, &a.id).cmp(&(b.provider.key(), &b.email, &b.id)));
     slots
 }
 
@@ -333,15 +363,98 @@ fn save_slot(slot: &Slot) -> std::io::Result<()> {
 }
 
 fn save_slot_in(vault: &Path, slot: &Slot) -> std::io::Result<()> {
-    std::fs::create_dir_all(vault)?;
-    write_json(&slot_path_in(vault, slot.provider, &slot.id), &serde_json::to_value(slot)?)
+    let path = slot_path_in(vault, slot.provider, &slot.id);
+    crate::private_store::save_secret(&path, &serde_json::to_vec(slot)?)?;
+    // The encrypted copy is now the newest, so a leftover plaintext one is only a stale secret.
+    match std::fs::remove_file(path.with_extension(PLAIN_EXT)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 pub fn remove_slot(provider: Provider, id: &str) -> std::io::Result<()> {
-    match slot_path(provider, id) {
-        Some(p) => std::fs::remove_file(p),
-        None => Ok(()),
+    let Some(vault) = vault_dir() else { return Ok(()) };
+    let path = slot_path_in(&vault, provider, id);
+    let mut removed = false;
+    for path in [path.with_extension(PLAIN_EXT), path] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
     }
+    if removed { Ok(()) } else { Err(std::io::ErrorKind::NotFound.into()) }
+}
+
+/// What encrypting the plaintext slots of earlier releases did (see `migrate_vault`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VaultMigration {
+    /// Plaintext slots now stored encrypted, their plaintext file removed.
+    pub migrated: usize,
+    /// Slots that could not be encrypted, or did not read back; their plaintext file was kept.
+    pub failed: usize,
+    /// Plaintext files that are not a readable slot; left untouched.
+    pub unreadable: usize,
+}
+
+impl VaultMigration {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Encrypts every plaintext slot. Each one is written encrypted, read back and compared, and only
+/// then is its plaintext file removed; on any failure the plaintext file stays (and is still read)
+/// and a half-written encrypted copy is removed, so no slot is ever lost.
+pub fn migrate_vault() -> VaultMigration {
+    let _guard = VAULT.lock().unwrap_or_else(|e| e.into_inner());
+    vault_dir().map(|d| migrate_vault_in(&d, crate::private_store::save_secret, crate::private_store::load_secret)).unwrap_or_default()
+}
+
+fn migrate_vault_in(
+    vault: &Path,
+    save: impl Fn(&Path, &[u8]) -> std::io::Result<()>,
+    load: impl Fn(&Path) -> std::io::Result<Vec<u8>>,
+) -> VaultMigration {
+    let mut result = VaultMigration::default();
+    let Ok(entries) = std::fs::read_dir(vault) else { return result };
+    let mut plain: Vec<PathBuf> = entries.flatten().map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(PLAIN_EXT))
+        .collect();
+    plain.sort();
+    for path in plain {
+        let Some(slot) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).filter(|v| serde_json::from_value::<Slot>(v.clone()).is_ok()) else {
+            result.unreadable += 1;
+            continue;
+        };
+        let target = path.with_extension(SLOT_EXT);
+        // A newer encrypted copy already exists: the plaintext one is stale, but it is only
+        // removed once that copy is known to read back.
+        let newer = target.exists() && modified(&target) > modified(&path)
+            && load(&target).ok().and_then(|b| serde_json::from_slice::<Slot>(&b).ok()).is_some();
+        let stored = newer || (|| -> std::io::Result<bool> {
+            save(&target, &serde_json::to_vec(&slot)?)?;
+            Ok(load(&target).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).as_ref() == Some(&slot))
+        })().unwrap_or(false);
+        if stored && std::fs::remove_file(&path).is_ok() {
+            result.migrated += 1;
+        } else {
+            if !stored {
+                // Whatever encrypted copy is there now is either half-written or older than the
+                // plaintext one, which stays and keeps being read.
+                let _ = std::fs::remove_file(&target);
+            }
+            result.failed += 1;
+        }
+    }
+    result
+}
+
+/// Plaintext slot files still in the vault (a migration that failed, or an earlier release
+/// running alongside).
+pub fn plaintext_slots() -> usize {
+    let Some(Ok(entries)) = vault_dir().map(std::fs::read_dir) else { return 0 };
+    entries.flatten().filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some(PLAIN_EXT)).count()
 }
 
 /// Serializes vault reads/writes against switches.
@@ -973,5 +1086,115 @@ mod profile_tests {
         assert_eq!(profile_name(Provider::Claude, "user-1:org-1"), profile_name(Provider::Claude, "user-1:org-1"));
         assert_ne!(profile_name(Provider::Claude, "a"), profile_name(Provider::Codex, "a"));
         assert!(!profile_name(Provider::Codex, "user-2:acct-2").contains("user-2"));
+    }
+
+    // -- The encrypted vault ----------------------------------------------------------------
+
+    /// A slot as releases before the encrypted vault stored it.
+    fn plain(vault: &Path, slot: &Slot) -> PathBuf {
+        let path = slot_path_in(vault, slot.provider, &slot.id).with_extension(PLAIN_EXT);
+        std::fs::write(&path, serde_json::to_string_pretty(slot).unwrap()).unwrap();
+        path
+    }
+
+    fn files(vault: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(vault).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    fn real_migrate(vault: &Path) -> VaultMigration {
+        migrate_vault_in(vault, crate::private_store::save_secret, crate::private_store::load_secret)
+    }
+
+    #[test]
+    fn migration_encrypts_every_plaintext_slot_and_leaves_no_token_on_disk() {
+        let vault = TempDir::new();
+        let (a, b) = (claude("SYNTH-REFRESH-ALPHA", 1_000), codex("SYNTH-REFRESH-BRAVO", "2026-10-01T00:00:00Z"));
+        plain(&vault.0, &a);
+        plain(&vault.0, &b);
+        assert_eq!(real_migrate(&vault.0), VaultMigration { migrated: 2, failed: 0, unreadable: 0 });
+        assert!(files(&vault.0).iter().all(|f| f.ends_with(".slot")), "{:?}", files(&vault.0));
+        assert_eq!(stored(&vault.0, &a).as_deref(), Some("SYNTH-REFRESH-ALPHA"));
+        assert_eq!(stored(&vault.0, &b).as_deref(), Some("SYNTH-REFRESH-BRAVO"));
+        // DPAPI on Windows; on other platforms save_secret is a private (0600) plaintext file.
+        #[cfg(windows)]
+        for entry in std::fs::read_dir(&vault.0).unwrap().flatten() {
+            let bytes = std::fs::read(entry.path()).unwrap();
+            for token in ["SYNTH-REFRESH-ALPHA", "SYNTH-REFRESH-BRAVO", "at-SYNTH", "test@example.invalid"] {
+                assert!(!bytes.windows(token.len()).any(|w| w == token.as_bytes()), "{token} in {:?}", entry.path());
+            }
+        }
+        // Running again finds nothing to do, and saves keep writing encrypted slots only.
+        assert!(real_migrate(&vault.0).is_empty());
+        save_slot_in(&vault.0, &claude("SYNTH-REFRESH-CHARLIE", 2_000)).unwrap();
+        assert_eq!(stored(&vault.0, &a).as_deref(), Some("SYNTH-REFRESH-CHARLIE"));
+        assert_eq!(files(&vault.0).len(), 2);
+    }
+
+    #[test]
+    fn a_failed_migration_keeps_the_plaintext_slot_and_it_is_still_read() {
+        let vault = TempDir::new();
+        let (a, b) = (claude("SYNTH-REFRESH-ALPHA", 1_000), codex("SYNTH-REFRESH-BRAVO", "2026-10-01T00:00:00Z"));
+        let (pa, pb) = (plain(&vault.0, &a), plain(&vault.0, &b));
+        // Encrypting the Claude slot fails outright.
+        let failing = |path: &Path, bytes: &[u8]| {
+            if path.to_string_lossy().contains("claude-") { Err(std::io::Error::other("disk full")) } else { crate::private_store::save_secret(path, bytes) }
+        };
+        let result = migrate_vault_in(&vault.0, failing, crate::private_store::load_secret);
+        assert_eq!(result, VaultMigration { migrated: 1, failed: 1, unreadable: 0 });
+        assert!(pa.exists() && !pa.with_extension(SLOT_EXT).exists());
+        assert!(!pb.exists() && pb.with_extension(SLOT_EXT).exists());
+        assert_eq!(load_slots_in(&vault.0).len(), 2);
+        assert_eq!(stored(&vault.0, &a).as_deref(), Some("SYNTH-REFRESH-ALPHA"));
+
+        // Writing works but the copy does not read back the same: the copy goes, the plaintext stays.
+        let garbled = |path: &Path| crate::private_store::load_secret(path).map(|mut b| { b.reverse(); b });
+        let result = migrate_vault_in(&vault.0, crate::private_store::save_secret, garbled);
+        assert_eq!(result, VaultMigration { migrated: 0, failed: 1, unreadable: 0 });
+        assert!(pa.exists() && !pa.with_extension(SLOT_EXT).exists());
+        assert_eq!(stored(&vault.0, &a).as_deref(), Some("SYNTH-REFRESH-ALPHA"));
+
+        // The next start succeeds.
+        assert_eq!(real_migrate(&vault.0), VaultMigration { migrated: 1, failed: 0, unreadable: 0 });
+        assert_eq!(load_slots_in(&vault.0).len(), 2);
+    }
+
+    #[test]
+    fn unreadable_files_are_left_alone_and_never_stop_the_others() {
+        let vault = TempDir::new();
+        let a = claude("SYNTH-REFRESH-ALPHA", 1_000);
+        plain(&vault.0, &a);
+        std::fs::write(vault.0.join("claude-broken.json"), "{ not json").unwrap();
+        std::fs::write(vault.0.join("codex-other.json"), r#"{"something":"else"}"#).unwrap();
+        std::fs::write(vault.0.join("codex-garbage.slot"), b"\x00\x01not dpapi").unwrap();
+        assert_eq!(real_migrate(&vault.0), VaultMigration { migrated: 1, failed: 0, unreadable: 2 });
+        assert_eq!(std::fs::read_to_string(vault.0.join("claude-broken.json")).unwrap(), "{ not json");
+        assert!(vault.0.join("codex-garbage.slot").exists());
+        let slots = load_slots_in(&vault.0);
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].id, a.id);
+    }
+
+    #[test]
+    fn a_newer_plaintext_slot_wins_until_the_next_save_replaces_it() {
+        let vault = TempDir::new();
+        save_slot_in(&vault.0, &claude("SYNTH-REFRESH-OLD", 1_000)).unwrap();
+        let encrypted = slot_path_in(&vault.0, Provider::Claude, &claude("x", 0).id);
+        // An earlier release, run after this one, renewed the login and wrote it as plaintext.
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&encrypted).unwrap().set_modified(old).unwrap();
+        let newer = plain(&vault.0, &claude("SYNTH-REFRESH-NEW", 2_000));
+        assert_eq!(load_slots_in(&vault.0).len(), 1);
+        assert_eq!(stored(&vault.0, &claude("x", 0)).as_deref(), Some("SYNTH-REFRESH-NEW"));
+        // Migration takes the newer plaintext login, not the older encrypted one.
+        assert_eq!(real_migrate(&vault.0).migrated, 1);
+        assert!(!newer.exists());
+        assert_eq!(stored(&vault.0, &claude("x", 0)).as_deref(), Some("SYNTH-REFRESH-NEW"));
+        // A save also removes a leftover plaintext copy.
+        plain(&vault.0, &claude("SYNTH-REFRESH-STALE", 500));
+        save_slot_in(&vault.0, &claude("SYNTH-REFRESH-LATEST", 3_000)).unwrap();
+        assert_eq!(files(&vault.0).len(), 1);
+        assert_eq!(stored(&vault.0, &claude("x", 0)).as_deref(), Some("SYNTH-REFRESH-LATEST"));
     }
 }
