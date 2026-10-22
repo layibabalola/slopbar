@@ -17,17 +17,17 @@ description names the PRs it stacks on. The work before this roadmap is #6, then
 #11, merged in that order. This roadmap file itself stays on the fork and is never part of an
 upstream PR.
 
-## Wave 1: running
+## Wave 1: done (merged at b25d07f on claude/subscription-value)
 
 | # | Item | Status |
 |---|---|---|
-| 1 | **Renewal warnings.** A notification 3 days before an unused or mostly idle plan renews, naming the account, its verdict and cost, with Manage plan one click away. A softer one for any paid plan renewing within 24 hours. | running |
-| 2 | **Runs-out-at forecast.** "Hits its weekly limit Thursday around 3 PM" in the flyout and on Subscriptions, plus an optional heads-up for the account in use. | running |
-| 3 | **Unexpected-use alert.** With sharing on everywhere, usage rising while no machine reports the account in use means the web or mobile app, or a leaked sign-in. | running |
-| 17 | **`recommend_account` door.** An agent asks which account has headroom for its job; SlopBar ranks them and can switch. | running |
-| 18 | **`get_headroom` door.** A long-running agent slows down or pauses before a limit instead of failing mid-task. | running |
+| 1 | **Renewal warnings.** A notification 3 days before an unused or mostly idle plan renews, naming the account, its verdict and cost, with Manage plan one click away. A softer one for any paid plan renewing within 24 hours. | done (3aea1a9) |
+| 2 | **Runs-out-at forecast.** "Hits its weekly limit Thursday around 3 PM" in the flyout and on Subscriptions, plus an optional heads-up for the account in use. | done (3aea1a9) |
+| 3 | **Unexpected-use alert.** With sharing on everywhere, usage rising while no machine reports the account in use means the web or mobile app, or a leaked sign-in. | done (b25d07f) |
+| 17 | **`recommend_account` door.** An agent asks which account has headroom for its job; SlopBar ranks them and can switch. | done (5ebc677) |
+| 18 | **`get_headroom` door.** A long-running agent slows down or pauses before a limit instead of failing mid-task. | done (5ebc677) |
 
-## Wave 2: queued (starts when wave 1 is merged)
+## Wave 2: running
 
 | # | Item |
 |---|---|
