@@ -97,7 +97,7 @@ upstream PR.
 |---|---|---|
 | 45 | **Smaller footprint without losing features**: Settings, switcher and flyout built on demand; one shared WebView2 process group; quiet idle timers; capped diagnostics exports and install rollbacks. Measured: 404 MB -> 171 MB private and 4.88% -> 0.73% of a core at idle. | done (07416eb) |
 | 46 | **Native taskbar widget**: draw the always-visible widget with Windows' own drawing instead of a web view, for a small (~80-100 MB) idle footprint. | done (ac9e355) |
-| 47 | **Flyout on demand**: the flyout is built on click and closed when dismissed, so no WebView2 process runs at idle. Done in the native-widget session. | done (a74cf4b); replaced by 3418c53: the delay on click was too slow, so the flyout is now built hidden at startup and trims memory while hidden (~134 MB idle) |
+| 47 | **Flyout on demand**: the flyout is built on click and closed when dismissed, so no WebView2 process runs at idle. Done in the native-widget session. | done (a74cf4b); replaced by 3418c53/d2fe406/7109682: the delay on click was too slow, so the flyout is now built hidden at startup and shown instantly (checked on screen: drawn within 0.3 s of a click) |
 | 48 | **Full account tooltips** in the compact flyout and on the native widget (the same detail as the full view), **sparklines fixed** (a key-case mismatch had left them empty), **WSL never started needlessly** (`wsl_accounts` auto/on/off), and **the app no longer quits when the flyout closes**. Upstream thelioo/slopbar#33. | done (4194a17) |
 | 30b | **Translate the 130 strings added in waves 5 and 6.** | done (aab0f12) |
 
