@@ -352,6 +352,11 @@ pub fn is_windows_11() -> bool {
     win::is_windows_11()
 }
 
+/// Whether a fullscreen app (video, game, presentation) is in front.
+pub fn fullscreen() -> bool {
+    win::fullscreen_monitor().is_some()
+}
+
 /// The system accent palette: eight RGBA entries from lightest to darkest.
 pub fn accent_palette() -> Option<[u8; 32]> {
     win::accent_palette()

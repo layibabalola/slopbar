@@ -55,11 +55,13 @@ pub struct Notifications {
     pub unexpected_use: bool,
     /// A plan that looks unneeded renews within three days; any paid plan within a day.
     pub renewals: bool,
+    /// Monday mornings: last week's spend, savings, renewals and accounts that ran out.
+    pub digest: bool,
 }
 
 impl Default for Notifications {
     fn default() -> Self {
-        Self { usage: true, resets: true, switches: true, renewals: true, unexpected_use: true }
+        Self { usage: true, resets: true, switches: true, renewals: true, unexpected_use: true, digest: true }
     }
 }
 
@@ -77,6 +79,16 @@ impl Balancer {
             Provider::Codex => self.codex,
         }
     }
+}
+
+/// The plan-renewal calendar file (see `calendar`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Calendar {
+    /// Rewrite it after each refresh.
+    pub enabled: bool,
+    /// Where it goes; Documents\SlopBar\renewals.ics when unset.
+    pub path: Option<String>,
 }
 
 /// What the user told SlopBar about one account's paid plan (Settings > Subscriptions).
@@ -131,6 +143,10 @@ pub struct Settings {
     pub project_pins: Vec<ProjectPin>,
     /// The system-wide shortcut that opens the quick switcher, e.g. "Ctrl+Alt+S"; empty is off.
     pub switcher_hotkey: String,
+    /// Start the monitoring sign-in on its own for an account without one once it has been in use
+    /// for a few minutes (see `auto_monitor`). On unless the user turns it off.
+    pub auto_connect_monitoring: bool,
+    pub calendar: Calendar,
 }
 
 /// One folder pinned to one account of a provider.
@@ -163,6 +179,8 @@ impl Default for Settings {
             crash_records: false,
             project_pins: Vec::new(),
             switcher_hotkey: DEFAULT_SWITCHER_HOTKEY.into(),
+            auto_connect_monitoring: true,
+            calendar: Calendar::default(),
         }
     }
 }
@@ -204,7 +222,7 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
 /// `project_pins` has its own operations (see `pins`).
-const PATCHABLE: [&str; 15] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "switcher_hotkey"];
+const PATCHABLE: [&str; 17] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey"];
 
 /// Modifier names a shortcut may use, as the Settings window writes them.
 const HOTKEY_MODIFIERS: [&str; 4] = ["Ctrl", "Alt", "Shift", "Win"];
@@ -360,6 +378,14 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
     if next.unexpected_min_rise != current.unexpected_min_rise && !UNEXPECTED_MIN_RISE.contains(&next.unexpected_min_rise) {
         return Err(format!("unexpected_min_rise must be {}–{} points", UNEXPECTED_MIN_RISE.start(), UNEXPECTED_MIN_RISE.end()));
     }
+    if next.calendar.path != current.calendar.path {
+        if let Some(path) = &mut next.calendar.path {
+            *path = path.trim().to_string();
+            if !crate::calendar::valid_path(path) {
+                return Err("calendar.path must be an absolute .ics file path in an existing folder (null uses Documents\\SlopBar\\renewals.ics)".into());
+            }
+        }
+    }
     next.subscriptions.retain(|_, plan| *plan != Subscription::default());
     if next.switcher_hotkey != current.switcher_hotkey {
         next.switcher_hotkey = normalize_hotkey(&next.switcher_hotkey)?;
@@ -395,9 +421,18 @@ mod patch_tests {
         assert_eq!(web.web_use.keys().collect::<Vec<_>>(), ["claude:a"], "false entries are dropped");
         assert_eq!(web.unexpected_min_rise, 5);
         assert!(!next.crash_records, "crash records are off by default");
+        assert!(next.notifications.digest && !next.calendar.enabled, "the digest is on and the calendar off by default");
+        let dir = crate::test_support::TempDir::new();
+        let ics = dir.0.join("renewals.ics").display().to_string();
+        let cal = patched(&next, &json!({ "calendar": { "enabled": true, "path": ics }, "notifications": { "digest": false } }), false).unwrap();
+        assert!(cal.calendar.enabled && cal.calendar.path.as_deref() == Some(ics.as_str()) && !cal.notifications.digest);
+        assert!(patched(&cal, &json!({ "calendar": { "path": null } }), false).unwrap().calendar.path.is_none(), "null goes back to the default");
         let crash = patched(&next, &json!({ "crash_records": true }), false).unwrap();
         assert!(crash.crash_records && crash.refresh_minutes == 15);
         assert!(patched(&crash, &json!({ "crash_records": "yes" }), false).is_err());
+        assert!(next.auto_connect_monitoring, "monitoring connects automatically by default");
+        assert!(!patched(&next, &json!({ "auto_connect_monitoring": false }), false).unwrap().auto_connect_monitoring);
+        assert!(serde_json::from_str::<Settings>("{}").unwrap().auto_connect_monitoring, "older settings files turn it on");
         assert!(!web.notifications.unexpected_use && web.notifications.switches);
         assert!(patched(&web, &json!({ "web_use": { "claude:a": null } }), false).unwrap().web_use.is_empty());
         let planned = patched(&next, &json!({ "subscriptions": { "claude:a": { "billing_day": 3, "monthly_cost": 100, "cancel_after": "2026-11-02" } } }), false).unwrap();
@@ -440,6 +475,10 @@ mod patch_tests {
             (json!({ "unexpected_min_rise": 0 }), "rise too small"),
             (json!({ "unexpected_min_rise": 21 }), "rise too large"),
             (json!({ "notifications": { "unexpected": true } }), "notification typo"),
+            (json!({ "calendar": { "path": "renewals.ics" } }), "relative calendar path"),
+            (json!({ "calendar": { "path": "C:\\Windows\\win.ini" } }), "calendar path not .ics"),
+            (json!({ "calendar": { "enabled": "yes" } }), "calendar type"),
+            (json!({ "calendar": { "url": "x" } }), "calendar typo"),
             (json!({ "presence_remote": "a:b" }), "remote with a path"),
             (json!({ "presence_folder": "C:\\definitely\\not\\a\\slopbar\\folder" }), "missing presence folder"),
             (json!({ "aliases": { "claude:x": "ok
