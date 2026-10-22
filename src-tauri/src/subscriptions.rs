@@ -36,11 +36,6 @@ const FORGET_DAYS: i64 = 14;
 
 /// Weekly windows the history records. Session windows say nothing about a plan's value.
 const KINDS: [&str; 3] = ["weekly", "weekly_opus", "weekly_sonnet"];
-/// Readings kept for the short-term rate: this many hours, at most `MAX_RECENT` of them.
-const RECENT_HOURS: i64 = 6;
-const MAX_RECENT: usize = 48;
-/// The short-term rate needs readings spanning at least this long.
-const SHORT_MIN_MINUTES: i64 = 30;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -57,10 +52,6 @@ pub struct AccountHistory {
     /// The last poll that listed this account, readable or not.
     pub last_seen: Option<DateTime<Utc>>,
     pub windows: Vec<WindowRecord>,
-    /// The latest fresh readings of the weekly window in progress, for a short-term usage rate
-    /// (see `forecast`). Only the current window's, and only the last `RECENT_HOURS`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub recent: Vec<Reading>,
     /// Codex: the purchased credit balance last read, and what has been spent since SlopBar first
     /// read one (see `note_credits`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,13 +65,6 @@ pub struct CreditMark {
     /// Every drop in the balance since `since`. A top-up raises the balance without resetting it.
     pub spent: f64,
     pub since: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Reading {
-    pub at: DateTime<Utc>,
-    pub used: f64,
-    pub resets_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -149,7 +133,6 @@ pub fn observe(h: &mut AccountHistory, acc: &AccountUsage, now: DateTime<Utc>) {
         let Some(resets_at) = w.resets_at else { continue };
         // A window whose reset has passed belongs to the next poll's numbers, not this one.
         if resets_at <= now { continue; }
-        if w.kind == "weekly" { remember(h, w.used_percent, resets_at, now); }
         // Usage began: the idle stretch before it ends here.
         if let Some(r) = h.windows.iter_mut().find(|r| r.kind == w.kind && r.idle && r.resets_at > now) {
             r.resets_at = now;
@@ -165,15 +148,6 @@ pub fn observe(h: &mut AccountHistory, acc: &AccountUsage, now: DateTime<Utc>) {
                 first_obs: now, last_obs: now, hours: 1, days: 1, idle: false, local: false }, now),
         }
     }
-}
-
-/// Keeps a fresh reading of the weekly window for `forecast`, dropping the previous window's.
-fn remember(h: &mut AccountHistory, used: f64, resets_at: DateTime<Utc>, now: DateTime<Utc>) {
-    let cutoff = now - chrono::Duration::hours(RECENT_HOURS);
-    h.recent.retain(|r| r.at > cutoff && r.at < now && (r.resets_at - resets_at).num_seconds().abs() < SAME_WINDOW_SECONDS);
-    h.recent.push(Reading { at: now, used, resets_at });
-    let extra = h.recent.len().saturating_sub(MAX_RECENT);
-    h.recent.drain(..extra);
 }
 
 fn observe_idle(h: &mut AccountHistory, kind: &str, now: DateTime<Utc>) {
@@ -452,7 +426,8 @@ pub struct ThisWeek {
     pub resets_at: Option<DateTime<Utc>>,
     /// Usage so far divided by the share of the week that has passed: above 100 runs out early.
     pub pace_percent: Option<f64>,
-    /// When the week reaches its limit at the current rate, when that is before it resets.
+    /// When the week reaches its limit at the current pace, when that is before it resets
+    /// (`headroom::runs_out_at`).
     pub runs_out_at: Option<DateTime<Utc>>,
 }
 
@@ -467,41 +442,6 @@ fn this_week(acc: &AccountUsage, now: DateTime<Utc>) -> Option<ThisWeek> {
     })
 }
 
-/// When the weekly window reaches 100% at the current rate, if that comes before it resets.
-///
-/// The rate blends the whole week's average (used / time elapsed) with the short-term rate from
-/// the last hours of readings, when there are enough of them: the average alone misses a burst,
-/// the short-term rate alone overreacts to one. Never from a stale, failed or old reading, nor
-/// in the first hours of a window, when one session dominates the average.
-pub fn forecast(acc: &AccountUsage, h: Option<&AccountHistory>, max_age: chrono::Duration, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    if acc.stale || acc.error.is_some() { return None; }
-    let read_at = acc.fetched_at.filter(|t| *t <= now && now - *t <= max_age)?;
-    let w = acc.windows.iter().find(|w| w.kind == "weekly" && w.window_seconds.map_or(true, |s| s == WEEK_SECONDS))?;
-    let resets_at = w.resets_at.filter(|r| *r > read_at)?;
-    if !(w.used_percent > 0.0 && w.used_percent < 100.0) { return None; }
-    let elapsed = WEEK_SECONDS - (resets_at - read_at).num_seconds();
-    if elapsed < 6 * 3600 || elapsed > WEEK_SECONDS { return None; }
-    let hour = 3600.0;
-    let average = w.used_percent / (elapsed as f64 / hour);
-    let short = h.and_then(|h| {
-        let first = h.recent.iter().filter(|r| r.at <= read_at && read_at - r.at <= chrono::Duration::hours(RECENT_HOURS)
-            && (r.resets_at - resets_at).num_seconds().abs() < SAME_WINDOW_SECONDS).min_by_key(|r| r.at)?;
-        let span = (read_at - first.at).num_seconds();
-        (span >= SHORT_MIN_MINUTES * 60).then(|| ((w.used_percent - first.used) / (span as f64 / hour)).max(0.0))
-    });
-    let rate = short.map_or(average, |s| (average + s) / 2.0);
-    if rate <= 0.0 { return None; }
-    let at = read_at + chrono::Duration::seconds(((100.0 - w.used_percent) / rate * hour) as i64);
-    (at < resets_at).then_some(at)
-}
-
-/// Sets every account's `runs_out_at` from its reading and recent history.
-pub fn attach_forecasts(snapshot: &mut Snapshot, history: &History, max_age: chrono::Duration, now: DateTime<Utc>) {
-    for acc in &mut snapshot.accounts {
-        acc.runs_out_at = forecast(acc, history.accounts.get(&history_key(acc.provider, &acc.id)), max_age, now);
-    }
-}
-
 /// What a paid plan's next renewal deserves a warning for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -513,6 +453,41 @@ pub enum RenewalWarning {
 }
 
 pub const WASTEFUL_DAYS: i64 = 3;
+
+/// OpenAI: grandfathered ChatGPT Pro 200 subscribers keep the previous Codex allowance through
+/// this day; after it Pro 200 includes a lower allowance at the same price.
+/// https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers
+pub const PRO_200_LAST_DAY: (i32, u32, u32) = (2026, 10, 29);
+/// The new allowance as a share of the old. OpenAI gives no figure; third-party estimates put it
+/// at about half.
+pub const PRO_200_NEW_ALLOWANCE: f64 = 0.5;
+
+/// Pro 200's coming allowance cut, for one account on it.
+#[derive(Debug, Clone, Serialize)]
+pub struct AllowanceChange {
+    /// The last day of the previous allowance.
+    pub last_day: NaiveDate,
+    /// The highest weekly usage in recent weeks, the week in progress included.
+    pub peak_percent: f64,
+    /// That peak measured against the new allowance.
+    pub projected_percent: f64,
+    /// That week would reach the limit under the new allowance.
+    pub would_hit_limit: bool,
+}
+
+/// For a Codex account on Pro 200 before the cut: whether its recent weeks would fit the smaller
+/// allowance. None for other plans, after the cut, or with no week to go on.
+pub fn allowance_change(acc: &AccountUsage, h: &AccountHistory, now: DateTime<Utc>) -> Option<AllowanceChange> {
+    let (y, m, d) = PRO_200_LAST_DAY;
+    let last_day = NaiveDate::from_ymd_opt(y, m, d)?;
+    if acc.provider != Provider::Codex || acc.plan.as_deref() != Some("pro") || now.date_naive() > last_day { return None; }
+    let mut done: Vec<&WindowRecord> = h.windows.iter().filter(|r| r.kind == "weekly" && r.resets_at <= now && (r.counts() || r.local)).collect();
+    done.sort_by_key(|r| std::cmp::Reverse(r.resets_at));
+    let live = acc.windows.iter().filter(|w| w.kind == "weekly" && !acc.stale && acc.error.is_none()).map(|w| w.used_percent);
+    let peak = done.iter().take(RECENT).map(|r| r.peak).chain(live).reduce(f64::max)?;
+    let projected = peak / PRO_200_NEW_ALLOWANCE;
+    Some(AllowanceChange { last_day, peak_percent: peak, projected_percent: (projected * 10.0).round() / 10.0, would_hit_limit: projected >= 100.0 })
+}
 
 fn renewal_warning(renewal: Option<&Renewal>, ends_at: Option<DateTime<Utc>>, a: &Assessment, now: DateTime<Utc>) -> Option<RenewalWarning> {
     let left = renewal?.at - now;
@@ -563,6 +538,8 @@ pub struct Entry {
     pub idle_now: bool,
     /// Codex only: what the Codex CLI on this PC shows for this account.
     pub local: Option<crate::codex_local::LocalActivity>,
+    /// Codex Pro 200 only, until its allowance is cut (see `allowance_change`).
+    pub allowance_change: Option<AllowanceChange>,
     /// This plan's weekly allowance in plans of the provider's reference tier (`plan_weight`).
     pub plan_weight: Option<f64>,
     /// What the plan costs per use, when its cost is known (`cost_per_use`).
@@ -692,6 +669,7 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
             plan_code: acc.billing.plan_code.clone(),
             idle_now,
             local: activity,
+            allowance_change: allowance_change(acc, h, now),
             plan_weight: plan_weight(acc),
             cost_per_use,
             credits,
@@ -1338,70 +1316,67 @@ mod tests {
         acc
     }
 
-    #[test]
-    fn the_forecast_runs_out_before_the_reset_only_on_a_fast_pace() {
-        let now = at("2026-10-20T12:00:00Z");
-        let age = Duration::minutes(15);
-        // 60% two days in: 1.25%/h, so the last 40% lasts 32 h, well before the reset in 5 days.
-        let f = forecast(&live(60.0, 48, now), None, age, now).unwrap();
-        assert_eq!(f, now + Duration::hours(32));
-        // 30% four days in is on pace to finish under 100%: no forecast.
-        assert!(forecast(&live(30.0, 96, now), None, age, now).is_none());
-        // The first hours of a week, an empty week and a spent one say nothing.
-        assert!(forecast(&live(20.0, 3, now), None, age, now).is_none());
-        assert!(forecast(&live(0.0, 48, now), None, age, now).is_none());
-        assert!(forecast(&live(100.0, 48, now), None, age, now).is_none());
-        // Session windows are not the week.
-        let mut session = live(60.0, 48, now);
-        session.windows[0].kind = "session".into();
-        assert!(forecast(&session, None, age, now).is_none());
+    /// The one forecast (`headroom::runs_out_at`), with no recent readings unless given.
+    fn forecast(acc: &AccountUsage, recent: Option<&crate::headroom::Recent>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        crate::headroom::runs_out_at(acc, &Settings::default(), recent.unwrap_or(&Default::default()), now)
     }
 
     #[test]
-    fn recent_readings_blend_a_burst_into_the_rate() {
+    fn the_forecast_runs_out_before_the_reset_only_on_a_fast_pace() {
+        let now = at("2026-10-20T12:00:00Z");
+        // 60% two days in: 1.25%/h, so the last 40% lasts 32 h, well before the reset in 5 days.
+        let f = forecast(&live(60.0, 48, now), None, now).unwrap();
+        assert_eq!(f, now + Duration::hours(32));
+        // 30% four days in is on pace to finish under 100%: no forecast.
+        assert!(forecast(&live(30.0, 96, now), None, now).is_none());
+        // The first hours of a week, an empty week and a spent one say nothing.
+        assert!(forecast(&live(20.0, 3, now), None, now).is_none());
+        assert!(forecast(&live(0.0, 48, now), None, now).is_none());
+        assert!(forecast(&live(100.0, 48, now), None, now).is_none());
+        // Session windows are not the week.
+        let mut session = live(60.0, 48, now);
+        session.windows[0].kind = "session".into();
+        assert!(forecast(&session, None, now).is_none());
+    }
+
+    #[test]
+    fn recent_readings_override_the_week_average_in_a_burst() {
         let start = at("2026-10-20T08:00:00Z");
         let resets = start + Duration::hours(4 * 24 + 2);
-        let mut h = AccountHistory::default();
+        let mut recent = crate::headroom::Recent::default();
         // Three days in at 30%, then 10 points in the last two hours: 5%/h now against 0.56%/h overall.
         for (minutes, used) in [(0, 30.0), (60, 35.0), (120, 40.0)] {
-            observe(&mut h, &reading("weekly", used, resets), start + Duration::minutes(minutes));
+            let mut acc = reading("weekly", used, resets);
+            acc.fetched_at = Some(start + Duration::minutes(minutes));
+            recent.record(&[acc], start + Duration::minutes(minutes));
         }
         let now = start + Duration::hours(2);
         let mut acc = reading("weekly", 40.0, resets);
         acc.fetched_at = Some(now);
-        assert!(forecast(&acc, None, Duration::minutes(15), now).is_none(), "the weekly average alone finishes in time");
-        let f = forecast(&acc, Some(&h), Duration::minutes(15), now).unwrap();
-        // 40% over 72 h is 0.556%/h; (0.556 + 5) / 2 = 2.78%/h: 60 points in about 21.6 hours.
-        assert!((f - now - Duration::minutes(1296)).num_minutes().abs() <= 1, "{f}");
-        // A new week drops the old window's readings.
-        let next = resets + Duration::hours(1);
-        observe(&mut h, &reading("weekly", 1.0, next + Duration::days(7) - Duration::hours(1)), next);
-        assert_eq!(h.recent.len(), 1);
+        assert!(forecast(&acc, None, now).is_none(), "the weekly average alone finishes in time");
+        // The recent pace wins outright: 60 points at 5%/h is 12 hours.
+        let f = forecast(&acc, Some(&recent), now).unwrap();
+        assert_eq!(f, now + Duration::hours(12));
     }
 
     #[test]
     fn stale_failed_and_old_readings_never_forecast() {
         let now = at("2026-10-20T12:00:00Z");
-        let age = Duration::minutes(15);
         let mut stale = live(60.0, 48, now);
         stale.stale = true;
         stale.runs_out_at = Some(now + Duration::hours(3));
-        assert!(forecast(&stale, None, age, now).is_none());
+        assert!(forecast(&stale, None, now).is_none());
         assert!(this_week(&stale, now).unwrap().runs_out_at.is_none(), "a stale reading shows no stored forecast either");
         let mut failed = live(60.0, 48, now);
         failed.error = Some("http_500".into());
-        assert!(forecast(&failed, None, age, now).is_none());
+        assert!(forecast(&failed, None, now).is_none());
         let mut old = live(60.0, 48, now - Duration::hours(1));
-        assert!(forecast(&old, None, age, now).is_none(), "read an hour ago");
+        assert!(forecast(&old, None, now).is_none(), "read an hour ago");
         old.fetched_at = None;
-        assert!(forecast(&old, None, age, now).is_none(), "never read");
-        // Stale readings are not remembered for the short-term rate either.
-        let mut h = AccountHistory::default();
-        observe(&mut h, &stale, now);
-        assert!(h.recent.is_empty());
+        assert!(forecast(&old, None, now).is_none(), "never read");
         // The forecast reaches get_usage and the report.
         let mut snapshot = Snapshot { accounts: vec![live(60.0, 48, now)], updated_at: Some(now) };
-        attach_forecasts(&mut snapshot, &History::default(), age, now);
+        crate::headroom::attach_forecasts(&mut snapshot, &Settings::default(), &Default::default(), now);
         assert_eq!(snapshot.accounts[0].runs_out_at, Some(now + Duration::hours(32)));
         let r = report(&snapshot, &History::default(), &Settings::default(), None, now);
         assert_eq!(r.accounts[0].this_week.as_ref().unwrap().runs_out_at, Some(now + Duration::hours(32)));

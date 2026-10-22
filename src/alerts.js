@@ -2,7 +2,7 @@
 // switches, and use none of the user's computers accounts for. Runs in the taskbar widget, which is always alive; what was already said is
 // remembered across restarts so nothing is repeated, and the first look at an account only
 // records where it stands.
-import { t, resetsIn, windowLabel, resetText, groupResets, duration, dayTime } from "./i18n.js";
+import { t, resetsIn, windowLabel, resetText, groupResets, duration, dayTime, shortDate } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
 
@@ -77,7 +77,8 @@ const until = (iso) => duration(Math.max(1, Math.round((new Date(iso) - Date.now
 const money = (v) => `$${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 
 /**
- * Plan renewals and the account in use running out of its week. The app decides what is due and
+ * Plan renewals, the account in use running out of its week, and Codex Pro 200 accounts whose use
+ * would not fit the plan's smaller allowance after its cut. The app decides what is due and
  * remembers what was shown (it honours the notification settings); this only words it. Clicking
  * one opens Settings > Subscriptions.
  */
@@ -88,6 +89,11 @@ export async function checkPlans() {
     const provider = PROVIDER_NAME[a.provider];
     if (a.kind === "runs_out") {
       notify(t("nRunsOutTitle", { provider, at: dayTime(a.at) }), t("nRunsOutBody", { account: accountName(a), t: until(a.resets_at) }), "subscriptions");
+      continue;
+    }
+    if (a.kind === "pro_allowance_cut") {
+      // The last day of the old allowance, at local noon so no time zone moves it.
+      notify(t("nProCutTitle", { d: shortDate(`${a.at.slice(0, 10)}T12:00:00`) }), t("nProCutBody", { accounts: (a.accounts ?? []).join(", ") }), "subscriptions");
       continue;
     }
     const body = [accountName(a), a.kind === "renewal_wasteful" && a.verdict ? t(`subVerdict_${a.verdict}`) : "",
