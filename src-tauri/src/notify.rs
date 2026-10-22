@@ -68,20 +68,21 @@ fn clickable(app: AppHandle, title: &str, body: &str, page: String) -> Result<()
 
 /// Toasts are attributed to an app user model id (the plugin uses the bundle identifier). The
 /// installer's Start menu shortcut declares it; registering it here too gives toasts SlopBar's
-/// name and icon whatever way the app was started.
+/// name and icon whatever way the app was started. Returns whether every value was written.
 #[cfg(windows)]
-pub fn register_app_id(identifier: &str) {
+pub fn register_app_id(identifier: &str) -> bool {
     use windows_sys::Win32::System::Registry::{RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ};
-    let Some(dir) = crate::settings::app_dir() else { return };
+    let Some(dir) = crate::settings::app_dir() else { return false };
     let icon = dir.join("icon.png");
     if std::fs::create_dir_all(&dir).is_err() || std::fs::write(&icon, include_bytes!("../icons/128x128@2x.png")).is_err() {
-        return;
+        return false;
     }
     let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
     let key = wide(&format!(r"Software\Classes\AppUserModelId\{identifier}"));
+    let mut ok = true;
     for (name, value) in [("DisplayName", "SlopBar".to_string()), ("IconUri", icon.display().to_string())] {
         let data = wide(&value);
-        unsafe {
+        let status = unsafe {
             RegSetKeyValueW(
                 HKEY_CURRENT_USER,
                 key.as_ptr(),
@@ -89,7 +90,30 @@ pub fn register_app_id(identifier: &str) {
                 REG_SZ,
                 data.as_ptr() as *const _,
                 (data.len() * 2) as u32,
-            );
-        }
+            )
+        };
+        ok &= status == 0;
     }
+    ok
+}
+
+/// Whether Windows lets SlopBar show toasts, and whether it lets any app: the switches in Windows
+/// Settings > System > Notifications. `None` when Windows never stored a choice (the default is on).
+#[cfg(windows)]
+pub fn toast_switches(identifier: &str) -> (Option<bool>, Option<bool>) {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let read = |key: &str, value: &str| -> Option<bool> {
+        let (key, value) = (wide(key), wide(value));
+        let mut data: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        // SAFETY: the buffers outlive the call and `size` matches `data`.
+        let status = unsafe {
+            RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr(), RRF_RT_REG_DWORD, std::ptr::null_mut(), &mut data as *mut u32 as *mut _, &mut size)
+        };
+        (status == 0).then_some(data != 0)
+    };
+    let app = read(&format!(r"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\{identifier}"), "Enabled");
+    let system = read(r"Software\Microsoft\Windows\CurrentVersion\PushNotifications", "ToastEnabled");
+    (app, system)
 }

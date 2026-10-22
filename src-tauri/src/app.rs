@@ -1,4 +1,4 @@
-use crate::{accounts, balancer, codex_local, diagnostics, dock, door, headroom, inspect, migrate, model, monitoring, notify, panel, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates};
+use crate::{accounts, balancer, codex_local, diagnostics, dock, door, headroom, health, inspect, migrate, model, monitoring, notify, panel, plan_alerts, presence, providers, settings, sources, subscriptions, unexpected, updates};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -51,6 +51,70 @@ pub struct AppState {
     unexpected_log: Mutex<unexpected::Log>,
     /// Plan notifications already shown (renewals, running out), so each is shown once.
     plan_alerts: Mutex<plan_alerts::Sent>,
+    /// What refreshes and startup learned for Settings > Health.
+    health: Mutex<HealthSeen>,
+}
+
+/// Outcomes `health::checks` needs that nothing else keeps.
+#[derive(Clone, Default)]
+struct HealthSeen {
+    last_success: Option<chrono::DateTime<chrono::Utc>>,
+    sharing: Option<health::SharingResult>,
+    notifications_registered: Option<bool>,
+}
+
+/// Settings > Health and the agents' `get_health`: computed from state the app already has.
+async fn health_report(app: &AppHandle) -> health::Report {
+    let state = app.state::<AppState>();
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    let settings = state.settings.lock().unwrap().clone();
+    let seen = state.health.lock().unwrap().clone();
+    let connected: Vec<_> = snapshot.accounts.iter().filter(|a| a.monitor_connected).map(|a| (a.provider, a.id.clone())).collect();
+    let monitoring = state.monitor.health(&connected).await;
+    let rclone_installed = settings.presence_remote.is_some()
+        && tauri::async_runtime::spawn_blocking(crate::rclone::find).await.ok().flatten().is_some();
+    #[cfg(windows)]
+    let (app_enabled, system_enabled) = notify::toast_switches(&app.config().identifier);
+    #[cfg(not(windows))]
+    let (app_enabled, system_enabled) = (None, None);
+    let n = &settings.notifications;
+    let sharing = health::Sharing { folder: settings.presence_folder.clone(), remote: settings.presence_remote.clone(), rclone_installed, last: seen.sharing };
+    health::checks(&health::Inputs {
+        accounts: &snapshot.accounts,
+        monitoring: &monitoring,
+        refresh_minutes: settings.refresh_minutes,
+        last_success: seen.last_success,
+        door: door::health(),
+        sharing: &sharing,
+        journal: state.diagnostics.health(),
+        notifications: health::Notifications { registered: seen.notifications_registered, app_enabled, system_enabled,
+            any_wanted: n.usage || n.resets || n.switches || n.renewals || n.unexpected_use },
+    }, chrono::Utc::now())
+}
+
+#[tauri::command]
+async fn get_health(app: AppHandle) -> health::Report {
+    health_report(&app).await
+}
+
+/// Quits, then starts the installed executable again (the door's `restart_app`, Health's fix).
+fn restart(app: &AppHandle) -> Result<(), String> {
+    // The installed executable, even if this one was renamed aside for an update.
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?
+        .with_file_name(if cfg!(windows) { "slopbar.exe" } else { "slopbar" });
+    std::process::Command::new(&exe).arg("--after").arg(std::process::id().to_string())
+        .spawn().map_err(|e| format!("restart failed: {e}"))?;
+    let h = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        h.exit(0);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn restart_app(app: AppHandle) -> Result<(), String> {
+    restart(&app)
 }
 
 #[tauri::command]
@@ -229,6 +293,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             let target = match window { door::InspectTarget::Settings => inspect::Target::Settings, door::InspectTarget::Flyout => inspect::Target::Flyout };
             value(inspect::inspect(&app, target, page, screenshot).await?)
         }
+        R::GetHealth => value(health_report(&app).await),
         R::ListSharingLocations => {
             let (folder, remote) = {
                 let s = app.state::<AppState>().settings.lock().unwrap().clone();
@@ -251,19 +316,16 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         }
         R::QuitApp | R::RestartApp => {
             let restart = matches!(request, R::RestartApp);
-            if restart {
-                // The installed executable, even if this one was renamed aside for an update.
-                let exe = std::env::current_exe().map_err(|e| e.to_string())?
-                    .with_file_name(if cfg!(windows) { "slopbar.exe" } else { "slopbar" });
-                std::process::Command::new(&exe).arg("--after").arg(std::process::id().to_string())
-                    .spawn().map_err(|e| format!("restart failed: {e}"))?;
-            }
             // Reply first, then exit exactly as the tray's Quit does (journal flushed on Exit).
-            let h = app.clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                h.exit(0);
-            });
+            if restart {
+                self::restart(&app)?;
+            } else {
+                let h = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    h.exit(0);
+                });
+            }
             Ok(serde_json::json!({ "quitting": true, "restarting": restart }))
         }
     }
@@ -515,12 +577,14 @@ async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String>
 /// Saves and applies settings; callers hold `settings_lock`.
 async fn store_settings(app: &AppHandle, settings: Settings) -> Result<(), String> {
     settings::save(&settings)?;
+    diagnostics::set_crash_records(settings.crash_records);
     let previous = std::mem::replace(&mut *app.state::<AppState>().settings.lock().unwrap(), settings.clone());
     apply_settings(app);
     let providers_changed = previous.providers.claude != settings.providers.claude
         || previous.providers.codex != settings.providers.codex;
     let presence_changed = previous.presence_folder != settings.presence_folder || previous.presence_remote != settings.presence_remote;
     if presence_changed {
+        app.state::<AppState>().health.lock().unwrap().sharing = None;
         // The old folder's other machines should not keep seeing this one as signed in.
         if let Some(old) = presence::store(&previous) {
             let interval = settings.refresh_minutes.max(1) as u64 * 60;
@@ -533,8 +597,12 @@ async fn store_settings(app: &AppHandle, settings: Settings) -> Result<(), Strin
     Ok(())
 }
 
+/// Shows Settings, on `page` when given (the flyout's health badge opens Health).
 #[tauri::command]
-fn open_settings(app: AppHandle) {
+fn open_settings(app: AppHandle, page: Option<String>) {
+    if let Some(page) = page.filter(|p| door::SETTINGS_PAGES.contains(&p.as_str())) {
+        let _ = app.emit_to(SETTINGS_LABEL, "show-page", &page);
+    }
     show_settings(&app);
 }
 
@@ -691,13 +759,17 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     let interval = settings.refresh_minutes.max(1) as u64 * 60;
     // Whether every computer is covered: sharing is on and someone (this one or a peer) published.
     let mut covered = false;
+    let mut shared = None;
     if let Some(store) = presence::store(&settings) {
         let mine = list.clone();
-        let (peers, wrote) = tauri::async_runtime::spawn_blocking(move || {
-            let Some((id, name)) = presence::identity() else { return (vec![], false) };
+        let (peers, wrote, read) = tauri::async_runtime::spawn_blocking(move || {
+            let Some((id, name)) = presence::identity() else { return (vec![], false, false) };
             let wrote = store.write(&presence::own(id, name, interval, &mine, now)).is_ok();
-            (presence::read(store.as_ref(), id, now), wrote)
+            let listed = store.list();
+            let read = listed.is_ok();
+            (presence::peers(listed.unwrap_or_default(), id, now), wrote, read)
         }).await.unwrap_or_default();
+        shared = Some(health::SharingResult { at: now, wrote, read });
         covered = wrote || peers.iter().any(|p| p.live);
         presence::attach(&mut list, &peers, now);
     }
@@ -734,6 +806,13 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     if subscriptions::save(&history).is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::HistorySave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
     state.diagnostics.record(None, None, diagnostics::Event::PollFinished { elapsed_ms: diagnostics::millis(started), accounts: snapshot.accounts.len(),
         native_sources: found.iter().filter(|s| s.distro.is_none()).count(), wsl_sources: found.iter().filter(|s| s.distro.is_some()).count() });
+    {
+        let mut seen = state.health.lock().unwrap();
+        seen.sharing = shared;
+        if snapshot.accounts.is_empty() || snapshot.accounts.iter().any(|a| !a.stale) {
+            seen.last_success = snapshot.updated_at;
+        }
+    }
     *state.snapshot.lock().unwrap() = snapshot.clone();
     let _ = app.emit("usage-updated", &snapshot);
     if settings.providers.codex { scan_codex_local(app); }
@@ -775,10 +854,14 @@ async fn refresh_loop(app: AppHandle) {
 pub fn run() {
     migrate::run();
     let diagnostics = std::sync::Arc::new(diagnostics::Recorder::new(settings::app_dir().expect("config directory").join("diagnostics/history.bin")));
+    let loaded = settings::load();
+    // Off unless the user turned crash records on; nothing is recorded before the journal starts.
+    diagnostics::set_crash_records(loaded.crash_records);
+    diagnostics::install_crash_hook(diagnostics.clone());
     // Managed before the builder runs: config windows load (and call commands) before `setup`.
     let state = AppState {
         snapshot: Mutex::default(),
-        settings: Mutex::new(settings::load()),
+        settings: Mutex::new(loaded),
         menu: Mutex::default(),
         menu_items: Mutex::default(),
         panel_anchor: Mutex::default(),
@@ -799,6 +882,7 @@ pub fn run() {
         presence_tracks: Mutex::default(),
         unexpected_log: Mutex::new(unexpected::load()),
         plan_alerts: Mutex::new(plan_alerts::load()),
+        health: Mutex::default(),
     };
     tauri::Builder::default()
         // Must come first: a second launch hands over to the running instance and exits.
@@ -812,6 +896,8 @@ pub fn run() {
         ))
         .invoke_handler(tauri::generate_handler![
             get_usage,
+            get_health,
+            restart_app,
             get_subscriptions,
             take_plan_alerts,
             open_billing_page,
@@ -849,7 +935,10 @@ pub fn run() {
             app.state::<AppState>().diagnostics.start();
             let handle = app.handle();
             #[cfg(windows)]
-            notify::register_app_id(&app.config().identifier);
+            {
+                let registered = notify::register_app_id(&app.config().identifier);
+                app.state::<AppState>().health.lock().unwrap().notifications_registered = Some(registered);
+            }
 
             let defaults = ["Refresh", "Settings…", "Quit"];
             let items = MENU_IDS

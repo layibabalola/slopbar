@@ -75,6 +75,8 @@ pub enum Request {
         #[serde(default = "yes")]
         screenshot: bool,
     },
+    /// The self-check Settings > Health shows (see `health`).
+    GetHealth,
     /// Where in-use status can be shared: detected sync folders and rclone remotes.
     ListSharingLocations,
     /// Open the provider's billing page in the user's browser (fixed URL per provider).
@@ -85,8 +87,29 @@ pub enum Request {
     RestartApp,
 }
 
+/// How the door is doing, for Settings > Health: 0 starting, 1 listening, 2 retrying.
+static STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+pub fn health() -> crate::health::Door {
+    use crate::health::Door;
+    if !cfg!(windows) {
+        return Door::Unsupported;
+    }
+    match STATE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Door::Listening,
+        2 => Door::Retrying,
+        _ => Door::Starting,
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn set_state(state: u8) {
+    STATE.store(state, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Settings pages `InspectWindow` can show (its sidebar's `data-page` values).
-pub const SETTINGS_PAGES: [&str; 5] = ["accounts", "subscriptions", "notifications", "data", "general"];
+pub const SETTINGS_PAGES: [&str; 6] = ["accounts", "subscriptions", "notifications", "data", "general", "health"];
 
 /// A window `InspectWindow` can look at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -334,6 +357,7 @@ mod imp {
         let reuse = Arc::new(Reuse::default());
         loop {
             if let Err(e) = listen(&name, handle.clone(), reuse.clone()).await {
+                set_state(2);
                 eprintln!("door closed, retrying: {e}");
             }
             tokio::time::sleep(RETRY).await;
@@ -349,6 +373,7 @@ mod imp {
         // Exports are serialized so a burst reuses the first one.
         let exporting = Arc::new(tokio::sync::Mutex::new(()));
         let mut server = create(name, true)?;
+        set_state(1);
         loop {
             let slot = slots.clone().acquire_owned().await.expect("never closed");
             server.connect().await?;
