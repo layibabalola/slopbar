@@ -47,12 +47,19 @@ pub fn line(pipe: &str, cache: Option<&Path>, limit: Duration, now: DateTime<Utc
     let line = crate::door::call_within(pipe, &request, limit).ok().and_then(|v| format(&v, &chrono::Local, now));
     if let Some(path) = cache {
         // A failure is remembered too, so a stuck app costs the deadline once per `FRESH`.
-        let entry = Cached { at: now, line: line.clone().unwrap_or_default() };
-        if let Ok(bytes) = serde_json::to_vec(&entry) {
-            let _ = crate::private_store::write(path, &bytes);
-        }
+        remember(path, &Cached { at: now, line: line.clone().unwrap_or_default() });
     }
     line
+}
+
+/// Saves the answer without flushing it to disk: a lost cache only means one more door call, while
+/// a flush can take a second on a busy disk, far longer than the status line may.
+fn remember(path: &Path, entry: &Cached) {
+    let Ok(bytes) = serde_json::to_vec(entry) else { return };
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    if std::fs::write(&temp, bytes).is_err() || std::fs::rename(&temp, path).is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
 }
 
 /// "name · 12% 5h · 42% wk · runs out Thu 3PM" from a `GetHeadroom` reply, with times in `tz`.
