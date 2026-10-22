@@ -137,7 +137,9 @@ fn wsl_check(s: &crate::sources::WslStatus) -> Option<Check> {
     use crate::sources::{WslPlan, WslScan};
     let data = Some(Fix::OpenSettings { page: "data" });
     s.checked_at?;
-    if s.timed_out || s.backing_off {
+    // Backing off after a single slow listing is not a warning: `timed_out` is set only once
+    // listings keep missing (see `sources::listing_stuck`) or a distro did not answer.
+    if s.timed_out {
         let slow: Vec<&str> = s.distros.iter().filter(|d| d.timed_out).map(|d| d.name.as_str()).collect();
         let what = if slow.is_empty() { "WSL did not answer in time".to_string() } else { format!("WSL ({}) did not answer in time", slow.join(", ")) };
         return Some(check("wsl", Status::Warning, "WSL",
@@ -741,6 +743,10 @@ mod tests {
         let k = find(&r, "wsl");
         assert_eq!((k.status, k.fix.clone()), (Status::Warning, Some(Fix::OpenSettings { page: "data" })));
         assert!(k.reason.contains("wsl --shutdown"));
+        // Waiting out one slow listing (the service waking up) keeps the last good picture.
+        c.wsl.timed_out = false;
+        c.wsl.backing_off = true;
+        assert_eq!(find(&c.run(), "wsl").status, Status::Ok);
         c.wsl = WslStatus { mode: WslScan::Off, checked_at: Some(now()), installed: true, ..Default::default() };
         assert!(find(&c.run(), "wsl").reason.contains("Off"));
     }

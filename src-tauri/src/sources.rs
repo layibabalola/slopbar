@@ -117,8 +117,12 @@ pub fn wsl_plan(mode: WslScan, running: bool, known: bool, wake_due: bool, resca
     }
 }
 
-/// Listing distros asks the WSL service only; it answers at once unless WSL is wedged.
-const LIST_TIMEOUT: Duration = Duration::from_secs(4);
+/// Listing distros asks the WSL service only and never starts a distro. It usually answers in
+/// well under a second, but a WSL service that went idle can take several seconds to come back.
+const LIST_TIMEOUT: Duration = Duration::from_secs(12);
+/// Listings in a row that must miss their deadline before Health calls WSL stuck: one slow
+/// listing is a service waking up, not a wedged WSL.
+const MISSES_BEFORE_WARNING: u32 = 2;
 /// Reading a running distro's home directory.
 const READ_TIMEOUT: Duration = Duration::from_secs(6);
 /// Starting a stopped distro and reading its home directory.
@@ -161,6 +165,8 @@ struct WslState {
     mode: WslScan,
     rescan: bool,
     backoff_until: Option<Instant>,
+    /// Listings in a row that did not answer in time.
+    listing_misses: u32,
     woken: BTreeMap<String, Instant>,
     status: WslStatus,
 }
@@ -169,6 +175,7 @@ static WSL: Mutex<WslState> = Mutex::new(WslState {
     mode: WslScan::Auto,
     rescan: false,
     backoff_until: None,
+    listing_misses: 0,
     woken: BTreeMap::new(),
     status: WslStatus { mode: WslScan::Auto, checked_at: None, installed: false, timed_out: false, backing_off: false, distros: Vec::new() },
 });
@@ -193,6 +200,11 @@ pub fn request_wsl_rescan() {
 /// How the last discovery went with WSL (Settings > Health).
 pub fn wsl_status() -> WslStatus {
     wsl_state().status.clone()
+}
+
+/// Whether `misses` listings in a row without an answer mean WSL is stuck.
+pub fn listing_stuck(misses: u32) -> bool {
+    misses >= MISSES_BEFORE_WARNING
 }
 
 /// Runs a command, giving up (and ending it) after `limit`. None when it could not start or did
@@ -272,9 +284,16 @@ fn wsl_sources() -> Vec<Source> {
         (s.mode, rescan, s.backoff_until.is_some_and(|t| Instant::now() < t), s.woken.clone())
     };
     let mut status = WslStatus { mode, checked_at: Some(Utc::now()), backing_off: backoff, ..Default::default() };
-    let finish = |status: WslStatus, timed_out_now: bool| {
+    let finish = |status: WslStatus| wsl_state().status = status;
+    // A listing that missed its deadline: back off, and call WSL stuck only once it keeps missing.
+    let listing_missed = |mut status: WslStatus| {
         let mut s = wsl_state();
-        if timed_out_now { s.backoff_until = Some(Instant::now() + BACKOFF); }
+        s.backoff_until = Some(Instant::now() + BACKOFF);
+        s.listing_misses += 1;
+        let previous = std::mem::take(&mut s.status);
+        status.timed_out = listing_stuck(s.listing_misses);
+        status.installed = previous.installed;
+        status.distros = previous.distros;
         s.status = status;
     };
     if mode == WslScan::Off || backoff {
@@ -282,16 +301,16 @@ fn wsl_sources() -> Vec<Source> {
         let previous = wsl_status();
         status.installed = previous.installed;
         status.timed_out = backoff && previous.timed_out;
-        finish(status, false);
+        if backoff { status.distros = previous.distros; }
+        finish(status);
         return vec![];
     }
     let Some(all) = wsl(&["--list", "--quiet"], LIST_TIMEOUT) else {
-        status.timed_out = true;
-        finish(status, true);
+        listing_missed(status);
         return vec![];
     };
     if !all.status.success() {
-        finish(status, false);
+        finish(status);
         return vec![];
     }
     let distros = parse_distros(&decode_wsl_output(&all.stdout));
@@ -301,11 +320,11 @@ fn wsl_sources() -> Vec<Source> {
         Some(o) if o.status.success() => parse_distros(&decode_wsl_output(&o.stdout)),
         Some(_) => vec![],
         None => {
-            status.timed_out = true;
-            finish(status, true);
+            listing_missed(status);
             return vec![];
         }
     };
+    wsl_state().listing_misses = 0;
     let known_before = load_known();
     let mut known = known_before.clone();
     let mut found = vec![];
@@ -334,7 +353,7 @@ fn wsl_sources() -> Vec<Source> {
     if known != known_before { save_known(known); }
     // A distro that did not answer is not a wedged WSL: only the listing backs off.
     status.timed_out = timed_out;
-    finish(status, false);
+    finish(status);
     found
 }
 
@@ -384,6 +403,14 @@ mod tests {
                 assert_eq!(wsl_plan(WslScan::Off, running, known, true, true), WslPlan::Skip);
             }
         }
+    }
+
+    #[test]
+    fn one_slow_listing_is_not_a_stuck_wsl() {
+        assert!(!listing_stuck(0));
+        assert!(!listing_stuck(1));
+        assert!(listing_stuck(2));
+        assert!(LIST_TIMEOUT >= Duration::from_secs(10), "an idle WSL service can take seconds to answer");
     }
 
     #[test]
