@@ -4,6 +4,10 @@ const MESSAGES = {
   en: {
     sDiagnostics: "Diagnostics",
     crashRecords: "Record crashes",
+    autoMonitoring: "Connect monitoring automatically",
+    autoMonitoringHint: "When an account without monitoring has been in use for 3 minutes, SlopBar opens its monitoring sign-in so it stays current after you switch away. One approval in your browser; your active account stays the same.",
+    monitorAutoTitle: "Finish connecting monitoring for {name}",
+    monitorAutoBody: "Approve the sign-in in your browser so SlopBar can keep reading this account after you switch away. Your active account stays the same.",
     crashRecordsHint: "Off by default. Keeps where in SlopBar's code a crash happened (file and line, never its message) in the local history above, so exports include it. Nothing is sent anywhere.",
     sHealth: "Health",
     descHealth: "SlopBar checks its own sign-ins, readings, sharing and services. Each problem comes with the fix.",

@@ -40,6 +40,11 @@ impl Operations {
             operations: self.0.clone(),
         })
     }
+
+    /// Whether an operation holds the account, by `key`.
+    pub fn busy(&self, key: &str) -> bool {
+        self.0.lock().unwrap().contains(key)
+    }
 }
 impl Drop for Operation {
     fn drop(&mut self) {

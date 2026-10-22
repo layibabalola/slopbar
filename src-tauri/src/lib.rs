@@ -17,6 +17,7 @@ mod presence;
 mod rclone;
 mod unexpected;
 mod health;
+mod auto_monitor;
 pub use diagnostics::write_build_info;
 mod door;
 pub use door::wait_for_exit;

@@ -253,6 +253,10 @@ $refresh.addEventListener("click", async () => {
   try { render(await invoke("refresh")); } finally { $refresh.classList.remove("spin"); }
 });
 
+// An automatic monitoring sign-in started (see auto_monitor.rs): the user finishes it in the browser.
+listen("monitoring-auto-started", ({ payload }) => invoke("notify", {
+  title: t("monitorAutoTitle", { name: payload.name ?? t("unknownAccount") }), body: t("monitorAutoBody"), page: null,
+}).catch(() => {}));
 listen("monitoring-login", ({ payload }) => showToast(payload.error ? errorText("", payload.error) : t("monitorConnected")));
 listen("usage-updated", (e) => render(e.payload));
 invoke("get_usage").then(render);

@@ -508,6 +508,7 @@ async function render() {
   $("auto-update").disabled = !updatesEnabled;
   for (const kind of NOTIFY_KINDS) $(`notify-${kind}`).checked = settings.notifications[kind];
   $("crash-records").checked = settings.crash_records;
+  $("auto-monitoring").checked = settings.auto_connect_monitoring;
   renderPresence();
   const version = await invoke("app_version");
   $("version").textContent = /^\d/.test(version) ? `v${version}` : version;
@@ -543,6 +544,7 @@ $("export-diagnostics").addEventListener("click", async () => {
   finally { button.disabled = false; }
 });
 $("crash-records").addEventListener("change", (e) => update({ crash_records: e.target.checked }));
+$("auto-monitoring").addEventListener("change", (e) => update({ auto_connect_monitoring: e.target.checked }));
 
 // ---------------------------------------------------------------------------------------------
 // Health: the backend's self-check (health.rs) with each check's fix wired to the matching action.

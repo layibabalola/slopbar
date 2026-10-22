@@ -119,6 +119,8 @@ pub struct Inputs<'a> {
     pub sharing: &'a Sharing,
     pub journal: Journal,
     pub notifications: Notifications,
+    /// Settings: Connect monitoring automatically.
+    pub auto_connect: bool,
 }
 
 fn name(a: &AccountUsage) -> String {
@@ -163,8 +165,13 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         let who = name(a);
         let connect = Some(Fix::ConnectMonitoring { provider: a.provider, id: a.id.clone() });
         if !a.monitor_connected {
+            let how = if inputs.auto_connect {
+                "Connect monitoring automatically is on (Settings > Data): SlopBar starts its sign-in once it has been in use for 3 minutes, or connect it now."
+            } else {
+                "Connect monitoring automatically is off (Settings > Data): connect it now, or turn that on to have SlopBar start the sign-in when it is in use."
+            };
             monitoring.push(check(id, Status::Warning, format!("{who}: monitoring not connected"),
-                "Its usage is only read while it is the account in use. Connect monitoring to keep it current.", connect));
+                format!("Its usage is only read while it is the account in use. {how}"), connect));
             continue;
         }
         let state = inputs.monitoring.get(&key).cloned().unwrap_or_default();
@@ -314,6 +321,7 @@ mod tests {
         sharing: Sharing,
         journal: Journal,
         notifications: Notifications,
+        auto_connect: bool,
     }
 
     impl Case {
@@ -326,12 +334,13 @@ mod tests {
                 sharing: Sharing::default(),
                 journal: Journal { started: true, write_attempts: 4, storage_errors: 0, last_write_ok: Some(true), history_unreadable: false },
                 notifications: Notifications { registered: Some(true), app_enabled: None, system_enabled: None, any_wanted: true },
+                auto_connect: true,
             }
         }
 
         fn run(&self) -> Report {
             checks(&Inputs { accounts: &self.accounts, monitoring: &self.monitoring, refresh_minutes: 5, last_success: self.last_success,
-                door: self.door, sharing: &self.sharing, journal: self.journal, notifications: self.notifications }, now())
+                door: self.door, sharing: &self.sharing, journal: self.journal, notifications: self.notifications, auto_connect: self.auto_connect }, now())
         }
     }
 
@@ -361,6 +370,21 @@ mod tests {
         }
         assert!(r.checks.iter().all(|c| c.id != "monitoring"), "the all-ok row is replaced");
         assert_eq!((r.status, r.problems), (Status::Problem, 2));
+    }
+
+    #[test]
+    fn an_unmonitored_account_says_whether_it_connects_automatically() {
+        let mut case = Case::healthy();
+        case.accounts[0].monitor_connected = false;
+        let r = case.run();
+        let c = find(&r, "monitoring:claude:a");
+        assert_eq!(c.status, Status::Warning);
+        assert_eq!(c.fix, Some(Fix::ConnectMonitoring { provider: Provider::Claude, id: "a".into() }));
+        assert!(c.reason.contains("Connect monitoring automatically is on"), "{}", c.reason);
+        case.auto_connect = false;
+        let r = case.run();
+        let c = find(&r, "monitoring:claude:a");
+        assert!(c.reason.contains("Connect monitoring automatically is off"), "{}", c.reason);
     }
 
     #[test]
