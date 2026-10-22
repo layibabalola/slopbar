@@ -48,6 +48,32 @@
       <header><h1 data-i18n="sAccounts"></h1><p data-i18n="descAccounts"></p></header>
       <div id="accounts"></div>
       <p class="hint notice" id="add-hint" hidden data-i18n="addHint"></p>
+
+      <h2 data-i18n="bulkTitle"></h2>
+      <div class="group">
+        <div class="row">
+          <div class="title"><label data-i18n="bulkConnect"></label><small id="bulk-connect-hint"></small></div>
+          <button class="btn" id="bulk-connect" data-i18n="bulkConnectButton"></button>
+        </div>
+        <div class="row">
+          <div class="title"><label data-i18n="bulkRemove"></label><small id="bulk-remove-hint"></small></div>
+          <button class="btn" id="bulk-remove" data-i18n="bulkRemoveButton"></button>
+        </div>
+      </div>
+      <p class="hint notice" id="bulk-status" role="status" hidden></p>
+
+      <h2 data-i18n="pinsTitle"></h2>
+      <p class="hint pins-intro" data-i18n="pinsIntro"></p>
+      <div class="group" id="pins"></div>
+      <div class="group">
+        <div class="row pin-add">
+          <input type="text" id="pin-folder" spellcheck="false" data-i18n-title="pinFolder" />
+          <div class="select"><select id="pin-account"></select></div>
+          <button class="btn" id="pin-save" data-i18n="pinSave"></button>
+        </div>
+      </div>
+      <p class="hint" id="pins-launcher"></p>
+      <p class="hint" id="pins-status" role="status" hidden></p>
     </section>
 
     <!-- Subscriptions -->
@@ -134,6 +160,13 @@
         <div class="row">
           <label for="startup" data-i18n="sStartup"></label>
           <input type="checkbox" class="switch" id="startup" />
+        </div>
+        <div class="row">
+          <div class="title"><label for="hotkey" data-i18n="switcherShortcut"></label><small id="hotkey-hint"></small></div>
+          <div class="presence-path hotkey">
+            <input type="text" id="hotkey" spellcheck="false" />
+            <button class="btn" id="hotkey-save" data-i18n="hotkeySave"></button>
+          </div>
         </div>
       </div>
 

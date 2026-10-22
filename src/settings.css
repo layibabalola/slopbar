@@ -323,3 +323,19 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
 .health-dot { width: 10px; height: 10px; flex: none; border-radius: 50%; background: var(--ok); }
 .health-dot.warning { background: var(--warn); }
 .health-dot.problem { background: var(--bad); }
+
+/* Bulk actions, project pins and the switcher's shortcut (Accounts and General pages). */
+.row .title small.problem { color: var(--bad); }
+.row.pin { gap: 8px; }
+.row.pin .title { flex: 1; min-width: 0; }
+.row.pin .title label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row.pin .btn { flex: none; }
+.pin-add { gap: 8px; }
+.pin-add input {
+  flex: 1; min-width: 0; height: 32px; padding: 0 10px; font: inherit; color: var(--text);
+  background: var(--control); border: 1px solid var(--control-stroke); border-bottom-color: var(--control-stroke-bottom); border-radius: 4px;
+}
+.pin-add input:focus { outline: none; border-bottom: 2px solid var(--accent); }
+.pin-add .select { flex: none; max-width: 45%; }
+.pins-intro { margin: 0 1px 8px; }
+.presence-path.hotkey { flex: none; width: 280px; }

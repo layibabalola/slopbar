@@ -231,6 +231,7 @@ theme();
 setInterval(theme, 10_000);
 
 document.getElementById("open-settings").addEventListener("click", () => invoke("open_settings"));
+document.getElementById("open-switcher").addEventListener("click", () => invoke("open_switcher"));
 
 function applySettings(settings) {
   notifications = settings.notifications;

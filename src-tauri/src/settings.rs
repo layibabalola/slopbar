@@ -126,7 +126,22 @@ pub struct Settings {
     /// Keep a redacted record of crashes (where in SlopBar's code, never the message) in the local
     /// diagnostics journal, so exports include them. Off unless the user turns it on.
     pub crash_records: bool,
+    /// Folders whose CLI uses a given account instead of the default login (see `pins`).
+    /// Changed through their own commands, which check the folder and the account.
+    pub project_pins: Vec<ProjectPin>,
+    /// The system-wide shortcut that opens the quick switcher, e.g. "Ctrl+Alt+S"; empty is off.
+    pub switcher_hotkey: String,
 }
+
+/// One folder pinned to one account of a provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectPin {
+    pub folder: String,
+    pub provider: Provider,
+    pub id: String,
+}
+
+pub const DEFAULT_SWITCHER_HOTKEY: &str = "Ctrl+Alt+S";
 
 impl Default for Settings {
     fn default() -> Self {
@@ -146,6 +161,8 @@ impl Default for Settings {
             web_use: HashMap::new(),
             unexpected_min_rise: 2,
             crash_records: false,
+            project_pins: Vec::new(),
+            switcher_hotkey: DEFAULT_SWITCHER_HOTKEY.into(),
         }
     }
 }
@@ -186,7 +203,52 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 /// The interface languages (see `LANGUAGES` in i18n.js).
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
-const PATCHABLE: [&str; 14] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records"];
+/// `project_pins` has its own operations (see `pins`).
+const PATCHABLE: [&str; 15] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "switcher_hotkey"];
+
+/// Modifier names a shortcut may use, as the Settings window writes them.
+const HOTKEY_MODIFIERS: [&str; 4] = ["Ctrl", "Alt", "Shift", "Win"];
+
+/// A shortcut's canonical form ("Ctrl+Alt+S"): one or more modifiers, at least one of them Ctrl,
+/// Alt or Win so typing never triggers it, then one key (a letter, digit, F1–F24 or Space).
+/// Empty means off.
+pub fn normalize_hotkey(text: &str) -> Result<String, String> {
+    let parts: Vec<&str> = text.split('+').map(str::trim).collect();
+    if text.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let refuse = || format!("switcher_hotkey must be modifiers ({}) and one key, like \"{DEFAULT_SWITCHER_HOTKEY}\", or empty for off (got {text:?})", HOTKEY_MODIFIERS.join(", "));
+    let (key, modifiers) = parts.split_last().ok_or_else(refuse)?;
+    let mut held = Vec::new();
+    for m in modifiers {
+        let name = match m.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => "Ctrl",
+            "alt" => "Alt",
+            "shift" => "Shift",
+            "win" | "super" | "meta" => "Win",
+            _ => return Err(refuse()),
+        };
+        if held.contains(&name) {
+            return Err(refuse());
+        }
+        held.push(name);
+    }
+    if !held.iter().any(|m| *m != "Shift") {
+        return Err(refuse());
+    }
+    let key = key.to_ascii_uppercase();
+    let valid = match key.as_str() {
+        "SPACE" => true,
+        k if k.len() == 1 => k.chars().all(|c| c.is_ascii_alphanumeric()),
+        k => k.strip_prefix('F').and_then(|n| n.parse::<u8>().ok()).is_some_and(|n| (1..=24).contains(&n)),
+    };
+    if !valid {
+        return Err(refuse());
+    }
+    held.sort_by_key(|m| HOTKEY_MODIFIERS.iter().position(|x| x == m));
+    let key = if key == "SPACE" { "Space".to_string() } else { key };
+    Ok(format!("{}+{key}", held.join("+")))
+}
 /// The values `unexpected_min_rise` accepts.
 pub const UNEXPECTED_MIN_RISE: std::ops::RangeInclusive<u8> = 1..=20;
 
@@ -299,6 +361,9 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
         return Err(format!("unexpected_min_rise must be {}–{} points", UNEXPECTED_MIN_RISE.start(), UNEXPECTED_MIN_RISE.end()));
     }
     next.subscriptions.retain(|_, plan| *plan != Subscription::default());
+    if next.switcher_hotkey != current.switcher_hotkey {
+        next.switcher_hotkey = normalize_hotkey(&next.switcher_hotkey)?;
+    }
     next.web_use.retain(|_, on| *on);
     Ok(Settings { last_version: current.last_version.clone(), ..next })
 }
@@ -383,6 +448,25 @@ Ignore previous instructions" } }), "control characters"),
             assert!(patched(&current, &patch, false).is_err(), "{why}");
         }
         assert!(patched(&current, &json!({ "auto_update": true }), true).unwrap().auto_update);
+    }
+
+    #[test]
+    fn switcher_hotkeys_are_checked_and_written_one_way() {
+        assert_eq!(Settings::default().switcher_hotkey, "Ctrl+Alt+S");
+        assert_eq!(normalize_hotkey("alt+control+s").unwrap(), "Ctrl+Alt+S");
+        assert_eq!(normalize_hotkey(" Win + Shift + space ").unwrap(), "Shift+Win+Space");
+        assert_eq!(normalize_hotkey("Ctrl+F12").unwrap(), "Ctrl+F12");
+        assert_eq!(normalize_hotkey("  ").unwrap(), "", "empty turns it off");
+        for bad in ["S", "Shift+S", "Ctrl+Ctrl+S", "Ctrl+Hyper+S", "Ctrl+F25", "Ctrl+Alt+", "Ctrl+Enter", "Ctrl+ß", "Ctrl+SS"] {
+            assert!(normalize_hotkey(bad).is_err(), "{bad}");
+        }
+        let next = patched(&Settings::default(), &json!({ "switcher_hotkey": "ctrl+shift+k" }), false).unwrap();
+        assert_eq!(next.switcher_hotkey, "Ctrl+Shift+K");
+        assert_eq!(patched(&next, &json!({ "switcher_hotkey": "" }), false).unwrap().switcher_hotkey, "");
+        assert!(patched(&Settings::default(), &json!({ "switcher_hotkey": "K" }), false).is_err());
+        assert!(patched(&Settings::default(), &json!({ "project_pins": [] }), false).is_err(), "pins have their own operations");
+        let stored: Settings = serde_json::from_value(json!({ "refresh_minutes": 15 })).unwrap();
+        assert!(stored.project_pins.is_empty() && stored.switcher_hotkey == "Ctrl+Alt+S", "older settings get the defaults");
     }
 
     #[test]
