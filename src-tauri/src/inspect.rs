@@ -23,6 +23,8 @@ pub enum Target {
     Flyout,
     /// The quick switcher.
     Switcher,
+    /// The taskbar widget.
+    Widget,
 }
 
 impl Target {
@@ -31,8 +33,27 @@ impl Target {
             Target::Settings => "settings",
             Target::Flyout => crate::panel::LABEL,
             Target::Switcher => crate::app::SWITCHER_LABEL,
+            Target::Widget => crate::dock::LABEL,
         }
     }
+}
+
+/// The native widget has no webview to ask: its text and picture come from the code that draws
+/// it on the taskbar (`widget_win::inspect`).
+#[cfg(windows)]
+fn inspect_native_widget(app: &AppHandle, screenshot: bool) -> Result<Inspection, String> {
+    let (text, png, was_visible) = crate::widget_win::inspect(app)?;
+    let screenshot = if screenshot {
+        let dir = captures_dir().ok_or("no app data folder")?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(format!("SlopBar-widget-{}.png", chrono::Utc::now().format("%Y%m%d-%H%M%S%3f")));
+        std::fs::write(&path, png).map_err(|e| e.to_string())?;
+        prune(&dir);
+        Some(path)
+    } else {
+        None
+    };
+    Ok(Inspection { window: Target::Widget, page: None, was_visible, text, screenshot })
 }
 
 #[derive(Debug, Serialize)]
@@ -57,11 +78,15 @@ pub async fn inspect(app: &AppHandle, target: Target, page: Option<String>, scre
             return Err(format!("page is only for the settings window, one of {PAGES:?}"));
         }
     }
+    if target == Target::Widget && crate::widget_win::running() && crate::dock::native_wanted(app) {
+        return inspect_native_widget(app, screenshot);
+    }
     // Settings and the switcher exist only while open: one that is closed is created for the
-    // look, given a moment to load, and destroyed again afterwards.
+    // look, given a moment to load, and destroyed again afterwards. (The web widget is never
+    // built just for a look: it exists whenever it is the widget in use.)
     let (window, created) = match app.get_webview_window(target.label()) {
         Some(w) => (w, false),
-        None if crate::app::ON_DEMAND.contains(&target.label()) => {
+        None if target != Target::Widget && crate::app::ON_DEMAND.contains(&target.label()) => {
             let w = crate::app::on_demand_window(app, target.label()).await.ok_or("window not available")?;
             (w, true)
         }

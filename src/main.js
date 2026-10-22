@@ -1,7 +1,7 @@
 import { t, windowResetText, windowLabel, errorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, duration, resetText, groupResets, visibleResetWindows, placesText } from "./i18n.js";
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
-import { checkUsage, checkSwitch, checkPlans, checkDigest, checkCapacity, creditAdviceText } from "./alerts.js";
+import { creditAdviceText } from "./alerts.js";
 import { sparkline } from "./sparkline.js";
 
 const { invoke } = window.__TAURI__.core;
@@ -20,8 +20,6 @@ observeFrontend(IS_DOCK ? "dock" : "panel");
 document.body.classList.add(IS_DOCK ? "dock" : "panel");
 
 let lastSnap = { accounts: [], updated_at: null };
-/** Which notifications to show (from settings); only the widget sends them. */
-let notifications = null;
 /** The whole settings, for the flyout's layout choice. */
 let current = null;
 /** Each account's weekly usage over the last 7 days, keyed `provider:id` (get_sparklines). */
@@ -64,7 +62,6 @@ function showToast(text) {
 listen("update-installed", ({ payload: version }) => showToast(t("updatedTo", { v: version })));
 
 listen("account-switched", ({ payload: s }) => {
-  if (IS_DOCK && notifications) checkSwitch(s, notifications);
   const name = PROVIDER_NAME[s.provider];
   showToast(t(s.auto ? "switchedAuto" : "switched", { provider: name, to: s.to ?? "" }));
 });
@@ -277,7 +274,6 @@ function layout() {
 
 function render(snap) {
   lastSnap = snap;
-  if (IS_DOCK && notifications && snap.updated_at) { checkUsage(snap, notifications); checkPlans(); checkDigest(); checkCapacity(); }
   if (!IS_DOCK) loadCreditAdvice();
   if (IS_DOCK) renderCompact(snap);
   else renderDetails(snap);
@@ -305,7 +301,6 @@ document.getElementById("open-switcher").addEventListener("click", () => invoke(
 
 function applySettings(settings) {
   current = settings;
-  notifications = settings.notifications;
   setLanguage(settings.language);
   translateDom();
   if (IS_DOCK) {
@@ -325,10 +320,6 @@ $refresh.addEventListener("click", async () => {
   try { render(await invoke("refresh")); } finally { $refresh.classList.remove("spin"); }
 });
 
-// An automatic monitoring sign-in started (see auto_monitor.rs): the user finishes it in the browser.
-listen("monitoring-auto-started", ({ payload }) => invoke("notify", {
-  title: t("monitorAutoTitle", { name: payload.name ?? t("unknownAccount") }), body: t("monitorAutoBody"), page: null,
-}).catch(() => {}));
 listen("monitoring-login", ({ payload }) => showToast(payload.error ? errorText("", payload.error) : t("monitorConnected")));
 listen("usage-updated", (e) => render(e.payload));
 // The sparklines' readings: the backend records them on every refresh.
