@@ -1,4 +1,4 @@
-use crate::{accounts, balancer, codex_local, diagnostics, dock, door, inspect, migrate, model, monitoring, notify, panel, presence, providers, settings, sources, subscriptions, updates};
+use crate::{accounts, balancer, codex_local, diagnostics, dock, door, headroom, inspect, migrate, model, monitoring, notify, panel, presence, providers, settings, sources, subscriptions, updates};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -41,6 +41,8 @@ pub struct AppState {
     pub(crate) codex_local: Mutex<Option<std::sync::Arc<codex_local::Local>>>,
     /// When each provider was last switched automatically (the balancer's cooldown).
     pub(crate) last_switch: Mutex<HashMap<Provider, Instant>>,
+    /// The past few hours of readings, for the agents' pace forecasts.
+    pub(crate) recent: Mutex<headroom::Recent>,
     /// Sources found by the last refresh, where switches are written.
     pub(crate) sources: Mutex<Vec<sources::Source>>,
     /// Recent readings of unclaimed accounts, to notice use outside this PC.
@@ -95,6 +97,18 @@ async fn export_diagnostics(app: AppHandle) -> Result<String, String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// An agent's switch: the same as Use in Settings, then the balancer's cooldown so the next poll
+/// does not switch straight back. Returns the new snapshot and whether the account held.
+async fn agent_switch(app: &AppHandle, provider: Provider, id: String) -> Result<serde_json::Value, String> {
+    switch_to(app, provider, id.clone(), false).await?;
+    app.state::<AppState>().last_switch.lock().unwrap().insert(provider, Instant::now());
+    let snapshot = do_refresh(app).await;
+    let active = snapshot.accounts.iter().find(|a| a.provider == provider && a.active).map(|a| a.id.clone());
+    let mut result = serde_json::to_value(snapshot).map_err(|e| e.to_string())?;
+    result["switched_to_requested"] = (active.as_deref() == Some(id.as_str())).into();
+    Ok(result)
+}
+
 /// One operation for an agent, through the door (see `door` and `mcp`). Each runs the same code as
 /// the matching Settings action, so the windows and journal see it the same way.
 async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json::Value, String> {
@@ -122,15 +136,43 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             store_settings(&app, next.clone()).await?;
             value(next)
         }
-        R::SwitchAccount { provider, id } => {
-            // An agent's explicit choice gets the balancer's cooldown, as an automatic switch does,
-            // so the next poll does not switch straight back.
-            switch_to(&app, provider, id.clone(), false).await?;
-            app.state::<AppState>().last_switch.lock().unwrap().insert(provider, Instant::now());
-            let snapshot = do_refresh(&app).await;
-            let active = snapshot.accounts.iter().find(|a| a.provider == provider && a.active).map(|a| a.id.clone());
-            let mut result = value(snapshot)?;
-            result["switched_to_requested"] = (active.as_deref() == Some(id.as_str())).into();
+        R::SwitchAccount { provider, id } => agent_switch(&app, provider, id).await,
+        R::GetHeadroom { provider, id } => {
+            let state = app.state::<AppState>();
+            let snapshot = state.snapshot.lock().unwrap().clone();
+            let settings = state.settings.lock().unwrap().clone();
+            let now = chrono::Utc::now();
+            let picked: Vec<_> = snapshot.accounts.iter().filter(|a| match (&provider, &id) {
+                (_, Some(id)) => a.id == *id && provider.map_or(true, |p| a.provider == p),
+                (Some(p), None) => a.provider == *p && a.active,
+                (None, None) => a.active,
+            }).collect();
+            if picked.is_empty() {
+                return Err(if id.is_some() { "monitor_wrong_account".into() } else { "no_active_account".into() });
+            }
+            let accounts: Vec<_> = {
+                let recent = state.recent.lock().unwrap();
+                picked.into_iter().map(|a| headroom::headroom(a, &settings, &recent, now)).collect()
+            };
+            Ok(serde_json::json!({ "accounts": value(accounts)?, "updated_at": snapshot.updated_at }))
+        }
+        R::RecommendAccount { provider, expected_percent, hours, switch } => {
+            if expected_percent.is_some_and(|p| !(0.0..=100.0).contains(&p)) || hours.is_some_and(|h| !(0.0..=168.0).contains(&h)) {
+                return Err("expected_percent must be 0-100 and hours 0-168".into());
+            }
+            let rec = {
+                let state = app.state::<AppState>();
+                let snapshot = state.snapshot.lock().unwrap().clone();
+                let settings = state.settings.lock().unwrap().clone();
+                headroom::recommend(&snapshot.accounts, &settings, provider, expected_percent, hours, chrono::Utc::now())
+            };
+            let mut result = value(&rec)?;
+            result["switched"] = false.into();
+            if let (true, headroom::Action::Switch, Some(id)) = (switch, rec.action, rec.recommended.clone()) {
+                let done = agent_switch(&app, provider, id).await?;
+                result["switched"] = true.into();
+                result["switched_to_requested"] = done["switched_to_requested"].clone();
+            }
             Ok(result)
         }
         R::AddAccount { provider } => {
@@ -651,6 +693,7 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     if subscriptions::save(&history).is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::HistorySave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
     state.diagnostics.record(None, None, diagnostics::Event::PollFinished { elapsed_ms: diagnostics::millis(started), accounts: snapshot.accounts.len(),
         native_sources: found.iter().filter(|s| s.distro.is_none()).count(), wsl_sources: found.iter().filter(|s| s.distro.is_some()).count() });
+    state.recent.lock().unwrap().record(&snapshot.accounts, chrono::Utc::now());
     *state.snapshot.lock().unwrap() = snapshot.clone();
     let _ = app.emit("usage-updated", &snapshot);
     if settings.providers.codex { scan_codex_local(app); }
@@ -711,6 +754,7 @@ pub fn run() {
         settings_lock: tokio::sync::Mutex::new(()),
         account_operations: monitoring::Operations::default(),
         last_switch: Mutex::default(),
+        recent: Mutex::default(),
         sources: Mutex::default(),
         presence_tracks: Mutex::default(),
     };
