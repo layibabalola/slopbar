@@ -265,6 +265,29 @@ mod win {
         true
     }
 
+    /// The taskbar's visible child windows: (class, rect).
+    pub fn child_windows() -> Vec<(String, Rect)> {
+        let mut out = Vec::new();
+        unsafe {
+            let bar = bar();
+            if bar.is_null() {
+                return out;
+            }
+            let mut child = FindWindowExW(bar, std::ptr::null_mut(), std::ptr::null(), std::ptr::null());
+            while !child.is_null() {
+                if IsWindowVisible(child) != 0 {
+                    let mut buf = [0u16; 128];
+                    let n = GetClassNameW(child, buf.as_mut_ptr(), buf.len() as i32);
+                    if let Some(r) = rect_of(child) {
+                        out.push((String::from_utf16_lossy(&buf[..n.max(0) as usize]), r));
+                    }
+                }
+                child = FindWindowExW(bar, child, std::ptr::null(), std::ptr::null());
+            }
+        }
+        out
+    }
+
     pub fn init_com() {
         use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
         let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
@@ -394,6 +417,9 @@ mod win {
     pub fn reread(_: &mut [Seen]) -> bool {
         true
     }
+    pub fn child_windows() -> Vec<(String, Rect)> {
+        Vec::new()
+    }
     pub fn init_com() {}
     pub fn own_by_taskbar(_: ()) -> bool {
         false
@@ -462,7 +488,11 @@ fn watch_taskbar(changed: std::sync::mpsc::Receiver<()>) {
                 seen = found;
             }
         }
-        *OCCUPIED.lock().unwrap() = seen.iter().map(|s| s.rect).collect();
+        let mut occupied: Vec<Rect> = seen.iter().map(|s| s.rect).collect();
+        if let Some((bar, _)) = win::taskbar() {
+            occupied.extend(occupying(bar, &win::child_windows()));
+        }
+        *OCCUPIED.lock().unwrap() = occupied;
         search = match changed.recv_timeout(REREAD_EVERY) {
             // A burst of changes (the taskbar sliding in) is one search.
             Ok(()) => {
@@ -480,19 +510,30 @@ fn watch_taskbar(changed: std::sync::mpsc::Receiver<()>) {
 /// widest the widget may be there (`room`) without touching what is to its left. Usually that
 /// is right by the tray; with the weather (or a long row of task buttons) there, it is left of
 /// them. Only what is on the taskbar's row counts (another monitor's taskbar doesn't), and
-/// nothing right of the tray's left edge (the tray's own icons). With no free span at all it
-/// docks against the tray, as before anything was looked at.
-pub fn dock_span(bar: Rect, tray: Rect, occupied: &[Rect], need: i32) -> (i32, i32) {
+/// nothing right of the tray's left edge (the tray's own icons). Where nothing is that wide it
+/// tries without the gaps, then for `least` (the rings without their padding), and failing all
+/// of those takes the widest free span there is, so it covers as little as it can.
+pub fn dock_span(bar: Rect, tray: Rect, occupied: &[Rect], need: i32, least: i32) -> (i32, i32) {
     let row: Vec<Rect> = occupied
         .iter()
         .filter(|o| o.top < bar.bottom && o.bottom > bar.top && o.right > o.left && o.left < tray.left)
         .copied()
         .collect();
+    for (need, margin) in [(need, GAP), (need, 0), (least, GAP), (least, 0)] {
+        if let Some(span) = fit(bar, tray, &row, need, margin) {
+            return span;
+        }
+    }
+    widest(bar, tray, &row).unwrap_or((tray.left - GAP, need))
+}
+
+/// The first span, walking left from the tray, `need` wide with `margin` on each side.
+fn fit(bar: Rect, tray: Rect, row: &[Rect], need: i32, margin: i32) -> Option<(i32, i32)> {
     let mut right = tray.left;
     loop {
-        let left = right - GAP - need - GAP;
+        let left = right - margin - need - margin;
         if left < bar.left {
-            return (tray.left - GAP, need);
+            return None;
         }
         match row.iter().filter(|o| o.left < right && o.right > left).map(|o| o.left).min() {
             Some(l) => right = l,
@@ -500,7 +541,47 @@ pub fn dock_span(bar: Rect, tray: Rect, occupied: &[Rect], need: i32) -> (i32, i
         }
     }
     let wall = row.iter().filter(|o| o.left < right).map(|o| o.right).max().unwrap_or(bar.left).max(bar.left);
-    (right - GAP, right - GAP - (wall + GAP))
+    Some((right - margin, right - margin - (wall + margin)))
+}
+
+/// The widest free span between the taskbar's left edge and the tray, as (right edge, width).
+fn widest(bar: Rect, tray: Rect, row: &[Rect]) -> Option<(i32, i32)> {
+    let mut sorted = row.to_vec();
+    sorted.sort_by_key(|o| o.left);
+    let mut best: Option<(i32, i32)> = None;
+    let mut wall = bar.left;
+    for o in sorted.iter().map(|o| (o.left, o.right)).chain([(tray.left, tray.left)]) {
+        let free = o.0.min(tray.left) - wall;
+        if free > 0 && best.is_none_or(|b| free > b.1) {
+            best = Some((o.0.min(tray.left), free));
+        }
+        wall = wall.max(o.1);
+    }
+    best
+}
+
+/// The taskbar's own windows that show something (on Windows 10 the weather, `DynamicContent2`,
+/// and search highlights, `DynamicContent1`, are windows of their own, not UI Automation
+/// buttons). Containers don't count: the task list and its rebar span all the space the task
+/// buttons may use (the buttons themselves are counted by UI Automation), the tray is docked
+/// against, and the XAML bridges of newer taskbars span the whole bar. Nor does anything as wide
+/// as half the taskbar, whatever it is called.
+pub fn occupying(bar: Rect, windows: &[(String, Rect)]) -> Vec<Rect> {
+    const CONTAINERS: &[&str] = &[
+        "ReBarWindow32",
+        "MSTaskSwWClass",
+        "MSTaskListWClass",
+        "TrayNotifyWnd",
+        "Windows.UI.Composition.DesktopWindowContentBridge",
+        "Windows.UI.Input.InputSite.WindowClass",
+    ];
+    windows
+        .iter()
+        .filter(|(class, r)| {
+            !CONTAINERS.contains(&class.as_str()) && r.right > r.left && 2 * (r.right - r.left) < bar.right - bar.left
+        })
+        .map(|(_, r)| *r)
+        .collect()
 }
 
 /// Left edge of a widget `width` wide in the span `dock_span` found for it, and its width there
@@ -660,7 +741,7 @@ fn place_docked(app: &AppHandle, host: &Host, taskbar: Option<(Rect, Rect)>, rai
         Host::Web { win, hwnd, frame } => {
             // The web widget sizes itself; it can only be put where it fits.
             let width = (*app.state::<AppState>().dock_width.lock().unwrap() * frame.scale).ceil() as i32;
-            let (right, _) = dock_span(bar, tray, &occupied, width);
+            let (right, _) = dock_span(bar, tray, &occupied, width, width);
             let pos = PhysicalPosition::new(right - width, bar.top);
             let size = PhysicalSize::new(width as u32, height as u32);
             if frame.pos != pos {
@@ -678,7 +759,7 @@ fn place_docked(app: &AppHandle, host: &Host, taskbar: Option<(Rect, Rect)>, rai
             let width = native::width_px(dpi);
             // A notice is wider than the rings: the span is picked for the rings (so a notice
             // doesn't move the widget), and the notice is cut short to fit it.
-            let span = dock_span(bar, tray, &occupied, width.min(native::rings_px(dpi)));
+            let span = dock_span(bar, tray, &occupied, width.min(native::rings_px(dpi)), native::least_px(dpi));
             let (x, w) = dock_left(span, width);
             native::place(native::Place { x, y: bar.top, w, h: height, dpi, room: span.1 });
             native::hwnd().map(|h| h as isize)
@@ -786,30 +867,30 @@ mod tests {
 
     #[test]
     fn docks_against_the_tray_with_nothing_else_there() {
-        assert_eq!(dock_span(BAR, TRAY, &[], 98), (3279 - GAP, 3279 - 2 * GAP));
-        assert_eq!(dock_span(BAR, TRAY, &left_side(), 98), (3279 - GAP, 3279 - GAP - 1145 - GAP));
-        assert_eq!(dock_left(dock_span(BAR, TRAY, &left_side(), 98), 98), (3279 - GAP - 98, 98));
+        assert_eq!(dock_span(BAR, TRAY, &[], 98, 98), (3279 - GAP, 3279 - 2 * GAP));
+        assert_eq!(dock_span(BAR, TRAY, &left_side(), 98, 98), (3279 - GAP, 3279 - GAP - 1145 - GAP));
+        assert_eq!(dock_left(dock_span(BAR, TRAY, &left_side(), 98, 98), 98), (3279 - GAP - 98, 98));
     }
 
     #[test]
     fn steps_left_of_the_weather_next_to_the_tray() {
         let mut o = left_side();
         o.push(at(3033, 3261));
-        let span = dock_span(BAR, TRAY, &o, 98);
+        let span = dock_span(BAR, TRAY, &o, 98, 98);
         assert_eq!(span, (3033 - GAP, 3033 - GAP - 1145 - GAP));
         assert_eq!(dock_left(span, 98), (3033 - GAP - 98, 98));
     }
 
     #[test]
     fn steps_left_of_weather_that_only_reaches_into_its_spot() {
-        assert_eq!(dock_span(BAR, TRAY, &[at(3000, 3180)], 98).0, 3000 - GAP);
+        assert_eq!(dock_span(BAR, TRAY, &[at(3000, 3180)], 98, 98).0, 3000 - GAP);
     }
 
     #[test]
     fn stays_by_the_tray_when_the_weather_leaves_room() {
         // The widget spans 3177..3275 with a gap of 4 on each side.
-        assert_eq!(dock_span(BAR, TRAY, &[at(2900, 3173)], 98), (3279 - GAP, 98));
-        assert_eq!(dock_span(BAR, TRAY, &[at(2900, 3174)], 98).0, 2900 - GAP);
+        assert_eq!(dock_span(BAR, TRAY, &[at(2900, 3173)], 98, 98), (3279 - GAP, 98));
+        assert_eq!(dock_span(BAR, TRAY, &[at(2900, 3174)], 98, 98).0, 2900 - GAP);
     }
 
     #[test]
@@ -817,28 +898,28 @@ mod tests {
         // Windows 11 centered: weather far left, task buttons in the middle.
         let mut o = vec![at(0, 228)];
         o.extend((0..10).map(|i| at(1590 + 66 * i, 1656 + 66 * i)));
-        assert_eq!(dock_span(BAR, TRAY, &o, 98), (3279 - GAP, 3279 - GAP - 2250 - GAP));
+        assert_eq!(dock_span(BAR, TRAY, &o, 98, 98), (3279 - GAP, 3279 - GAP - 2250 - GAP));
     }
 
     #[test]
     fn ignores_what_is_on_another_taskbar_or_in_the_tray() {
         let elsewhere = Rect { left: 3033, top: 1000, right: 3261, bottom: 1072 };
         let tray_icon = at(3327, 3375);
-        assert_eq!(dock_span(BAR, TRAY, &[elsewhere, tray_icon], 98).0, 3279 - GAP);
+        assert_eq!(dock_span(BAR, TRAY, &[elsewhere, tray_icon], 98, 98).0, 3279 - GAP);
     }
 
     #[test]
     fn walks_past_task_buttons_that_reach_the_weather() {
         // Windows 10 style: the weather by the tray, and task buttons running up to it.
         let o = vec![at(2700, 2766), at(2766, 2832), at(2832, 2898), at(2900, 3030), at(3033, 3261)];
-        assert_eq!(dock_span(BAR, TRAY, &o, 98).0, 2700 - GAP);
+        assert_eq!(dock_span(BAR, TRAY, &o, 98, 98).0, 2700 - GAP);
     }
 
     #[test]
     fn a_notice_is_cut_to_the_room_between_its_neighbours() {
         // Task buttons up to 2800, the weather from 3033: 225 px free between them.
         let o = vec![at(2734, 2800), at(3033, 3261)];
-        let span = dock_span(BAR, TRAY, &o, 66);
+        let span = dock_span(BAR, TRAY, &o, 66, 66);
         assert_eq!(span, (3029, 3029 - 2804));
         // A notice 600 px wide is cut to the room; the rings fit as they are.
         assert_eq!(dock_left(span, 600), (2804, 225));
@@ -846,9 +927,65 @@ mod tests {
     }
 
     #[test]
-    fn a_full_taskbar_docks_against_the_tray() {
-        let o: Vec<Rect> = (0..60).map(|i| at(i * 60, i * 60 + 58)).collect();
-        assert_eq!(dock_span(BAR, TRAY, &o, 98), (3279 - GAP, 98));
+    fn a_full_taskbar_takes_the_widest_free_span() {
+        let mut o: Vec<Rect> = (0..60).map(|i| at(i * 60, i * 60 + 58)).collect();
+        // Every gap is 2 px, but one is 10.
+        o[40] = at(2400, 2450);
+        assert_eq!(dock_span(BAR, TRAY, &o, 98, 81), (2460, 10));
+    }
+
+    // UltraMagnus's Windows 10 taskbar (physical px), where the weather is a window of its own.
+    const BAR10: Rect = Rect { left: 0, top: 2100, right: 3840, bottom: 2160 };
+    const TRAY10: Rect = Rect { left: 3440, top: 2100, right: 3840, bottom: 2160 };
+
+    fn win10(class: &str, left: i32, right: i32) -> (String, Rect) {
+        (class.to_string(), Rect { left, top: 2100, right, bottom: 2160 })
+    }
+
+    fn win10_windows() -> Vec<(String, Rect)> {
+        vec![
+            win10("Start", 0, 72),
+            win10("DynamicContent1", 384, 504),
+            win10("ReBarWindow32", 504, 3128),
+            win10("DynamicContent2", 3234, 3428),
+            win10("TrayNotifyWnd", 3440, 3840),
+        ]
+    }
+
+    #[test]
+    fn counts_windows_10s_weather_window_but_not_its_containers() {
+        let o = occupying(BAR10, &win10_windows());
+        assert_eq!(o, vec![win10("", 0, 72).1, win10("", 384, 504).1, win10("", 3234, 3428).1]);
+        let bridge = win10("Windows.UI.Composition.DesktopWindowContentBridge", 0, 3840);
+        let unknown_but_huge = win10("SomethingNew", 100, 3000);
+        assert!(occupying(BAR10, &[bridge, unknown_but_huge]).is_empty());
+    }
+
+    #[test]
+    fn docks_left_of_windows_10s_weather_window() {
+        // The widget was at 3337-3436, over the weather; it goes left of it.
+        let o = occupying(BAR10, &win10_windows());
+        let span = dock_span(BAR10, TRAY10, &o, 99, 81);
+        assert_eq!(span.0, 3234 - GAP);
+        let (x, w) = dock_left(span, 99);
+        assert_eq!((x, w), (3230 - 99, 99));
+        assert!(x + w <= 3234);
+    }
+
+    #[test]
+    fn squeezes_into_a_tight_gap_rather_than_overlap() {
+        // The search box, and task buttons filling the task list up to 3128: 106 px to the
+        // weather, too tight for 99 px with a 4 px gap each side, so it goes without the gaps.
+        let mut o = occupying(BAR10, &win10_windows());
+        o.push(win10("", 72, 384).1);
+        o.push(win10("", 504, 3128).1);
+        let span = dock_span(BAR10, TRAY10, &o, 99, 81);
+        assert_eq!(span, (3234, 106));
+        let (x, w) = dock_left(span, 99);
+        assert!(x >= 3128 && x + w <= 3234, "{x} {w}");
+        // 90 px: only the rings without their padding fit.
+        o.push(win10("", 3128, 3144).1);
+        assert_eq!(dock_span(BAR10, TRAY10, &o, 99, 81), (3234 - GAP, 3234 - GAP - 3144 - GAP));
     }
 
     /// Against this machine's real taskbar: `cargo test --lib real_taskbar -- --ignored --nocapture`.
@@ -866,12 +1003,14 @@ mod tests {
             println!("{r:?}");
         }
         println!("{} buttons in {took:?}; bar {bar:?} tray {tray:?}", rects.len());
-        println!("span for 99 px: {:?}", dock_span(bar, tray, &rects, 99));
+        let windows = win::child_windows();
+        println!("child windows {windows:?}; occupying {:?}", occupying(bar, &windows));
+        println!("span for 99 px: {:?}", dock_span(bar, tray, &rects, 99, 81));
     }
 
     #[test]
     fn a_window_spanning_the_whole_taskbar_counts_from_its_left_edge() {
         // Should something span the bar, nothing left of it is free: dock against the tray.
-        assert_eq!(dock_span(BAR, TRAY, &[at(0, 3840)], 98), (3279 - GAP, 98));
+        assert_eq!(dock_span(BAR, TRAY, &[at(0, 3840)], 98, 98), (3279 - GAP, 98));
     }
 }
