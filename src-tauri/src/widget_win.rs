@@ -97,6 +97,12 @@ pub fn rings_px(dpi: u32) -> i32 {
     widget::physical(RINGS, dpi)
 }
 
+/// The narrowest the widget can be drawn at `dpi` (rings without their padding): what dock.rs
+/// squeezes it to where nothing wider is free.
+pub fn least_px(dpi: u32) -> i32 {
+    widget::physical(shared(|s| widget::least_width(&s.view)).unwrap_or(RINGS), dpi)
+}
+
 /// Moves (and redraws) the widget; a no-op when it is already there.
 pub fn place(p: Place) {
     let changed = shared(|s| {
