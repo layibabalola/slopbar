@@ -16,12 +16,17 @@
   (cargo build) for slopbar.exe.
 #>
 param(
-  [string]$Out = (Join-Path $env:TEMP 'slopbar-signin-visual')
+  [string]$Out = (Join-Path $env:TEMP 'slopbar-signin-visual'),
+  # On a machine without the sources (another PC, so the windows never open on the desktop being
+  # worked in): a debug slopbar.exe, and the library's test binary
+  # (target\debug\deps\slopbar_lib-*.exe from cargo test --no-run).
+  [string]$Exe,
+  [string]$TestExe
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $tauri = Join-Path $root 'src-tauri'
-$exe = Join-Path $tauri 'target\debug\slopbar.exe'
+$exe = if ($Exe) { $Exe } else { Join-Path $tauri 'target\debug\slopbar.exe' }
 if (-not (Test-Path $exe)) { Write-Host "CANNOT RUN: build $exe first (cargo build in src-tauri)."; exit 2 }
 
 Add-Type -AssemblyName System.Drawing
@@ -82,8 +87,9 @@ $data = Join-Path $Out 'data'; New-Item -ItemType Directory -Force $data | Out-N
 
 $env:SLOPBAR_VISUAL_DIR = $sync; $env:SLOPBAR_EXE = $exe; $env:SLOPBAR_DATA_DIR = $data
 $log = Join-Path $Out 'test.log'
-$test = Start-Process cargo -ArgumentList 'test', '--lib', 'visual_sign_in_windows', '--', '--ignored', '--nocapture' `
-  -WorkingDirectory $tauri -RedirectStandardOutput $log -RedirectStandardError (Join-Path $Out 'build.log') -PassThru -WindowStyle Hidden
+$run = if ($TestExe) { @{ FilePath = $TestExe; ArgumentList = 'visual_sign_in_windows', '--ignored', '--nocapture'; WorkingDirectory = $Out } }
+  else { @{ FilePath = 'cargo'; ArgumentList = 'test', '--lib', 'visual_sign_in_windows', '--', '--ignored', '--nocapture'; WorkingDirectory = $tauri } }
+$test = Start-Process @run -RedirectStandardOutput $log -RedirectStandardError (Join-Path $Out 'build.log') -PassThru -WindowStyle Hidden
 
 $report = [ordered]@{}
 foreach ($step in '1-claude', '2-codex', '3-closed', '4-next', '5-closed') {
