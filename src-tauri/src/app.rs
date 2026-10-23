@@ -589,6 +589,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         }
         R::GetHealth => value(health_report(&app).await),
         R::GetRoster { sync } => Ok(roster_status(&app, sync).await),
+        R::SyncRoster => Ok(roster_status(&app, true).await),
         R::SetRosterPassphrase { passphrase } => set_roster_passphrase(&app, passphrase).await,
         R::ListSharingLocations => {
             let (folder, remote) = {

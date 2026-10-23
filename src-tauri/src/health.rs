@@ -156,7 +156,7 @@ fn place_set(sharing: &Sharing) -> bool {
 /// wait to be signed in here.
 fn roster_checks(r: &Roster, place: bool) -> Vec<Check> {
     if !r.enabled {
-        return vec![];
+        return vec![check("roster", Status::Ok, "Account roster", "Off: this computer's accounts are not shared with your other computers, and theirs are not read.", None)];
     }
     let data = Some(Fix::OpenSettings { page: "data" });
     let title = "Account roster";
@@ -538,7 +538,7 @@ mod tests {
         let r = Case::healthy().run();
         assert_eq!((r.status, r.problems, r.warnings), (Status::Ok, 0, 0), "{:#?}", r.checks);
         let ids: Vec<_> = r.checks.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(ids, ["monitoring", "freshness", "refresh", "instances", "agent_servers", "door", "sharing", "journal", "notifications"]);
+        assert_eq!(ids, ["monitoring", "freshness", "refresh", "instances", "agent_servers", "door", "sharing", "roster", "journal", "notifications"]);
     }
 
     #[test]
@@ -722,7 +722,8 @@ mod tests {
     #[test]
     fn the_roster_says_how_many_accounts_wait_and_why_it_cannot_share() {
         let mut case = Case::healthy();
-        assert!(case.run().checks.iter().all(|c| !c.id.starts_with("roster")), "off: no checks");
+        assert_eq!(find(&case.run(), "roster").reason.split(':').next(), Some("Off"), "off is reported too");
+        assert!(case.run().checks.iter().all(|c| c.id != "roster_waiting"));
         case.roster = Roster { enabled: true, ..Default::default() };
         assert!(find(&case.run(), "roster").reason.contains("sharing is off"));
         case.sharing.folder = Some("D:\\Sync".into());
