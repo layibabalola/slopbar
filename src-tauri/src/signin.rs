@@ -714,10 +714,8 @@ mod tests {
     #[test]
     #[ignore = "opens browser windows; run by scripts/test-signin-window.ps1"]
     fn visual_sign_in_windows() {
-        use std::os::windows::process::CommandExt;
+        use crate::login::ProcessTree;
         use std::process::{Command, Stdio};
-        const CREATE_NEW_CONSOLE: u32 = 0x10;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let sync = PathBuf::from(std::env::var_os("SLOPBAR_VISUAL_DIR").expect("SLOPBAR_VISUAL_DIR"));
         let exe = PathBuf::from(std::env::var_os("SLOPBAR_EXE").expect("SLOPBAR_EXE"));
         assert!(std::env::var_os("SLOPBAR_DATA_DIR").is_some(), "keep the sessions out of the installed app's folder");
@@ -743,21 +741,25 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(250));
             }
         };
+        // Through cmd, as the app runs them: the CLIs may be npm .cmd shims. Each runs in a
+        // kill-on-close tree, as in the app; only the page launcher breaks away from it.
         let claude = |session: &Session, email: &str, home: &Path| {
-            Command::new("claude").args(["--setting-sources", "user", "auth", "login", "--email", email])
-                .env("CLAUDE_CONFIG_DIR", home).envs(claude_browser_env_for(&exe, &session.target()))
-                .creation_flags(CREATE_NEW_CONSOLE).spawn().expect("claude")
+            let mut c = Command::new("cmd");
+            c.args(["/c", "claude", "--setting-sources", "user", "auth", "login", "--email", email])
+                .env("CLAUDE_CONFIG_DIR", home).envs(claude_browser_env_for(&exe, &session.target()));
+            ProcessTree::spawn_with(&mut c, true, true).expect("claude")
         };
 
         let first = Session::create().expect("session");
         let homes = [TempDir::new(), TempDir::new(), TempDir::new()];
-        let mut claude_one = claude(&first, "visual.one@example.invalid", &homes[0].0);
+        let claude_one = claude(&first, "visual.one@example.invalid", &homes[0].0);
         let pid = browser(first.dir());
         step("1-claude", format!("browser={pid:?} profile={}", first.dir().display()));
 
         std::fs::write(homes[1].0.join("config.toml"), "cli_auth_credentials_store = \"file\"\n").unwrap();
-        let mut codex = Command::new("codex").arg("app-server").env("CODEX_HOME", &homes[1].0)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).creation_flags(CREATE_NO_WINDOW).spawn().expect("codex");
+        let mut c = Command::new("cmd");
+        c.args(["/c", "codex", "app-server"]).env("CODEX_HOME", &homes[1].0).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        let (mut codex, codex_tree) = ProcessTree::spawn(&mut c, false).expect("codex");
         let (stdin, stdout) = (codex.stdin.take().unwrap(), codex.stdout.take().unwrap());
         let target = first.target();
         let started = crate::codex_signin::start(stdin, stdout, |url| open(url, &target));
@@ -765,19 +767,20 @@ mod tests {
         let again = browser_pid(first.dir());
         step("2-codex", format!("started={} browser={again:?} same_browser={}", started.is_ok(), again.is_some() && again == pid));
 
-        let _ = claude_one.kill();
+        drop(claude_one);
         drop(started);
-        let _ = codex.kill();
+        drop(codex_tree);
+        let _ = codex.wait();
         let dir = first.dir().to_owned();
         drop(first);
         step("3-closed", format!("browser_open={} profile_exists={}", browser_open(&dir), dir.exists()));
 
         let second = Session::create().expect("session");
-        let mut claude_two = claude(&second, "visual.two@example.invalid", &homes[2].0);
+        let claude_two = claude(&second, "visual.two@example.invalid", &homes[2].0);
         let next = browser(second.dir());
         step("4-next", format!("browser={next:?} new_profile={} new_browser={}", second.dir() != dir, next.is_some() && next != pid));
 
-        let _ = claude_two.kill();
+        drop(claude_two);
         let dir = second.dir().to_owned();
         drop(second);
         step("5-closed", format!("browser_open={} profile_exists={}", browser_open(&dir), dir.exists()));
