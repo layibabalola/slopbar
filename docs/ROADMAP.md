@@ -101,6 +101,7 @@ upstream PR.
 | 48 | **Full account tooltips** in the compact flyout and on the native widget (the same detail as the full view), **sparklines fixed** (a key-case mismatch had left them empty), **WSL never started needlessly** (`wsl_accounts` auto/on/off), and **the app no longer quits when the flyout closes**. Upstream thelioo/slopbar#33. | done (4194a17) |
 | 49 | **Widget docks in a free gap**: it reads every taskbar button through UI Automation (the weather included, on any taskbar style) and docks in the first free span left of the tray, so it never covers the weather; a notice too long for the room is cut with an ellipsis and its tooltip gives the full text. Checked on screen with the weather showing, for both the rings and a notice. Upstream thelioo/slopbar#34. | done (3258378) |
 | 30b | **Translate the 130 strings added in waves 5 and 6.** | done (aab0f12) |
+| 50 | **Account roster**: opt-in, an encrypted list of each computer's accounts (provider, id, email, plan; never sign-ins) in the in-use sharing folder or rclone remote, under a roster passphrase set on each computer. A new computer's Sign in all accounts queues every account the others have, and the flyout and Health say how many wait. Verified on the installed build: written, read back, a synthetic peer's two accounts queued. Not yet turned on: set the same passphrase on each computer. | done (05492b0) |
 
 ## Done before this roadmap (branch `claude/subscription-value`; upstream thelioo/slopbar#8–#11, stacked on #6)
 
