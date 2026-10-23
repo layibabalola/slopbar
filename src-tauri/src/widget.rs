@@ -338,25 +338,55 @@ pub struct Layout {
     /// Per item, where it is drawn: a ring's 24×24 box, or a line of text's box.
     pub items: Vec<Box2>,
     pub dot: Option<Box2>,
+    /// Per item, whether its text was cut short (with an ellipsis) to fit the room on the
+    /// taskbar; its tooltip then says it in full.
+    pub cut: Vec<bool>,
 }
 
 /// Lays the view out in a window `height` DIPs tall. `measure` gives a text's width at the
 /// widget's font (DirectWrite on Windows).
+#[cfg(test)]
 pub fn layout(view: &View, height: f32, measure: &dyn Fn(&str) -> f32) -> Layout {
+    layout_within(view, height, f32::INFINITY, measure)
+}
+
+/// As `layout`, at most `room` DIPs wide: text (a long notice) is cut short to fit, so the
+/// widget never reaches over the taskbar's other buttons. Rings are never cut.
+pub fn layout_within(view: &View, height: f32, room: f32, measure: &dyn Fn(&str) -> f32) -> Layout {
     let frame_h = (height - 2.0 * INSET_Y).max(RING_BOX);
     let mid = INSET_Y + frame_h / 2.0;
     let text_only = view.items.iter().all(|i| matches!(i, Item::Text { .. }));
     let pad = if text_only && !view.items.is_empty() { PAD_TEXT } else { PAD_CHIPS };
+    let mut sizes: Vec<(f32, f32)> = view
+        .items
+        .iter()
+        .map(|item| match item {
+            Item::Chip { .. } => (RING_BOX, RING_BOX),
+            Item::Text { text, .. } => (measure(text).ceil(), (FONT_SIZE * 1.35).round()),
+        })
+        .collect();
+    let gaps = GAP * view.items.len().saturating_sub(1) as f32;
+    let natural = 2.0 * (BORDER + pad) + gaps + sizes.iter().map(|s| s.0).sum::<f32>();
+    let mut excess = (natural - room).max(0.0);
+    let mut cut = vec![false; sizes.len()];
+    // The last text gives way first (there is only ever one today).
+    for (i, item) in view.items.iter().enumerate().rev() {
+        if excess <= 0.0 {
+            break;
+        }
+        if matches!(item, Item::Text { .. }) {
+            let take = excess.min(sizes[i].0).ceil();
+            sizes[i].0 -= take;
+            excess -= take;
+            cut[i] = true;
+        }
+    }
     let mut x = BORDER + pad;
     let mut boxes = Vec::with_capacity(view.items.len());
-    for (i, item) in view.items.iter().enumerate() {
+    for (i, (w, h)) in sizes.into_iter().enumerate() {
         if i > 0 {
             x += GAP;
         }
-        let (w, h) = match item {
-            Item::Chip { .. } => (RING_BOX, RING_BOX),
-            Item::Text { text, .. } => (measure(text).ceil(), (FONT_SIZE * 1.35).round()),
-        };
         boxes.push(Box2 { x, y: mid - h / 2.0, w, h });
         x += w;
     }
@@ -368,7 +398,7 @@ pub fn layout(view: &View, height: f32, measure: &dyn Fn(&str) -> f32) -> Layout
         w: DOT_SIZE,
         h: DOT_SIZE,
     });
-    Layout { width, frame, items: boxes, dot }
+    Layout { width, frame, items: boxes, dot, cut }
 }
 
 /// DIPs to physical pixels for a monitor at `dpi` (96 = 100%). Window sizes round up so nothing
@@ -398,7 +428,8 @@ pub fn tips(view: &View, layout: &Layout, texts: &dyn Texts) -> Vec<(Box2, Strin
         .enumerate()
         .filter_map(|(i, (item, b))| match item {
             Item::Chip { tip, .. } => Some((*b, full_tip(tip, view.details.get(i)))),
-            Item::Text { .. } => None,
+            // Cut short to fit: the tooltip says it all.
+            Item::Text { text, .. } => layout.cut.get(i).copied().unwrap_or(false).then(|| (*b, text.clone())),
         })
         .collect();
     if let Some(dot) = layout.dot {
@@ -756,6 +787,32 @@ mod tests {
         let t = layout(&view(&snap(vec![]), None, 0, &En), 48.0, &measure);
         let text = crate::i18n::t("en", "noAccounts", &[]);
         assert_eq!(t.width, 1.0 + 8.0 + measure(&text) + 8.0 + 1.0);
+        assert_eq!(t.cut, vec![false]);
+    }
+
+    #[test]
+    fn a_long_notice_is_cut_to_the_room_and_tipped_in_full() {
+        let s = snap(vec![account(Provider::Claude, "a", true, &[1.0])]);
+        let notice = "Monitoring sign-in did not complete. Try connecting again.";
+        let v = view(&s, Some(notice), 0, &En);
+        let full = layout(&v, 48.0, &measure);
+        assert!(full.width > 120.0);
+        assert!(tips(&v, &full, &En).is_empty());
+        let l = layout_within(&v, 48.0, 120.0, &measure);
+        assert_eq!(l.width, 120.0);
+        assert_eq!(l.cut, vec![true]);
+        assert_eq!(l.items[0].w, 120.0 - 2.0 * (1.0 + 8.0));
+        assert_eq!(tips(&v, &l, &En), vec![(l.items[0], notice.to_string())]);
+        // Room to spare cuts nothing.
+        assert_eq!(layout_within(&v, 48.0, 10_000.0, &measure), full);
+    }
+
+    #[test]
+    fn rings_are_never_cut() {
+        let s = snap(vec![account(Provider::Claude, "a", true, &[1.0]), account(Provider::Codex, "b", true, &[1.0])]);
+        let l = layout_within(&view(&s, None, 0, &En), 48.0, 30.0, &measure);
+        assert_eq!(l.width, 66.0);
+        assert_eq!(l.cut, vec![false, false]);
     }
 
     #[test]

@@ -22,7 +22,8 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED,
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_BOLD,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+    DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::HDC;
@@ -191,14 +192,19 @@ impl Renderer {
         self.text_layout(text, &self.text).map(|l| Self::width_of(&l)).unwrap_or(text.chars().count() as f32 * 7.0)
     }
 
-    pub fn layout(&self, view: &View, height_dips: f32) -> Layout {
-        widget::layout(view, height_dips, &|s| self.measure(s))
+    /// Draws `view` `height` physical pixels tall for a monitor at `dpi`.
+    #[cfg(test)]
+    pub fn draw(&self, view: &View, look: Look, dpi: u32, height: i32) -> Option<(Surface, Layout)> {
+        self.draw_within(view, look, dpi, height, None)
     }
 
-    /// Draws `view` `height` physical pixels tall for a monitor at `dpi`.
-    pub fn draw(&self, view: &View, look: Look, dpi: u32, height: i32) -> Option<(Surface, Layout)> {
+    /// As `draw`, at most `room` physical pixels wide (the free space on the taskbar): a notice
+    /// too long for it is cut short with an ellipsis.
+    pub fn draw_within(&self, view: &View, look: Look, dpi: u32, height: i32, room: Option<i32>) -> Option<(Surface, Layout)> {
         let scale = widget::scale(dpi);
-        let layout = self.layout(view, height as f32 / scale);
+        // Rounding up to whole pixels must not take it past the room.
+        let room = room.map_or(f32::INFINITY, |r| ((r as f32 - 1.0) / scale).floor().max(0.0));
+        let layout = widget::layout_within(view, height as f32 / scale, room, &|s| self.measure(s));
         let width = widget::physical(layout.width, dpi);
         let surface = Surface::new(width.max(1), height.max(1))?;
         unsafe { self.paint(&surface, view, &layout, look, dpi) }.ok()?;
@@ -222,7 +228,7 @@ impl Renderer {
         }
         // Pressed dims the content, like `#widget:active #compact`.
         let o = if look.pressed { 0.786 } else { 1.0 };
-        for (item, b) in view.items.iter().zip(&l.items) {
+        for (i, (item, b)) in view.items.iter().zip(&l.items).enumerate() {
             match item {
                 Item::Chip { provider, percent, .. } => {
                     let center = (b.x + b.w / 2.0, b.y + b.h / 2.0);
@@ -244,6 +250,11 @@ impl Renderer {
                 }
                 Item::Text { text, dim } => {
                     let layout = self.text_layout(text, &self.text)?;
+                    if l.cut.get(i).copied().unwrap_or(false) {
+                        layout.SetMaxWidth(b.w)?;
+                        let trimming = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 };
+                        layout.SetTrimming(&trimming, &self.dwrite.CreateEllipsisTrimmingSign(&self.text)?)?;
+                    }
                     let c = if *dim { p.text_2 } else { p.text };
                     // Centered on the line box: DirectWrite's line is a little shorter than CSS's 1.35.
                     let mut m = DWRITE_TEXT_METRICS::default();
@@ -539,5 +550,23 @@ mod tests {
         let (s, l) = r.draw(&view, LOOK, 96, 48).unwrap();
         assert_eq!(l.width, 1.0 + 8.0 + short.ceil() + 8.0 + 1.0);
         assert!(s.pixels().chunks_exact(4).any(|q| q[3] > 100));
+    }
+
+    #[test]
+    fn a_notice_too_long_for_the_room_is_cut_to_it() {
+        let r = Renderer::new().unwrap();
+        let text = "Monitoring sign-in did not complete. Try connecting again.";
+        let view = View { items: vec![Item::Text { text: text.into(), dim: false }], health_problems: 0, label: String::new(), details: vec![] };
+        for dpi in [96, 144] {
+            let (full, _) = r.draw(&view, LOOK, dpi, 48).unwrap();
+            let (s, l) = r.draw_within(&view, LOOK, dpi, 48, Some(150)).unwrap();
+            assert!(full.width > 150 && s.width <= 150, "{dpi}: {} {}", full.width, s.width);
+            assert_eq!(l.cut, vec![true]);
+            // Ink stops inside the box: nothing is drawn in the right padding.
+            let pad = (8.0 * widget::scale(dpi)) as i32;
+            let inked = |x: i32| (0..s.height).any(|y| px(&s, x, y)[3] > 100);
+            assert!((s.width - pad..s.width).all(|x| !inked(x)), "{dpi}");
+            assert!((0..s.width).any(inked));
+        }
     }
 }
