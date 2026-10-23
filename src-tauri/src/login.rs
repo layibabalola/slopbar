@@ -216,6 +216,13 @@ pub fn logout(provider: Provider, source: &Source, dir: &Path, native: &str) {
 
 impl ProcessTree {
     pub fn spawn(command: &mut Command, visible: bool) -> std::io::Result<(Child, Self)> {
+        Self::spawn_with(command, visible, false)
+    }
+
+    /// `breakaway`: a process in the tree may leave it by asking to (`CREATE_BREAKAWAY_FROM_JOB`).
+    /// Only SlopBar's own sign-in page launcher asks (see `signin::open`), so the browser window
+    /// it opens outlives the sign-in; the CLIs never ask, so they still die with the tree.
+    pub fn spawn_with(command: &mut Command, visible: bool, breakaway: bool) -> std::io::Result<(Child, Self)> {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -234,7 +241,7 @@ impl ProcessTree {
         #[cfg(not(windows))]
         let _ = visible;
         let mut child = command.spawn()?;
-        let result = Self::attach(&child);
+        let result = Self::attach_with(&child, breakaway);
         #[cfg(windows)]
         let result = result.and_then(|tree| {
             resume(&child)?;
@@ -431,7 +438,12 @@ pub struct ProcessTree(windows_sys::Win32::Foundation::HANDLE);
 unsafe impl Send for ProcessTree {}
 #[cfg(windows)]
 impl ProcessTree {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn attach(child: &Child) -> std::io::Result<Self> {
+        Self::attach_with(child, false)
+    }
+
+    fn attach_with(child: &Child, breakaway: bool) -> std::io::Result<Self> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::*;
         let tree = Self(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) });
@@ -439,7 +451,8 @@ impl ProcessTree {
             return Err(std::io::Error::last_os_error());
         }
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | if breakaway { JOB_OBJECT_LIMIT_BREAKAWAY_OK } else { 0 };
         let ok = unsafe {
             SetInformationJobObject(
                 tree.0,
@@ -473,6 +486,10 @@ impl Drop for ProcessTree {
 impl ProcessTree {
     pub fn attach(_: &Child) -> std::io::Result<Self> {
         Ok(Self)
+    }
+
+    fn attach_with(child: &Child, _: bool) -> std::io::Result<Self> {
+        Self::attach(child)
     }
 }
 

@@ -61,6 +61,29 @@ const MESSAGES = {
     bulkConnecting: "Monitoring sign-in {i} of {n}: sign in as {account} in the terminal that opened.",
     bulkConnectStopped: "Stopped after {done} of {n}: {error}",
     bulkConnectDone: "Monitoring connected for {n} accounts.",
+    signInAll: "Sign in all accounts",
+    signInAllButton: "Sign in all",
+    signInAllHint: "{n} sign-ins for {e} emails, one email at a time: sign in to Google once per email, then each sign-in takes a click.",
+    signInAllNone: "Every account is signed in and monitored.",
+    signInAllMonitoring: "Also connect monitoring",
+    signInAllMonitoringHint: "Each account then signs in twice: once to use it, once for monitoring. Both take a click once Google is signed in.",
+    signInAllAdding: "Email {g} of {e}, sign-in {i} of {n}: sign in as {account} {where}.",
+    signInAllConnecting: "Email {g} of {e}, sign-in {i} of {n} (monitoring): sign in as {account} {where}.",
+    signInAllDone: "Finished {n} sign-ins.",
+    signInWhereBrowser: "in the browser window that opened",
+    signInWhereTerminal: "in the terminal that opened",
+    signinWindow: "Sign-in window",
+    signinWindowHint: "Where sign-ins open their page. A profile per email keeps its Google and provider cookies on this PC, so signing in again takes one click.",
+    signinWindow_profile: "A browser profile per email",
+    signinWindow_private: "A private window (asks for Google each time)",
+    signinWindow_system: "The default browser",
+    signinForget: "Forget sign-in profiles",
+    signinForgetButton: "Forget",
+    signinForgetHint: "{n} sign-in profiles on this PC hold Google and provider cookies.",
+    signinForgetNone: "No sign-in profiles on this PC.",
+    signinForgetConfirm: "Delete {n} sign-in profiles with their cookies? Accounts stay signed in to SlopBar; the next sign-in asks for Google again.",
+    signinForgotten: "Deleted {n} sign-in profiles.",
+    signin_profiles_busy: "A sign-in profile is still open in a browser window. Close those windows and try again.",
     bulkRemove: "Remove lapsed accounts",
     bulkRemoveButton: "Remove…",
     bulkRemoveHint: "Plan ended: {list}",
@@ -1745,7 +1768,7 @@ const CLI_NAME = { Claude: "Claude Code", Codex: "Codex" };
 
 export function errorText(provider, code) {
   const vars = { provider: CLI_NAME[provider] ?? provider };
-  if (code.startsWith("monitor_")) return t(code);
+  if (code.startsWith("monitor_") || code.startsWith("signin_")) return t(code);
   if (code === "token_expired" || code === "token_invalid" || code === "bad_response") return t(code, vars);
   if (code === "idle") return t("idle");
   if (code === "rate_limited") return t("rateLimited");

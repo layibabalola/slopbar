@@ -173,6 +173,9 @@ pub struct Settings {
     /// Where to look for CLI sign-ins in WSL (see `sources::WslScan`): by default only distros
     /// already running, plus stopped ones that held sign-ins before.
     pub wsl_accounts: crate::sources::WslScan,
+    /// Where CLI sign-ins open their web page (see `signin`): a browser profile per email unless
+    /// the user picks a private window or the default browser.
+    pub signin_window: crate::signin::Window,
 }
 
 /// Phone alerts through a push service (ntfy). The access token is not here: it is kept with
@@ -277,6 +280,7 @@ impl Default for Settings {
             onboarding_dismissed: false,
             native_widget: true,
             wsl_accounts: crate::sources::WslScan::Auto,
+            signin_window: crate::signin::Window::Profile,
         }
     }
 }
@@ -286,6 +290,12 @@ impl Default for Settings {
 /// can ask for them.
 pub fn app_dir() -> Option<PathBuf> {
     isolated_dir().or_else(|| dirs::config_dir().map(|d| d.join(IDENTIFIER)))
+}
+
+/// The app's machine-local data folder (`%LOCALAPPDATA%\dev.thelio.slopbar`), for what must not
+/// roam with the Windows profile, such as the sign-in browser profiles.
+pub fn local_dir() -> Option<PathBuf> {
+    isolated_dir().map(|d| d.join("local")).or_else(|| dirs::data_local_dir().map(|d| d.join(IDENTIFIER)))
 }
 
 pub fn legacy_app_dir() -> Option<PathBuf> {

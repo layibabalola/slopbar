@@ -874,6 +874,8 @@ async function render() {
   $("codex").checked = settings.providers.codex;
   $("wsl-accounts").innerHTML = ["auto", "on", "off"].map((v) => `<option value="${v}">${t(`wsl_${v}`)}</option>`).join("");
   $("wsl-accounts").value = settings.wsl_accounts ?? "auto";
+  $("signin-window").innerHTML = ["profile", "private", "system"].map((v) => `<option value="${v}">${t(`signinWindow_${v}`)}</option>`).join("");
+  $("signin-window").value = settings.signin_window ?? "profile";
   $("startup").checked = settings.launch_at_login;
   $("auto-update").checked = updatesEnabled && settings.auto_update;
   $("auto-update").disabled = !updatesEnabled;
@@ -927,6 +929,7 @@ $("export-diagnostics").addEventListener("click", async () => {
 $("crash-records").addEventListener("change", (e) => update({ crash_records: e.target.checked }));
 $("auto-monitoring").addEventListener("change", (e) => update({ auto_connect_monitoring: e.target.checked }));
 $("wsl-accounts").addEventListener("change", (e) => update({ wsl_accounts: e.target.value }));
+$("signin-window").addEventListener("change", (e) => update({ signin_window: e.target.value }));
 // Reads every WSL distro once, starting stopped ones, then refreshes.
 $("wsl-rescan").addEventListener("click", async () => {
   const button = $("wsl-rescan");
@@ -1258,12 +1261,26 @@ $("hotkey").addEventListener("keydown", (e) => { if (e.key === "Enter") saveHotk
 // Bulk actions (Accounts): monitoring for every unmonitored account, one sign-in at a time, and
 // removing accounts whose plan has ended.
 
-let bulk = { unmonitored: [], lapsed: { remove: [], in_use: [] }, connecting: null };
+let bulk = { unmonitored: [], lapsed: { remove: [], in_use: [] }, connecting: null, sign_in: [], signin_profiles: 0 };
 const who = (target) => target.account || t("unknownAccount");
+
+/** "Sign in all accounts" as it would run now: its groups (one per email) and sign-ins. */
+function signInPlan() {
+  const monitoring = $("sign-in-all-monitoring").checked;
+  const groups = (bulk.sign_in ?? [])
+    .map((g) => ({ ...g, steps: g.steps.filter((s) => monitoring || s.kind === "add") }))
+    .filter((g) => g.steps.length);
+  return { groups, steps: groups.reduce((n, g) => n + g.steps.length, 0), monitoring };
+}
 
 function renderBulk() {
   const c = bulk.connecting;
   const running = c && !c.finished;
+  const plan = signInPlan();
+  $("sign-in-all").disabled = running || !plan.steps;
+  $("sign-in-all-hint").textContent = plan.steps ? t("signInAllHint", { n: plan.steps, e: plan.groups.length }) : t("signInAllNone");
+  $("signin-forget").disabled = !bulk.signin_profiles;
+  $("signin-forget-hint").textContent = bulk.signin_profiles ? t("signinForgetHint", { n: bulk.signin_profiles }) : t("signinForgetNone");
   $("bulk-connect").disabled = running || !bulk.unmonitored.length;
   $("bulk-connect-hint").textContent = bulk.unmonitored.length ? t("bulkConnectHint", { n: bulk.unmonitored.length }) : t("bulkConnectNone");
   $("bulk-remove").disabled = !bulk.lapsed.remove.length;
@@ -1271,15 +1288,37 @@ function renderBulk() {
     ? t("bulkRemoveHint", { list: bulk.lapsed.remove.map(who).join(", ") })
     : bulk.lapsed.in_use.length ? t("bulkRemoveInUse", { list: bulk.lapsed.in_use.map(who).join(", ") }) : t("bulkRemoveNone");
   const status = $("bulk-status");
-  if (running && c.current) status.textContent = t("bulkConnecting", { i: c.done + 1, n: c.total, account: who(c.current) });
+  const where = settings.signin_window === "system" ? t("signInWhereTerminal") : t("signInWhereBrowser");
+  if (running && c.current && c.emails) {
+    status.textContent = t(c.kind === "add" ? "signInAllAdding" : "signInAllConnecting",
+      { g: c.email, e: c.emails, i: c.done + 1, n: c.total, account: who(c.current), where });
+  } else if (running && c.current) status.textContent = t("bulkConnecting", { i: c.done + 1, n: c.total, account: who(c.current) });
   else if (c?.finished && c.error) status.textContent = t("bulkConnectStopped", { done: c.done, n: c.total, error: errorText("", c.error) });
-  else if (c?.finished && c.total) status.textContent = t("bulkConnectDone", { n: c.total });
+  else if (c?.finished && c.total) status.textContent = t(c.emails ? "signInAllDone" : "bulkConnectDone", { n: c.total });
   status.hidden = !(running || (c?.finished && c.total)) || !status.textContent;
 }
 async function loadBulk() {
   bulk = await invoke("bulk_status").catch(() => bulk);
   renderBulk();
 }
+$("sign-in-all").addEventListener("click", async () => {
+  $("sign-in-all").disabled = true;
+  try { await invoke("sign_in_all_accounts", { monitoring: $("sign-in-all-monitoring").checked }); } catch (err) { alert(errorText("", String(err))); }
+  loadBulk();
+});
+$("sign-in-all-monitoring").addEventListener("change", renderBulk);
+$("signin-forget").addEventListener("click", async () => {
+  if (!confirm(t("signinForgetConfirm", { n: bulk.signin_profiles }))) return;
+  $("signin-forget").disabled = true;
+  const status = $("bulk-status");
+  try {
+    status.textContent = t("signinForgotten", { n: await invoke("forget_signin_profiles") });
+  } catch (err) {
+    status.textContent = errorText("", String(err));
+  }
+  status.hidden = false;
+  loadBulk();
+});
 $("bulk-connect").addEventListener("click", async () => {
   $("bulk-connect").disabled = true;
   try { await invoke("connect_monitoring_all"); } catch (err) { alert(errorText("", String(err))); }

@@ -150,6 +150,15 @@ pub enum Request {
         #[serde(default)]
         confirm: bool,
     },
+    /// "Sign in all accounts" (see `bulk::sign_in_plan`): pending accounts signed in again and, with
+    /// `monitoring` (default true), monitoring for each account without it, by email. Without
+    /// `confirm` only says what it would open.
+    SignInAll {
+        #[serde(default)]
+        confirm: bool,
+        #[serde(default = "yes")]
+        monitoring: bool,
+    },
     /// Remove every account whose plan has ended (see `bulk::lapsed`). Without `confirm` only
     /// says which accounts that would be.
     RemoveLapsedAccounts {
