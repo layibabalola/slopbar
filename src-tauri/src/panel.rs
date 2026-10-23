@@ -59,9 +59,10 @@ async fn build(app: &AppHandle) {
     }
     BUILDING.store(false, Ordering::Release);
     let Some(win) = built else { return };
-    let _ = win;
     if SHOW_WHEN_BUILT.swap(false, Ordering::AcqRel) {
         show(app);
+    } else {
+        set_webview_visible(&win, false);
     }
 }
 
@@ -178,11 +179,23 @@ pub fn on_blur(app: &AppHandle) {
 /// empty panel. `inspect` does the same when it shows a hidden window off-screen.
 #[cfg(windows)]
 fn set_webview_visible(win: &tauri::WebviewWindow, visible: bool) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_3;
+    use webview2_com::TrySuspendCompletedHandler;
+    use windows::core::Interface;
     let _ = win.with_webview(move |w| unsafe {
         let controller = w.controller();
-        let _ = controller.SetIsVisible(visible);
+        let webview = controller.CoreWebView2().ok().and_then(|c| c.cast::<ICoreWebView2_3>().ok());
         if visible {
+            if let Some(webview) = &webview {
+                let _ = webview.Resume();
+            }
+            let _ = controller.SetIsVisible(true);
             let _ = controller.NotifyParentWindowPositionChanged();
+        } else {
+            let _ = controller.SetIsVisible(false);
+            if let Some(webview) = &webview {
+                let _ = webview.TrySuspend(&TrySuspendCompletedHandler::create(Box::new(|_, _| Ok(()))));
+            }
         }
     });
 }
