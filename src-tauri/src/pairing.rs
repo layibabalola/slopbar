@@ -99,9 +99,9 @@ pub fn remote_command(args: &[&str]) -> String {
         "$ErrorActionPreference = 'Stop'\n",
         "$exe = Join-Path $env:LOCALAPPDATA 'SlopBar\\slopbar-mcp.exe'\n",
         "if (-not (Test-Path -LiteralPath $exe)) {{ '{{\"error\":\"slopbar_not_installed\"}}'; exit 3 }}\n",
-        // Capturing the output makes PowerShell wait for this windowless program and pass it its
-        // standard input.
-        "$out = & $exe {}\n",
+        // A pipeline stage, not just capturing it, makes Windows PowerShell wait for this windowless
+        // program; it still inherits standard input.
+        "$out = & $exe {} | ForEach-Object {{ $_ }}\n",
         "$code = $LASTEXITCODE\n",
         "$out\n",
         "exit $code\n"), quoted.join(" "));
@@ -518,7 +518,7 @@ mod tests {
         let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
         let units: Vec<u16> = bytes.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         let script = String::from_utf16(&units).unwrap();
-        assert!(script.contains("$out = & $exe '--call-b64' 'it''s'"), "{script}");
+        assert!(script.contains("$out = & $exe '--call-b64' 'it''s' | ForEach-Object { $_ }"), "{script}");
         assert!(script.contains("SlopBar\\slopbar-mcp.exe"));
     }
 
