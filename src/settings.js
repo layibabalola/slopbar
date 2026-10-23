@@ -1354,11 +1354,14 @@ function renderBulk() {
   const c = bulk.connecting;
   const running = c && !c.finished;
   const plan = signInPlan();
-  $("sign-in-all").disabled = running || !plan.steps;
+  // While one runs, either button stops it (its sign-in closes with its browser).
+  $("sign-in-all").disabled = !running && !plan.steps;
+  $("sign-in-all").textContent = t(running ? "signInAllStop" : "signInAllButton");
+  $("bulk-connect").textContent = t(running ? "signInAllStop" : "bulkConnectButton");
   $("sign-in-all-hint").textContent = plan.steps ? t("signInAllHint", { n: plan.steps, e: plan.groups.length }) : t("signInAllNone");
   $("signin-forget").disabled = !bulk.signin_profiles;
   $("signin-forget-hint").textContent = bulk.signin_profiles ? t("signinForgetHint", { n: bulk.signin_profiles }) : t("signinForgetNone");
-  $("bulk-connect").disabled = running || !bulk.unmonitored.length;
+  $("bulk-connect").disabled = !running && !bulk.unmonitored.length;
   $("bulk-connect-hint").textContent = bulk.unmonitored.length ? t("bulkConnectHint", { n: bulk.unmonitored.length }) : t("bulkConnectNone");
   $("bulk-remove").disabled = !bulk.lapsed.remove.length;
   $("bulk-remove-hint").textContent = bulk.lapsed.remove.length
@@ -1378,7 +1381,9 @@ async function loadBulk() {
   bulk = await invoke("bulk_status").catch(() => bulk);
   renderBulk();
 }
+const stopping = () => bulk.connecting && !bulk.connecting.finished;
 $("sign-in-all").addEventListener("click", async () => {
+  if (stopping()) return void invoke("stop_sign_ins").finally(loadBulk);
   $("sign-in-all").disabled = true;
   try { await invoke("sign_in_all_accounts", { monitoring: $("sign-in-all-monitoring").checked }); } catch (err) { alert(errorText("", String(err))); }
   loadBulk();
@@ -1397,6 +1402,7 @@ $("signin-forget").addEventListener("click", async () => {
   loadBulk();
 });
 $("bulk-connect").addEventListener("click", async () => {
+  if (stopping()) return void invoke("stop_sign_ins").finally(loadBulk);
   $("bulk-connect").disabled = true;
   try { await invoke("connect_monitoring_all"); } catch (err) { alert(errorText("", String(err))); }
   loadBulk();
