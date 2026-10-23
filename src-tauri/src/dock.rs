@@ -483,6 +483,18 @@ struct Frame {
     scale: f64,
 }
 
+/// Whether `win` is still the foreground window. A webview window reports a blur when the
+/// keyboard focus moves into its own WebView2 child, which is not the user going elsewhere.
+#[cfg(windows)]
+pub fn is_foreground(win: &WebviewWindow) -> bool {
+    let fg = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() } as isize;
+    fg != 0 && handle(win) == Some(fg)
+}
+#[cfg(not(windows))]
+pub fn is_foreground(_: &WebviewWindow) -> bool {
+    false
+}
+
 /// The widget window's handle.
 #[cfg(windows)]
 fn handle(win: &WebviewWindow) -> Option<isize> {
