@@ -29,6 +29,8 @@ const WM_REDRAW: u32 = wm::WM_APP + 3;
 const TIMER: usize = 1;
 /// How long a notice replaces the rings, as `showToast` in main.js.
 const TOAST: Duration = Duration::from_secs(4);
+/// Two rings' width in DIPs (the widget's usual width).
+const RINGS: f32 = 66.0;
 const MENU_REFRESH: usize = 1;
 const MENU_SETTINGS: usize = 2;
 const MENU_QUIT: usize = 3;
@@ -41,6 +43,8 @@ pub struct Place {
     pub w: i32,
     pub h: i32,
     pub dpi: u32,
+    /// How wide it may be there without reaching over the taskbar's other buttons.
+    pub room: i32,
 }
 
 /// What the app side tells the widget thread.
@@ -84,7 +88,12 @@ fn post(msg: u32) {
 
 /// The widget's width at `dpi`, in physical pixels: what dock.rs docks.
 pub fn width_px(dpi: u32) -> i32 {
-    widget::physical(shared(|s| s.width).unwrap_or(66.0), dpi)
+    widget::physical(shared(|s| s.width).unwrap_or(RINGS), dpi)
+}
+
+/// Two rings' width at `dpi`: what dock.rs finds room for, however wide a notice is.
+pub fn rings_px(dpi: u32) -> i32 {
+    widget::physical(RINGS, dpi)
 }
 
 /// Moves (and redraws) the widget; a no-op when it is already there.
@@ -191,7 +200,8 @@ pub fn inspect(app: &AppHandle) -> Result<(String, Vec<u8>, bool), String> {
     let (place, theme, open) = shared(|s| (s.shown.or(s.want), s.theme, s.open)).unwrap_or((None, Theme::Dark, false));
     let (dpi, h) = place.map_or((96, 48), |p| (p.dpi, p.h));
     let renderer = Renderer::new().map_err(|e| e.to_string())?;
-    let (surface, _) = renderer.draw(&view, Look { theme, hot: open, pressed: false }, dpi, h).ok_or("drawing failed")?;
+    let look = Look { theme, hot: open, pressed: false };
+    let (surface, _) = renderer.draw_within(&view, look, dpi, h, place.map(|p| p.room)).ok_or("drawing failed")?;
     Ok((text, surface.png(), visible()))
 }
 
@@ -436,10 +446,10 @@ fn redraw(hwnd: HWND) {
         let Some(renderer) = l.renderer.as_ref() else { return };
         let (dpi, h) = want.map_or((96, 48), |p| (p.dpi, p.h));
         let look = Look { theme, hot: l.hot || open, pressed: l.pressed };
-        let Some((surface, layout)) = renderer.draw(&view, look, dpi, h) else { return };
+        let Some((surface, layout)) = renderer.draw_within(&view, look, dpi, h, want.map(|p| p.room)) else { return };
         let width = layout.width;
         let tips = widget::tips(&view, &layout, &lang_of_app());
-        let shown = want.map(|p| Place { x: p.x + p.w - surface.width, y: p.y, w: surface.width, h: surface.height, dpi });
+        let shown = want.map(|p| Place { x: p.x + p.w - surface.width, y: p.y, w: surface.width, h: surface.height, dpi, room: p.room });
         unsafe {
             let dst = shown.map(|p| POINT { x: p.x, y: p.y });
             let size = SIZE { cx: surface.width, cy: surface.height };
