@@ -46,9 +46,10 @@ With SSH to the new computer (OpenSSH key auth or Tailscale SSH; the README's fi
 instead, with no passphrase for anyone to type: get_machine_readiness with ssh_host checks it (SlopBar running there, someone \
 signed in at its desktop, a browser); pair_machine with ssh_host pairs it (the key goes over SSH and is never shown); \
 run_on_machine with get_roster lists the accounts waiting there. Then tell the user to sit at that computer's screen, and \
-only once they say they are there, run_on_machine with sign_in_all (confirm: true): the sign-in pages open on that \
+only once they say they are there, run_on_machine with sign_in_all (confirm: true; the same for connect_monitoring_all): the sign-in pages open on that \
 computer's desktop, never in the SSH session, and are refused while that desktop is locked or not shown. Guide the user \
-email by email (run_on_machine get_roster or get_usage shows progress); never sign in or approve anything yourself.";
+email by email (run_on_machine get_roster or get_usage shows progress); never sign in or approve anything yourself. \
+Results name accounts by email: keep emails out of commits, pull requests and anything you publish.";
 
 fn schema(properties: Value, required: &[&str]) -> Value {
     let mut schema = json!({ "type": "object", "properties": properties, "additionalProperties": false });
@@ -243,10 +244,13 @@ fn catalog() -> Vec<Tool> {
             schema(json!({
                 "passphrase": { "type": ["string", "null"], "description": "Supplied by the user; null deletes it." },
             }), &["passphrase"]), false, true, true, false),
-        tool("get_machine_readiness", "Get machine readiness", "Whether a computer is ready for sign_in_all: app (running, version, build), desktop (the Windows session SlopBar runs in: state active or disconnected, locked), browser (edge or chrome, for sign-in pages), roster (as get_roster, waiting as a count), accounts here, waiting (the accounts to sign in: provider, id, email), ready_for_sign_in, problems (codes such as no_desktop_session, desktop_locked, app_not_running, roster_off, no_roster_key) and next (what to do). With ssh_host, asks that computer over SSH (key auth, BatchMode; a ~/.ssh/config alias, host name or Tailscale name); without, this one. Works when SlopBar is not running: it then says whether anyone is signed in at the desktop.",
+        tool("get_machine_readiness", "Get machine readiness", "Whether a computer is ready for sign_in_all: app (running, version, build), desktop (the Windows session SlopBar runs in: state active or disconnected, locked), idle_seconds (since the last keyboard or mouse input there), browser (edge or chrome, for sign-in pages), roster (as get_roster, waiting as a count), accounts here, waiting (the accounts to sign in: provider, id, email), ready_for_sign_in, problems (codes such as no_desktop_session, desktop_locked, app_not_running, roster_off, no_roster_key) and next (what to do). With ssh_host, asks that computer over SSH (key auth, BatchMode; a ~/.ssh/config alias, host name or Tailscale name); without, this one. Works when SlopBar is not running: it then says whether anyone is signed in at the desktop.",
             schema(json!({ "ssh_host": { "type": "string", "description": "Another of the user's computers, as ssh reaches it (alias from ~/.ssh/config, host name, Tailscale name or user@host)." } }), &[]), true, false, true, true),
-        tool("pair_machine", "Pair another computer", "Brings another of the user's computers onto this computer's account roster over SSH, so nobody types a roster passphrase: checks the other computer's SlopBar is running, turns the roster on here, uses this computer's roster passphrase (or, with none saved, generates a 256-bit key and saves it here), sends it over the SSH connection's input to the other computer's SlopBar, which points sharing at the same rclone remote (or keeps its own synced folder), turns its roster on and saves the key with DPAPI, then syncs both. The key never appears in arguments, results, errors or logs. Replaces any roster passphrase saved on the other computer. Needs a sharing location here and SSH key auth to the other computer. Only when the user asked to pair or set up that computer.",
-            schema(json!({ "ssh_host": { "type": "string", "description": "The computer to pair, as ssh reaches it." } }), &["ssh_host"]), false, true, true, true),
+        tool("pair_machine", "Pair another computer", "Brings another of the user's computers onto this computer's account roster over SSH, so nobody types a roster passphrase: checks the other computer's SlopBar is running, turns the roster on here, uses this computer's roster passphrase (or, with none saved, generates a 256-bit key and saves it here), sends it over the SSH connection's input to the other computer's SlopBar, which points sharing at the same rclone remote (or keeps its own synced folder), turns its roster on and saves the key with DPAPI, then syncs both. The key never appears in arguments, results, errors or logs. When the other computer already has a different roster passphrase it refuses (target_has_other_key) unless replace_key is true. Needs a sharing location here and SSH key auth to the other computer. Only when the user asked to pair or set up that computer.",
+            schema(json!({
+                "ssh_host": { "type": "string", "description": "The computer to pair, as ssh reaches it." },
+                "replace_key": { "type": "boolean", "description": "Replace a different roster passphrase the other computer already has (its own other computers then need pairing again). Default false: pairing refuses instead. Only when the user said so." },
+            }), &["ssh_host"]), false, true, true, true),
         tool("run_on_machine", "Run a tool on another computer", "Runs one SlopBar tool on another of the user's computers over SSH and returns its result: get_machine_readiness, get_app_info, get_health, get_usage, get_settings, list_sharing_locations, get_roster, sync_roster, update_settings, sign_in_all, connect_monitoring_all, refresh_usage or restart_app (never tools that take a passphrase). Each tool's own rules apply as if called there; sign-ins open on that computer's desktop through its running SlopBar, never in the SSH session, and are refused while nobody can see that desktop (locked or not shown). Call sign_in_all there with confirm: true only after the user said they are at that computer's screen.",
             schema(json!({
                 "ssh_host": { "type": "string", "description": "The computer, as ssh reaches it." },
@@ -272,7 +276,7 @@ fn tools() -> Value {
 fn local_args(name: &str) -> Option<(&'static [&'static str], &'static [&'static str])> {
     match name {
         "get_machine_readiness" => Some((&["ssh_host"], &[])),
-        "pair_machine" => Some((&["ssh_host"], &["ssh_host"])),
+        "pair_machine" => Some((&["ssh_host", "replace_key"], &["ssh_host"])),
         "run_on_machine" => Some((&["ssh_host", "tool", "arguments"], &["ssh_host", "tool"])),
         _ => None,
     }
@@ -287,8 +291,8 @@ fn check_local(name: &str, args: &Value) -> Option<Result<(), String>> {
     if let Some(k) = required.iter().find(|k| !map.contains_key(**k)) {
         return Some(Err(format!("Invalid arguments: {k} is required")));
     }
-    let typed = map.iter().all(|(k, v)| if k == "arguments" { v.is_object() } else { v.is_string() });
-    Some(if typed { Ok(()) } else { Err("Invalid arguments: ssh_host and tool are strings, arguments an object".into()) })
+    let typed = map.iter().all(|(k, v)| match k.as_str() { "arguments" => v.is_object(), "replace_key" => v.is_boolean(), _ => v.is_string() });
+    Some(if typed { Ok(()) } else { Err("Invalid arguments: ssh_host and tool are strings, arguments an object, replace_key a boolean".into()) })
 }
 
 /// The door request for a tool call, or a message for the agent when the arguments are wrong.
@@ -410,6 +414,8 @@ fn explain(error: &str) -> String {
         "slopbar_not_installed" => "SlopBar is not installed for that user on the other computer (no %LOCALAPPDATA%\\SlopBar\\slopbar-mcp.exe).".into(),
         "remote_no_answer" => "The other computer answered without a SlopBar result: its SlopBar may predate pairing; update it there first.".into(),
         "pairing_unreadable" | "pairing_unsupported" => "The pairing offer could not be read: update SlopBar on both computers to the same version.".into(),
+        "app_outdated" => "The SlopBar running there is older than its helper and does not check that someone can see its desktop; nothing was started. Update it (and restart it through restart_app), then try again.".into(),
+        "target_has_other_key" => "The other computer already has a different roster passphrase, which its own other computers may share; nothing was changed. Ask the user whether to replace it (pair_machine with replace_key: true).".into(),
         "not_from_a_remote_call" => "A computer reached over SSH cannot reach on to another one.".into(),
         e if e.starts_with("ssh_failed") => format!("SSH could not run the command ({}). Check key auth with: ssh -o BatchMode=yes <host> hostname; see the README's field guide.",
             e.trim_start_matches("ssh_failed").trim_start_matches(':').trim().chars().filter(|c| !c.is_control()).take(200).collect::<String>()),
@@ -590,6 +596,13 @@ fn serve<W: Write + Send + 'static>(mut input: impl BufRead, out: W) -> std::io:
 /// Runs one tool as a tool call would and returns its result or its error text. `remote_ok` is
 /// false for a `--call` (reached over SSH from another computer).
 fn run_tool(name: &str, args: Value, pipe: &str, remote_ok: bool) -> Result<Value, String> {
+    // Called in from another computer: a sign-in reaches only an app that refuses it while
+    // nobody sees the desktop (older ones did not check).
+    if !remote_ok && matches!(name, "sign_in_all" | "connect_monitoring_all") && args.get("confirm") == Some(&Value::Bool(true)) {
+        if let Err(e) = crate::door::call(pipe, &Request::GetReadiness) {
+            return Err(explain(if e == "unsupported_request" { "app_outdated" } else { &e }));
+        }
+    }
     let message = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } });
     let cancelled = Mutex::new(HashSet::new());
     let outcome = match step(&message, &crate::door::exports_dir, &cancelled) {
@@ -628,7 +641,9 @@ pub fn call_cli(args: &[String]) -> i32 {
             }
         },
     };
-    let outcome = parsed.and_then(|(tool, arguments)| run_tool(&tool, arguments, &crate::door::pipe_name(), false));
+    // Only `--call-b64` is how another computer calls in; from a shell here, ssh_host is fine.
+    let remote_ok = args.first().map(String::as_str) == Some("--call");
+    let outcome = parsed.and_then(|(tool, arguments)| run_tool(&tool, arguments, &crate::door::pipe_name(), remote_ok));
     print_answer(outcome)
 }
 
@@ -647,7 +662,8 @@ fn print_answer(outcome: Result<Value, String>) -> i32 {
 /// standard input (see `pairing::receive`). Prints the outcome, never the key.
 pub fn pair_receive() -> i32 {
     let door = crate::pairing::LocalDoor(crate::door::pipe_name());
-    let outcome = crate::pairing::receive(&door, &mut std::io::stdin().lock()).map(sanitize).map_err(|e| explain(&e));
+    let saved = crate::settings::app_dir().and_then(|d| crate::roster::load_passphrase(&d));
+    let outcome = crate::pairing::receive(&door, &mut std::io::stdin().lock(), saved).map(sanitize).map_err(|e| explain(&e));
     print_answer(outcome)
 }
 

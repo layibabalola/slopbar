@@ -999,6 +999,11 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Re
                 if !still {
                     continue;
                 }
+                // Locked or left since the queue started: stop rather than open a page nobody sees.
+                if let Err(problem) = desktop_shown() {
+                    error = Some(problem);
+                    break 'groups;
+                }
                 let session = group_session.get_or_insert_with(|| signin_session(&h)).clone();
                 let run = async {
                     // Another sign-in is open (one the user or automatic monitoring started): wait for it.
@@ -2387,7 +2392,7 @@ async fn readiness(app: &AppHandle) -> serde_json::Value {
     summary["waiting"] = waiting.as_array().map_or(0, Vec::len).into();
     serde_json::json!({
         "app": { "running": true, "version": app_version(app.clone()), "build": diagnostics::build_info(), "pid": std::process::id() },
-        "desktop": desktop, "browser": browser, "signin_window": signin_window,
+        "desktop": desktop, "idle_seconds": desktop::idle_seconds(), "browser": browser, "signin_window": signin_window,
         "accounts": { "here": snapshot.accounts.len(), "unmonitored": bulk::unmonitored(&snapshot).len() },
         "roster": summary, "waiting": waiting,
         "ready_for_sign_in": ready, "problems": problems, "next": next,

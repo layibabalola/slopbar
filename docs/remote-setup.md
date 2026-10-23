@@ -91,6 +91,9 @@ The agent should:
    generates a 256-bit key when there is none), sends it over the SSH connection's input to the
    new computer's SlopBar, which saves it with Windows DPAPI as it saves any roster passphrase,
    and syncs both rosters. The key never appears in the tool's arguments, results, errors or logs.
+   Nothing changes on either computer until the new one has shown it can share where this one
+   does. If the new computer already has a different roster passphrase, pairing refuses unless you
+   tell the agent to replace it (`replace_key: true`).
 3. Call `run_on_machine` with `tool: "get_roster"` to list the accounts waiting there.
 4. Ask you to sit at the new computer's screen, and wait until you say you are there.
 5. Call `run_on_machine` with `tool: "sign_in_all"` and `arguments: { "confirm": true }`. Sign-in
