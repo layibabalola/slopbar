@@ -1,4 +1,4 @@
-use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, panel, phone, pins, plan_alerts, presence, providers, reset_credits, roster, settings, signin, sources, subscriptions, unexpected, updates, usage_index, wind_down};
+use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, desktop, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, pairing, panel, phone, pins, plan_alerts, presence, providers, reset_credits, roster, settings, signin, sources, subscriptions, unexpected, updates, usage_index, wind_down};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -515,12 +515,14 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::RecordSession { session_id, cwd, config_dir } => record_session(&app, session_id, cwd, config_dir).await,
         R::Turn { session_id, event, config_dir } => record_turn(&app, session_id, event, config_dir).await,
         R::AddAccount { provider } => {
+            desktop_shown()?;
             // One pending sign-in per provider, so a retrying agent cannot flood the desktop.
             let pending = app.state::<AppState>().account_operations.begin(provider, "add-account")?;
             start_add_account(app.clone(), provider, Some(pending)).await?;
             Ok(serde_json::json!({ "started": true, "next": "The user completes the sign-in in the terminal that opened; the account then appears in get_usage." }))
         }
         R::ConnectMonitoring { provider, id } => {
+            desktop_shown()?;
             connect_monitoring(app.clone(), provider, id).await?;
             Ok(serde_json::json!({ "started": true, "next": "The user completes the monitoring sign-in that opened; get_usage then shows monitor_connected." }))
         }
@@ -541,6 +543,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
                 return Ok(serde_json::json!({ "started": false, "to_connect": to_connect,
                     "next": "Nothing was started. With confirm: true the sign-ins open one at a time; the user signs in as each account named here." }));
             }
+            desktop_shown()?;
             let queued = connect_all(&app).await?;
             Ok(serde_json::json!({ "started": !queued.is_empty(), "queued": queued,
                 "next": "Each sign-in opens after the previous one finishes; the user signs in as the account named in Settings. get_usage shows monitor_connected as they complete." }))
@@ -550,6 +553,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
                 return Ok(serde_json::json!({ "started": false, "plan": sign_in_plan(&app, monitoring),
                     "next": "Nothing was started. With confirm: true the sign-ins open one at a time, an email's back to back in one fresh browser profile that is closed and deleted when the email is done; the user signs in as each account named here and completes every page." }));
             }
+            desktop_shown()?;
             let plan = sign_in_all(&app, monitoring).await?;
             Ok(serde_json::json!({ "started": !plan.is_empty(), "plan": plan,
                 "next": "Each sign-in opens after the previous one finishes. get_usage shows the accounts and monitor_connected as they complete." }))
@@ -601,6 +605,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::GetHealth => value(health_report(&app).await),
         R::GetRoster { sync } => Ok(roster_status(&app, sync).await),
         R::SyncRoster => Ok(roster_status(&app, true).await),
+        R::GetReadiness => Ok(readiness(&app).await),
         R::SetRosterPassphrase { passphrase } => set_roster_passphrase(&app, passphrase).await,
         R::ListSharingLocations => {
             let (folder, remote) = {
@@ -993,6 +998,11 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Re
                 };
                 if !still {
                     continue;
+                }
+                // Locked or left since the queue started: stop rather than open a page nobody sees.
+                if let Err(problem) = desktop_shown() {
+                    error = Some(problem);
+                    break 'groups;
                 }
                 let session = group_session.get_or_insert_with(|| signin_session(&h)).clone();
                 let run = async {
@@ -2357,6 +2367,36 @@ async fn sync_roster(state: &AppState, settings: &settings::Settings, accounts: 
     if let Some(seen) = seen {
         *state.roster_seen.lock().unwrap() = seen;
     }
+}
+
+/// Sign-ins started through the door (often by an agent over SSH) open windows on this app's
+/// desktop: refused while nobody can see it, so a sign-in never waits unseen (see `desktop`).
+fn desktop_shown() -> Result<(), String> {
+    match desktop::of_process().and_then(|d| d.problem()) {
+        Some(problem) => Err(problem.into()),
+        None => Ok(()),
+    }
+}
+
+/// The door's `get_readiness`: whether sign-ins can run here, and what is waiting.
+async fn readiness(app: &AppHandle) -> serde_json::Value {
+    let roster = roster_status(app, false).await;
+    let desktop = desktop::of_process();
+    let browser = tauri::async_runtime::spawn_blocking(|| signin::find_browser().map(|(k, _)| pairing::browser_name(k))).await.ok().flatten();
+    let (ready, problems, next) = pairing::assess(true, desktop, browser.is_some(), &roster);
+    let state = app.state::<AppState>();
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    let signin_window = state.settings.lock().unwrap().signin_window;
+    let mut summary = roster.clone();
+    let waiting = summary.get_mut("waiting").map(serde_json::Value::take).unwrap_or_default();
+    summary["waiting"] = waiting.as_array().map_or(0, Vec::len).into();
+    serde_json::json!({
+        "app": { "running": true, "version": app_version(app.clone()), "build": diagnostics::build_info(), "pid": std::process::id() },
+        "desktop": desktop, "idle_seconds": desktop::idle_seconds(), "browser": browser, "signin_window": signin_window,
+        "accounts": { "here": snapshot.accounts.len(), "unmonitored": bulk::unmonitored(&snapshot).len() },
+        "roster": summary, "waiting": waiting,
+        "ready_for_sign_in": ready, "problems": problems, "next": next,
+    })
 }
 
 /// Settings > Other computers and the door's `get_roster`. With `sync`, writes and reads the
