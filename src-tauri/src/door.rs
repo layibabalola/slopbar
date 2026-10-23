@@ -196,6 +196,15 @@ pub enum Request {
     },
     /// The self-check Settings > Health shows (see `health`).
     GetHealth,
+    /// The account roster (see `roster`): whether it is on, what this machine last wrote and
+    /// read back, the other machines' rosters, and the accounts waiting to be signed in here.
+    /// With `sync`, writes and reads the rosters first.
+    GetRoster {
+        #[serde(default)]
+        sync: bool,
+    },
+    /// Saves the roster passphrase on this machine (null deletes it), then syncs with it.
+    SetRosterPassphrase { passphrase: Option<crate::backup::Passphrase> },
     /// Where in-use status can be shared: detected sync folders and rclone remotes.
     ListSharingLocations,
     /// Open the provider's billing page in the user's browser (fixed URL per provider).

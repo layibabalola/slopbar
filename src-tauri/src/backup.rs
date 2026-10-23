@@ -129,50 +129,111 @@ fn associated(e: &Envelope) -> Vec<u8> {
     format!("{}|{}|{}|{}|{}|{}|{}|{}|{}", e.format, e.version, e.kdf.algorithm, e.kdf.memory_kib, e.kdf.iterations, e.kdf.parallelism, e.kdf.salt, e.cipher, e.nonce).into_bytes()
 }
 
-/// Encrypts a backup into the file's bytes.
-pub fn seal(contents: &Contents, passphrase: &Passphrase) -> Result<Vec<u8>, String> {
-    check_passphrase(passphrase)?;
-    let plain = serde_json::to_vec(contents).map_err(|_| "backup_unwritable")?;
-    let mut salt = [0u8; 16];
-    chacha20poly1305::aead::rand_core::RngCore::fill_bytes(&mut OsRng, &mut salt);
+/// A key derived from a passphrase with a fresh random salt, at this version's Argon2id cost.
+/// The roster (see `roster`) keeps one per run, so it derives once rather than at every write.
+#[derive(Clone)]
+pub struct SealKey {
+    salt: [u8; 16],
+    key: [u8; 32],
+}
+
+impl std::fmt::Debug for SealKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("SealKey(..)") }
+}
+
+impl SealKey {
+    pub fn new(passphrase: &Passphrase) -> Result<Self, String> {
+        check_passphrase(passphrase)?;
+        let mut salt = [0u8; 16];
+        chacha20poly1305::aead::rand_core::RngCore::fill_bytes(&mut OsRng, &mut salt);
+        let kdf = Kdf { algorithm: KDF.into(), memory_kib: MEMORY_KIB, iterations: ITERATIONS, parallelism: PARALLELISM, salt: String::new() };
+        Ok(SealKey { salt, key: key(passphrase, &kdf, &salt)? })
+    }
+}
+
+/// The key a sealed file asks for: its KDF settings and salt.
+pub(crate) struct KeyRequest<'a> {
+    kdf: &'a Kdf,
+    salt: &'a [u8],
+}
+
+impl KeyRequest<'_> {
+    /// Names the settings and salt, so a caller can keep keys it already derived.
+    pub fn id(&self) -> String {
+        format!("{}|{}|{}|{}", self.kdf.memory_kib, self.kdf.iterations, self.kdf.parallelism, self.kdf.salt)
+    }
+
+    pub fn derive(&self, passphrase: &Passphrase) -> Result<[u8; 32], String> {
+        key(passphrase, self.kdf, self.salt)
+    }
+}
+
+/// Why a sealed file did not open. Each caller names these in its own words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenError {
+    /// Not this envelope, or another format.
+    NotOurs,
+    /// A version, cipher, KDF or KDF cost this build does not open.
+    Unsupported,
+    /// The passphrase is wrong, or the file changed after it was written.
+    WrongOrDamaged,
+}
+
+/// Encrypts `plain` into an envelope of `format`.
+pub(crate) fn seal_bytes(format: &str, plain: &[u8], key: &SealKey) -> Result<Vec<u8>, String> {
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
     let mut envelope = Envelope {
-        format: FORMAT.into(),
+        format: format.into(),
         version: VERSION,
-        kdf: Kdf { algorithm: KDF.into(), memory_kib: MEMORY_KIB, iterations: ITERATIONS, parallelism: PARALLELISM, salt: b64().encode(salt) },
+        kdf: Kdf { algorithm: KDF.into(), memory_kib: MEMORY_KIB, iterations: ITERATIONS, parallelism: PARALLELISM, salt: b64().encode(key.salt) },
         cipher: CIPHER.into(),
         nonce: b64().encode(nonce),
         ciphertext: String::new(),
     };
-    let key = key(passphrase, &envelope.kdf, &salt)?;
     let aad = associated(&envelope);
-    let sealed = XChaCha20Poly1305::new((&key).into())
-        .encrypt(&nonce, Payload { msg: &plain, aad: &aad })
+    let sealed = XChaCha20Poly1305::new((&key.key).into())
+        .encrypt(&nonce, Payload { msg: plain, aad: &aad })
         .map_err(|_| "backup_unwritable")?;
     envelope.ciphertext = b64().encode(sealed);
     serde_json::to_vec_pretty(&envelope).map_err(|_| "backup_unwritable".into())
 }
 
-/// Opens a backup: checks the format and version, then decrypts. A wrong passphrase and a file
-/// changed after it was written fail alike (the AEAD cannot tell them apart).
-pub fn open(bytes: &[u8], passphrase: &Passphrase) -> Result<Contents, String> {
-    if bytes.len() as u64 > MAX_FILE { return Err("backup_not_a_backup".into()); }
-    let envelope: Envelope = serde_json::from_slice(bytes).map_err(|_| "backup_not_a_backup")?;
-    if envelope.format != FORMAT { return Err("backup_not_a_backup".into()); }
+/// Opens an envelope of `format` at most `max` bytes long; `key` supplies the key it asks for.
+pub(crate) fn open_bytes(format: &str, bytes: &[u8], max: u64, key: &mut dyn FnMut(&KeyRequest) -> Result<[u8; 32], String>) -> Result<Vec<u8>, OpenError> {
+    if bytes.len() as u64 > max { return Err(OpenError::NotOurs); }
+    let envelope: Envelope = serde_json::from_slice(bytes).map_err(|_| OpenError::NotOurs)?;
+    if envelope.format != format { return Err(OpenError::NotOurs); }
     if envelope.version != VERSION || envelope.cipher != CIPHER || envelope.kdf.algorithm != KDF {
-        return Err("backup_version_unsupported".into());
+        return Err(OpenError::Unsupported);
     }
     let k = &envelope.kdf;
     if k.memory_kib > MAX_MEMORY_KIB || k.iterations > MAX_ITERATIONS || !(1..=8).contains(&k.parallelism) {
-        return Err("backup_version_unsupported".into());
+        return Err(OpenError::Unsupported);
     }
-    let salt = b64().decode(&k.salt).map_err(|_| "backup_not_a_backup")?;
-    let nonce = b64().decode(&envelope.nonce).ok().filter(|n| n.len() == 24).ok_or("backup_not_a_backup")?;
-    let sealed = b64().decode(&envelope.ciphertext).map_err(|_| "backup_not_a_backup")?;
-    let key = key(passphrase, k, &salt).map_err(|_| "backup_wrong_passphrase_or_damaged")?;
-    let plain = XChaCha20Poly1305::new((&key).into())
+    let salt = b64().decode(&k.salt).map_err(|_| OpenError::NotOurs)?;
+    let nonce = b64().decode(&envelope.nonce).ok().filter(|n| n.len() == 24).ok_or(OpenError::NotOurs)?;
+    let sealed = b64().decode(&envelope.ciphertext).map_err(|_| OpenError::NotOurs)?;
+    let key = key(&KeyRequest { kdf: k, salt: &salt }).map_err(|_| OpenError::WrongOrDamaged)?;
+    XChaCha20Poly1305::new((&key).into())
         .decrypt(XNonce::from_slice(&nonce), Payload { msg: &sealed, aad: &associated(&envelope) })
-        .map_err(|_| "backup_wrong_passphrase_or_damaged")?;
+        .map_err(|_| OpenError::WrongOrDamaged)
+}
+
+/// Encrypts a backup into the file's bytes.
+pub fn seal(contents: &Contents, passphrase: &Passphrase) -> Result<Vec<u8>, String> {
+    let key = SealKey::new(passphrase)?;
+    let plain = serde_json::to_vec(contents).map_err(|_| "backup_unwritable")?;
+    seal_bytes(FORMAT, &plain, &key)
+}
+
+/// Opens a backup: checks the format and version, then decrypts. A wrong passphrase and a file
+/// changed after it was written fail alike (the AEAD cannot tell them apart).
+pub fn open(bytes: &[u8], passphrase: &Passphrase) -> Result<Contents, String> {
+    let plain = open_bytes(FORMAT, bytes, MAX_FILE, &mut |request| request.derive(passphrase)).map_err(|e| match e {
+        OpenError::NotOurs => "backup_not_a_backup",
+        OpenError::Unsupported => "backup_version_unsupported",
+        OpenError::WrongOrDamaged => "backup_wrong_passphrase_or_damaged",
+    })?;
     let contents: Contents = serde_json::from_slice(&plain).map_err(|_| "backup_version_unsupported")?;
     if contents.version != VERSION
         || contents.usage_history.version != crate::subscriptions::VERSION
