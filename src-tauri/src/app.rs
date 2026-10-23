@@ -1,4 +1,4 @@
-use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, panel, phone, pins, plan_alerts, presence, providers, reset_credits, settings, signin, sources, subscriptions, unexpected, updates, usage_index};
+use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, panel, phone, pins, plan_alerts, presence, providers, reset_credits, roster, settings, signin, sources, subscriptions, unexpected, updates, usage_index};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -52,6 +52,10 @@ pub struct AppState {
     pub(crate) sources: Mutex<Vec<sources::Source>>,
     /// Recent readings of unclaimed accounts, to notice use outside this PC.
     presence_tracks: Mutex<presence::Tracks>,
+    /// The account roster's keys and last write (see `roster`), held while it syncs.
+    roster: std::sync::Arc<Mutex<roster::Syncer>>,
+    /// What the roster's last sync found, for Settings, Health and sign-ins.
+    roster_seen: Mutex<roster::Seen>,
     /// Use seen where none of the user's computers is, for a week (see `unexpected`).
     unexpected_log: Mutex<unexpected::Log>,
     /// Plan notifications already shown (renewals, running out), so each is shown once.
@@ -127,6 +131,11 @@ pub(crate) async fn health_report(app: &AppHandle) -> health::Report {
         last_success: seen.last_success,
         door: door::health(),
         sharing: &sharing,
+        roster: {
+            let seen = state.roster_seen.lock().unwrap().clone();
+            health::Roster { enabled: settings.account_roster, passphrase_saved: roster_passphrase_saved(), wrote: seen.wrote, read: seen.read,
+                unreadable: seen.unreadable, waiting: roster_waiting(&state, &snapshot).len() }
+        },
         journal: state.diagnostics.health(),
         notifications: health::Notifications { registered: seen.notifications_registered, app_enabled, system_enabled,
             any_wanted: n.usage || n.resets || n.switches || n.renewals || n.unexpected_use },
@@ -579,6 +588,8 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             value(inspect::inspect(&app, target, page, screenshot).await?)
         }
         R::GetHealth => value(health_report(&app).await),
+        R::GetRoster { sync } => Ok(roster_status(&app, sync).await),
+        R::SetRosterPassphrase { passphrase } => set_roster_passphrase(&app, passphrase).await,
         R::ListSharingLocations => {
             let (folder, remote) = {
                 let s = app.state::<AppState>().settings.lock().unwrap().clone();
@@ -865,8 +876,25 @@ async fn sign_in_all(app: &AppHandle, monitoring: bool) -> Result<Vec<bulk::Grou
 }
 
 fn sign_in_plan(app: &AppHandle, monitoring: bool) -> Vec<bulk::Group> {
-    let pending = bulk::load_pending();
-    bulk::sign_in_plan(&app.state::<AppState>().snapshot.lock().unwrap(), &pending, monitoring)
+    let state = app.state::<AppState>();
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    bulk::sign_in_plan(&snapshot, &pending_accounts(&state, &snapshot), monitoring)
+}
+
+/// Accounts to sign in here: those a restored backup named, and those other machines' rosters
+/// name (see `roster::waiting`).
+fn pending_accounts(state: &AppState, snapshot: &Snapshot) -> Vec<bulk::Pending> {
+    let mut list = bulk::load_pending();
+    bulk::add_pending(&mut list, roster_waiting(state, snapshot));
+    list
+}
+
+/// The accounts other machines' rosters name that are not signed in here, while the roster is on.
+fn roster_waiting(state: &AppState, snapshot: &Snapshot) -> Vec<bulk::Pending> {
+    if !state.settings.lock().unwrap().account_roster {
+        return vec![];
+    }
+    roster::waiting(&state.roster_seen.lock().unwrap(), &snapshot.accounts)
 }
 
 /// Runs the sign-ins one terminal at a time, each started once the previous one finished, an
@@ -959,7 +987,8 @@ fn bulk_status(state: tauri::State<AppState>) -> serde_json::Value {
         "lapsed": bulk::lapsed(&snapshot, &settings, chrono::Utc::now()),
         "connecting": state.bulk_connect.lock().unwrap().clone(),
         // "Sign in all accounts" with monitoring; without it, only the `add` steps run.
-        "sign_in": bulk::sign_in_plan(&snapshot, &bulk::load_pending(), true),
+        "sign_in": bulk::sign_in_plan(&snapshot, &pending_accounts(&state, &snapshot), true),
+        "roster_waiting": roster_waiting(&state, &snapshot).len(),
         "signin_profiles": signin::count(),
     })
 }
@@ -1497,7 +1526,18 @@ async fn store_settings(app: &AppHandle, settings: Settings) -> Result<(), Strin
             let _ = tauri::async_runtime::spawn_blocking(move || presence::withdraw(old.as_ref(), interval)).await;
         }
     }
-    if providers_changed || presence_changed {
+    if presence_changed || previous.account_roster != settings.account_roster {
+        // Off, or moved: the old location's machines should not keep this machine's accounts.
+        if previous.account_roster {
+            if let Some(old) = roster::store(&previous) {
+                let _ = tauri::async_runtime::spawn_blocking(move || roster::withdraw(old.as_ref())).await;
+            }
+        }
+        let state = app.state::<AppState>();
+        state.roster.lock().unwrap().reset();
+        *state.roster_seen.lock().unwrap() = roster::Seen::default();
+    }
+    if providers_changed || presence_changed || (settings.account_roster && !previous.account_roster) {
         do_refresh(app).await;
     }
     Ok(())
@@ -1757,6 +1797,9 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
         max_gap: chrono::Duration::seconds((3 * interval as i64 + 60).max(15 * 60)),
     };
     let surged = presence::infer(&mut state.presence_tracks.lock().unwrap(), &mut list, hold, surge, now);
+    if settings.account_roster {
+        sync_roster(&state, &settings, list.clone(), false).await;
+    }
     let watch = unexpected::Watch { covered, notify: settings.notifications.unexpected_use, web_use: &settings.web_use };
     let log = {
         let mut log = state.unexpected_log.lock().unwrap();
@@ -2029,6 +2072,75 @@ async fn set_phone_token(token: Option<String>) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || phone::store_token(&dir, token.as_deref())).await.map_err(|_| "phone_token_storage".to_string())?
 }
 
+// ---------------------------------------------------------------------------------------------
+// Account roster (see `roster`)
+
+/// Writes this machine's roster when due and reads the others' (at once with `force`). Does
+/// nothing without a sharing location or a passphrase.
+async fn sync_roster(state: &AppState, settings: &settings::Settings, accounts: Vec<model::AccountUsage>, force: bool) {
+    let (Some(store), Some(passphrase)) = (roster::store(settings), settings::app_dir().and_then(|d| roster::load_passphrase(&d))) else { return };
+    let sync = state.roster.clone();
+    let now = chrono::Utc::now();
+    let seen = tauri::async_runtime::spawn_blocking(move || {
+        let (id, name) = presence::identity()?;
+        let mut sync = sync.lock().unwrap();
+        sync.sync(store.as_ref(), &passphrase, (id, name), &accounts, now, force);
+        Some(sync.seen.clone())
+    }).await.ok().flatten();
+    if let Some(seen) = seen {
+        *state.roster_seen.lock().unwrap() = seen;
+    }
+}
+
+/// Settings > Other computers and the door's `get_roster`. With `sync`, writes and reads the
+/// rosters first.
+async fn roster_status(app: &AppHandle, sync: bool) -> serde_json::Value {
+    let state = app.state::<AppState>();
+    let settings = state.settings.lock().unwrap().clone();
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    if sync && settings.account_roster {
+        sync_roster(&state, &settings, snapshot.accounts.clone(), true).await;
+    }
+    let seen = state.roster_seen.lock().unwrap().clone();
+    let waiting = roster_waiting(&state, &snapshot);
+    serde_json::json!({
+        "enabled": settings.account_roster,
+        "location": settings.presence_remote.is_some() || settings.presence_folder.is_some(),
+        "passphrase_saved": roster_passphrase_saved(),
+        "wrote": seen.wrote, "written_at": seen.written_at, "read": seen.read, "read_at": seen.read_at,
+        "own_accounts": seen.own_accounts, "unreadable": seen.unreadable, "unsupported": seen.unsupported,
+        "machines": seen.peers.iter().map(|p| serde_json::json!({ "machine": p.machine, "written_at": p.written_at, "accounts": p.accounts.len() })).collect::<Vec<_>>(),
+        "waiting": waiting,
+    })
+}
+
+#[tauri::command]
+async fn get_roster(app: AppHandle, sync: Option<bool>) -> serde_json::Value {
+    roster_status(&app, sync.unwrap_or(false)).await
+}
+
+#[tauri::command]
+fn roster_passphrase_saved() -> bool {
+    settings::app_dir().is_some_and(|d| roster::load_passphrase(&d).is_some())
+}
+
+/// Saves the roster passphrase with DPAPI (null deletes it), then writes and reads the rosters
+/// with it. A new passphrase forgets the keys derived from the old one.
+async fn set_roster_passphrase(app: &AppHandle, passphrase: Option<backup::Passphrase>) -> Result<serde_json::Value, String> {
+    let dir = settings::app_dir().ok_or("roster_passphrase_storage")?;
+    tauri::async_runtime::spawn_blocking(move || roster::store_passphrase(&dir, passphrase.as_ref()))
+        .await.map_err(|_| "roster_passphrase_storage".to_string())??;
+    let state = app.state::<AppState>();
+    state.roster.lock().unwrap().reset();
+    *state.roster_seen.lock().unwrap() = roster::Seen::default();
+    Ok(roster_status(app, true).await)
+}
+
+#[tauri::command]
+async fn save_roster_passphrase(app: AppHandle, passphrase: Option<backup::Passphrase>) -> Result<serde_json::Value, String> {
+    set_roster_passphrase(&app, passphrase).await
+}
+
 /// "Send test": the saved URL and token, whether or not phone alerts are on.
 #[tauri::command]
 async fn send_phone_test(app: AppHandle, title: String, body: String) -> Result<(), String> {
@@ -2182,6 +2294,8 @@ pub fn run() {
         recent: Mutex::default(),
         sources: Mutex::default(),
         presence_tracks: Mutex::default(),
+        roster: Default::default(),
+        roster_seen: Mutex::default(),
         unexpected_log: Mutex::new(unexpected::load()),
         plan_alerts: Mutex::new(plan_alerts::load()),
         burn_log: Mutex::new(burn::load()),
@@ -2226,6 +2340,9 @@ pub fn run() {
             export_backup,
             restore_backup,
             phone_token_saved,
+            get_roster,
+            roster_passphrase_saved,
+            save_roster_passphrase,
             set_phone_token,
             send_phone_test,
             take_plan_alerts,

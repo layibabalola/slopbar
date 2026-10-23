@@ -856,6 +856,57 @@ $("phone-test").addEventListener("click", async () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// Account roster: the account list shared with the user's other computers, encrypted with a
+// passphrase that is saved here with DPAPI and never shown again.
+
+let rosterMessage = "";
+
+async function renderRoster() {
+  const placed = Boolean(settings.presence_folder || settings.presence_remote);
+  $("account-roster").checked = settings.account_roster;
+  $("account-roster").disabled = !placed && !settings.account_roster;
+  const r = await invoke("get_roster").catch(() => null);
+  $("roster-passphrase-state").textContent = r?.passphrase_saved ? t("rosterPassphraseSaved") : t("rosterPassphraseNone");
+  $("roster-passphrase-clear").disabled = !r?.passphrase_saved;
+  let text = rosterMessage;
+  if (!text && settings.account_roster) {
+    if (!placed) text = t("rosterNeedsSharing");
+    else if (!r?.passphrase_saved) text = t("rosterNeedsPassphrase");
+    else if (r.wrote === false) text = t("rosterWriteFailed");
+    else if (r.read === false) text = t("rosterReadFailed");
+    else if (r.read) {
+      text = [t("rosterShared", { n: r.machines.length }), r.unreadable ? t("rosterUnreadable", { n: r.unreadable }) : "",
+        r.waiting.length ? `${t("rosterWaiting", { n: r.waiting.length })}.` : ""].filter(Boolean).join(" ");
+    }
+  }
+  $("roster-status").textContent = text;
+  $("roster-status").hidden = !text;
+}
+
+$("account-roster").addEventListener("change", async (e) => {
+  rosterMessage = "";
+  await update({ account_roster: e.target.checked });
+  renderRoster();
+  loadBulk();
+});
+async function saveRosterPassphrase(passphrase) {
+  rosterMessage = "";
+  if (passphrase !== null && [...passphrase].length < 8) { rosterMessage = t("rosterErr_roster_passphrase_too_short"); return renderRoster(); }
+  $("roster-passphrase-save").disabled = true;
+  try {
+    await invoke("save_roster_passphrase", { passphrase });
+    $("roster-passphrase").value = "";
+  } catch (e) { rosterMessage = codeText("rosterErr", e); }
+  $("roster-passphrase-save").disabled = false;
+  await renderRoster();
+  loadBulk();
+}
+$("roster-passphrase-save").addEventListener("click", () => saveRosterPassphrase($("roster-passphrase").value));
+$("roster-passphrase").addEventListener("keydown", (e) => { if (e.key === "Enter") saveRosterPassphrase($("roster-passphrase").value); });
+$("roster-passphrase-clear").addEventListener("click", () => saveRosterPassphrase(null));
+listen("usage-updated", () => { if (settings) renderRoster(); });
+
+// ---------------------------------------------------------------------------------------------
 // Everything else
 
 async function render() {
@@ -890,6 +941,7 @@ async function render() {
   renderCalendar();
   renderPhone();
   renderPresence();
+  renderRoster();
   const version = await invoke("app_version");
   $("version").textContent = /^\d/.test(version) ? `v${version}` : version;
   $("version-label").textContent = t("versionN", { v: version });

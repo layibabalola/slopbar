@@ -40,6 +40,9 @@ pub struct Check {
     /// One line on why.
     pub reason: String,
     pub fix: Option<Fix>,
+    /// How many, for checks the flyout words itself ("roster_waiting").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +90,19 @@ pub struct SharingResult {
     pub read: bool,
 }
 
+/// The account roster (see `roster`) and how its last sync went.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Roster {
+    pub enabled: bool,
+    pub passphrase_saved: bool,
+    pub wrote: Option<bool>,
+    pub read: Option<bool>,
+    /// Other machines' rosters that did not open with this machine's passphrase.
+    pub unreadable: usize,
+    /// Accounts those rosters name that are not signed in here.
+    pub waiting: usize,
+}
+
 /// The diagnostics journal's own counters (see `Recorder::health`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Journal {
@@ -117,6 +133,7 @@ pub struct Inputs<'a> {
     pub last_success: Option<DateTime<Utc>>,
     pub door: Door,
     pub sharing: &'a Sharing,
+    pub roster: Roster,
     pub journal: Journal,
     pub notifications: Notifications,
     /// Settings: Connect monitoring automatically.
@@ -129,6 +146,40 @@ pub struct Inputs<'a> {
     pub disk: Option<Disk>,
     /// How the last refresh went with WSL (see `sources::wsl_status`).
     pub wsl: crate::sources::WslStatus,
+}
+
+fn place_set(sharing: &Sharing) -> bool {
+    sharing.remote.is_some() || sharing.folder.is_some()
+}
+
+/// The account roster, while it is on: whether it can be shared, and the accounts it found that
+/// wait to be signed in here.
+fn roster_checks(r: &Roster, place: bool) -> Vec<Check> {
+    if !r.enabled {
+        return vec![];
+    }
+    let data = Some(Fix::OpenSettings { page: "data" });
+    let title = "Account roster";
+    let mut out = vec![if !place {
+        check("roster", Status::Warning, title, "On, but in-use sharing is off: choose a folder or rclone remote under Other computers.", data)
+    } else if !r.passphrase_saved {
+        check("roster", Status::Warning, title, "On, but no roster passphrase is set: set the same one on each computer under Other computers.", data)
+    } else {
+        match (r.wrote, r.read) {
+            (Some(false), _) => check("roster", Status::Problem, title, "Could not write this computer's roster, so your other computers do not learn its accounts.", data),
+            (_, Some(false)) => check("roster", Status::Problem, title, "Could not read the rosters, so this computer does not learn the others' accounts.", data),
+            _ if r.unreadable > 0 => check("roster", Status::Warning, title, format!("{} roster(s) did not open with this computer's passphrase: set the same passphrase on every computer.", r.unreadable), data),
+            (None, None) => check("roster", Status::Ok, title, "Shared at the next refresh.", None),
+            _ => check("roster", Status::Ok, title, "Shared with your other computers, encrypted.", None),
+        }
+    }];
+    if r.waiting > 0 {
+        let mut waiting = check("roster_waiting", Status::Warning, format!("{} accounts from your other machines are waiting to be signed in", r.waiting),
+            "Sign them in here with Sign in all accounts (Settings > Accounts).", Some(Fix::OpenSettings { page: "accounts" }));
+        waiting.count = Some(r.waiting);
+        out.push(waiting);
+    }
+    out
 }
 
 /// WSL, when it is there or was asked about: which distros are read, which are left stopped,
@@ -223,7 +274,7 @@ fn ago(now: DateTime<Utc>, at: DateTime<Utc>) -> String {
 }
 
 fn check(id: impl Into<String>, status: Status, title: impl Into<String>, reason: impl Into<String>, fix: Option<Fix>) -> Check {
-    Check { id: id.into(), status, title: title.into(), reason: reason.into(), fix }
+    Check { id: id.into(), status, title: title.into(), reason: reason.into(), fix, count: None }
 }
 
 /// Every check, worst first within the order Settings lists them.
@@ -381,6 +432,8 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         },
     });
 
+    checks.extend(roster_checks(&inputs.roster, place_set(sharing)));
+
     checks.extend(wsl_check(&inputs.wsl));
 
     let j = inputs.journal;
@@ -440,6 +493,7 @@ mod tests {
         last_success: Option<DateTime<Utc>>,
         door: Door,
         sharing: Sharing,
+        roster: Roster,
         journal: Journal,
         notifications: Notifications,
         auto_connect: bool,
@@ -457,6 +511,7 @@ mod tests {
                 last_success: Some(now() - Duration::minutes(1)),
                 door: Door::Listening,
                 sharing: Sharing::default(),
+                roster: Roster::default(),
                 journal: Journal { started: true, write_attempts: 4, storage_errors: 0, last_write_ok: Some(true), history_unreadable: false },
                 notifications: Notifications { registered: Some(true), app_enabled: None, system_enabled: None, any_wanted: true },
                 auto_connect: true,
@@ -469,7 +524,7 @@ mod tests {
 
         fn run(&self) -> Report {
             checks(&Inputs { accounts: &self.accounts, monitoring: &self.monitoring, refresh_minutes: 5, last_success: self.last_success,
-                door: self.door, sharing: &self.sharing, journal: self.journal, notifications: self.notifications, auto_connect: self.auto_connect,
+                door: self.door, sharing: &self.sharing, roster: self.roster, journal: self.journal, notifications: self.notifications, auto_connect: self.auto_connect,
                 vault_plaintext: self.vault_plaintext, processes: self.processes, disk: self.disk, wsl: self.wsl.clone() }, now())
         }
     }
@@ -662,6 +717,31 @@ mod tests {
         assert_eq!(find(&case.run(), "door").status, Status::Warning);
         case.door = Door::Unsupported;
         assert!(case.run().checks.iter().all(|c| c.id != "door"));
+    }
+
+    #[test]
+    fn the_roster_says_how_many_accounts_wait_and_why_it_cannot_share() {
+        let mut case = Case::healthy();
+        assert!(case.run().checks.iter().all(|c| !c.id.starts_with("roster")), "off: no checks");
+        case.roster = Roster { enabled: true, ..Default::default() };
+        assert!(find(&case.run(), "roster").reason.contains("sharing is off"));
+        case.sharing.folder = Some("D:\\Sync".into());
+        assert!(find(&case.run(), "roster").reason.contains("passphrase"));
+        case.roster.passphrase_saved = true;
+        case.roster.wrote = Some(true);
+        case.roster.read = Some(true);
+        case.roster.unreadable = 1;
+        assert_eq!(find(&case.run(), "roster").status, Status::Warning);
+        case.roster.unreadable = 0;
+        case.roster.waiting = 13;
+        let r = case.run();
+        assert_eq!(find(&r, "roster").status, Status::Ok);
+        let waiting = find(&r, "roster_waiting");
+        assert_eq!((waiting.status, waiting.count), (Status::Warning, Some(13)));
+        assert_eq!(waiting.title, "13 accounts from your other machines are waiting to be signed in");
+        assert_eq!(waiting.fix, Some(Fix::OpenSettings { page: "accounts" }));
+        case.roster.read = Some(false);
+        assert_eq!(find(&case.run(), "roster").status, Status::Problem);
     }
 
     #[test]
