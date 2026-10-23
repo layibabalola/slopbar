@@ -143,6 +143,8 @@ header #updated { margin-left: auto; margin-right: 4px; }
 .icon-btn:hover { background: var(--subtle-hover); }
 .icon-btn:active { background: var(--subtle-press); color: var(--text-2); }
 #refresh.spin svg { animation: spin 0.9s linear infinite; }
+/* The layout toggle shows the layout it switches to: rows from the cards, cards from the rows. */
+#toggle-compact[aria-pressed="true"] .when-full, #toggle-compact[aria-pressed="false"] .when-compact { display: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 #accounts { display: flex; flex-direction: column; gap: 12px; }
