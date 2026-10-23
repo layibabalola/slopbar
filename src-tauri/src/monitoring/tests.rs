@@ -905,7 +905,8 @@ mod http {
         status: u16,
         body: &'static str,
         delay: Duration,
-        body_delay: Duration,
+        // Send the headers, then withhold the body until the client gives up and hangs up.
+        hold_body: bool,
         header: &'static str,
     }
     fn response(status: u16, body: &'static str) -> Response {
@@ -913,7 +914,7 @@ mod http {
             status,
             body,
             delay: Duration::ZERO,
-            body_delay: Duration::ZERO,
+            hold_body: false,
             header: "",
         }
     }
@@ -975,7 +976,12 @@ mod http {
                     std::thread::sleep(reply.delay);
                     let data = format!("HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n", reply.status, reply.body.len(), reply.header);
                     let _ = stream.write_all(data.as_bytes());
-                    std::thread::sleep(reply.body_delay);
+                    if reply.hold_body {
+                        // Nothing races the client's timeout here: the body never comes, so the
+                        // timeout can only fire while reading it, however long the headers took.
+                        let _ = stream.read(&mut [0; 1]);
+                        continue;
+                    }
                     let _ = stream.write_all(reply.body.as_bytes());
                 }
             });
@@ -1182,13 +1188,17 @@ mod http {
     }
     #[tokio::test]
     async fn accepted_but_unreadable_refresh_never_replays_even_after_restart() {
-        for (body, delay) in [
-            ("not-json", 0),
-            (r#"{"refresh_token":"new","expires_in":"invalid-type"}"#, 0),
-            (r#"{"refresh_token":"lost"}"#, 150),
+        // The last case times out reading the body of an accepted refresh. Its server holds the
+        // body until the client hangs up, so the timeout cannot fire before the headers arrive.
+        // (A 40 ms timeout racing a 150 ms body delay failed when a loaded machine took longer
+        // than 40 ms to deliver the headers: that is a network failure, not an accepted refresh.)
+        for (body, hold_body) in [
+            ("not-json", false),
+            (r#"{"refresh_token":"new","expires_in":"invalid-type"}"#, false),
+            (r#"{"refresh_token":"lost"}"#, true),
         ] {
             let mut accepted = response(200, body);
-            accepted.body_delay = Duration::from_millis(delay);
+            accepted.hold_body = hold_body;
             let server = Server::new(vec![accepted]);
             let dir = TempDir::new();
             let monitor = Monitor::new(dir.0.clone());
@@ -1197,7 +1207,7 @@ mod http {
                 monitor
                     .token_with(
                         &cli(),
-                        &Local(&client(if delay == 0 { 1000 } else { 40 }), &server.url),
+                        &Local(&client(1000), &server.url),
                         None,
                         now()
                     )
