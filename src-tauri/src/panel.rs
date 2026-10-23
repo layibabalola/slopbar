@@ -4,7 +4,7 @@
 //! A click must open it at once, like the shell's own flyouts. Building a WebView2 takes
 //! seconds, so the flyout is built hidden shortly after startup (`prepare`) and is only ever
 //! hidden, never destroyed. (WebView2's low memory target while hidden was tried: the flyout then
-//! showed blank, so it is not used.)
+//! showed blank, so it is not used.) Once it has been on screen, hiding suspends its webview.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -29,6 +29,10 @@ static READY: AtomicBool = AtomicBool::new(false);
 static SHOW_WHEN_BUILT: AtomicBool = AtomicBool::new(false);
 /// The flyout is being built (by `prepare` or a click), so a second build is not started.
 static BUILDING: AtomicBool = AtomicBool::new(false);
+/// The flyout's webview has been on screen at least once, so hiding may suspend it.
+static SHOWN: AtomicBool = AtomicBool::new(false);
+/// The flyout's webview was suspended when it was last hidden.
+static SUSPENDED: AtomicBool = AtomicBool::new(false);
 
 /// The flyout's page has laid itself out (it reports its height through `set_panel_height`).
 pub fn page_ready() {
@@ -50,6 +54,8 @@ async fn build(app: &AppHandle) {
         return;
     }
     READY.store(false, Ordering::Release);
+    SHOWN.store(false, Ordering::Release);
+    SUSPENDED.store(false, Ordering::Release);
     let built = crate::app::on_demand_window(app, LABEL).await;
     if built.is_some() {
         let started = Instant::now();
@@ -60,6 +66,7 @@ async fn build(app: &AppHandle) {
     BUILDING.store(false, Ordering::Release);
     let Some(win) = built else { return };
     let _ = win;
+    // Not suspended here: a webview suspended before it ever drew opens as an empty panel.
     if SHOW_WHEN_BUILT.swap(false, Ordering::AcqRel) {
         show(app);
     }
@@ -176,13 +183,35 @@ pub fn on_blur(app: &AppHandle) {
 /// Tells the flyout's webview it is (or is no longer) on screen. Showing the window alone can leave
 /// a webview that was built hidden, and stayed hidden, not drawing: the flyout then opens as an
 /// empty panel. `inspect` does the same when it shows a hidden window off-screen.
+///
+/// Once it has been shown, hiding also suspends the webview, which lets WebView2 give back most of
+/// its working set (about 450 MB down to 120 MB across the app's processes); showing resumes it first.
 #[cfg(windows)]
 fn set_webview_visible(win: &tauri::WebviewWindow, visible: bool) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_3;
+    use webview2_com::TrySuspendCompletedHandler;
+    use windows::core::Interface;
     let _ = win.with_webview(move |w| unsafe {
         let controller = w.controller();
-        let _ = controller.SetIsVisible(visible);
+        let webview = controller.CoreWebView2().ok().and_then(|c| c.cast::<ICoreWebView2_3>().ok());
         if visible {
+            if SUSPENDED.swap(false, Ordering::AcqRel) {
+                if let Some(webview) = &webview {
+                    let _ = webview.Resume();
+                }
+            }
+            let _ = controller.SetIsVisible(true);
             let _ = controller.NotifyParentWindowPositionChanged();
+            SHOWN.store(true, Ordering::Release);
+        } else {
+            let _ = controller.SetIsVisible(false);
+            // Never before it has been on screen once: suspended before it ever drew, it opens empty.
+            // A close hides more than once (blur, then the click); suspend once.
+            if SHOWN.load(Ordering::Acquire) && !SUSPENDED.swap(true, Ordering::AcqRel) {
+                if let Some(webview) = &webview {
+                    let _ = webview.TrySuspend(&TrySuspendCompletedHandler::create(Box::new(|_, _| Ok(()))));
+                }
+            }
         }
     });
 }
