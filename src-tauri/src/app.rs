@@ -1823,7 +1823,7 @@ fn apply_hotkey(app: &AppHandle) {
 fn hotkey_pressed(app: &AppHandle, shortcut: &tauri_plugin_global_shortcut::Shortcut) {
     let compact = app.state::<AppState>().settings.lock().unwrap().compact_hotkey.clone();
     if !compact.is_empty() && parse_hotkey(&compact).as_ref() == Some(shortcut) {
-        toggle_compact_flyout(app);
+        toggle_compact_flyout(app, true);
     } else {
         toggle_switcher(app);
     }
@@ -1837,9 +1837,15 @@ fn hotkey_status(state: tauri::State<AppState>, which: Option<String>) -> Option
     error.lock().unwrap().clone()
 }
 
-/// Turns the compact flyout on or off (the menus' item and its shortcut), and says which in the
+/// The flyout's own layout button: the flyout redraws in the new layout, so no toast.
+#[tauri::command]
+fn toggle_compact(app: AppHandle) {
+    toggle_compact_flyout(&app, false);
+}
+
+/// Turns the compact flyout on or off. From the menus and the shortcut it is `announce`d in the
 /// widget, since the flyout is usually closed.
-pub(crate) fn toggle_compact_flyout(app: &AppHandle) {
+pub(crate) fn toggle_compact_flyout(app: &AppHandle, announce: bool) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
@@ -1849,7 +1855,7 @@ pub(crate) fn toggle_compact_flyout(app: &AppHandle) {
         // Choosing a layout answers the flyout's offer of the compact one.
         settings.compact_suggested = true;
         let on = settings.compact_flyout;
-        if store_settings(&app, settings).await.is_ok() {
+        if store_settings(&app, settings).await.is_ok() && announce {
             let _ = app.emit("compact-toggled", on);
         }
     });
@@ -2162,7 +2168,7 @@ pub(crate) fn menu_event(app: &AppHandle, id: &str) {
             tauri::async_runtime::spawn(async move { do_refresh(&app).await });
         }
         "settings" => show_settings(app),
-        MENU_COMPACT => toggle_compact_flyout(app),
+        MENU_COMPACT => toggle_compact_flyout(app, true),
         "quit" => app.exit(0),
         _ => {}
     }
@@ -3050,6 +3056,7 @@ pub fn run() {
             open_switcher,
             hide_switcher,
             hotkey_status,
+            toggle_compact,
             set_dock_width,
             dock_clicked,
             dock_menu,
