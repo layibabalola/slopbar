@@ -1,6 +1,6 @@
 use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, panel, phone, pins, plan_alerts, presence, providers, reset_credits, roster, settings, signin, sources, subscriptions, unexpected, updates, usage_index};
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -73,6 +73,8 @@ pub struct AppState {
     profile_states: Mutex<HashMap<(Provider, String), accounts::ProfileState>>,
     /// The queued "Connect monitoring for all" while it runs: the accounts left, done first.
     bulk_connect: Mutex<Option<BulkConnect>>,
+    /// Stops the running one (Settings' Stop).
+    bulk_stop: Mutex<Option<Arc<tokio::sync::Notify>>>,
     /// Why the switcher's shortcut could not be registered (taken by another app, say).
     hotkey_error: Mutex<Option<String>>,
     /// The page Settings opens on when it is being created (it is destroyed when closed).
@@ -537,7 +539,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::SignInAll { confirm, monitoring } => {
             if !confirm {
                 return Ok(serde_json::json!({ "started": false, "plan": sign_in_plan(&app, monitoring),
-                    "next": "Nothing was started. With confirm: true the sign-ins open one at a time, an email's back to back in that email's own browser profile; the user signs in as each account named here and completes every page." }));
+                    "next": "Nothing was started. With confirm: true the sign-ins open one at a time, an email's back to back in one fresh browser profile that is closed and deleted when the email is done; the user signs in as each account named here and completes every page." }));
             }
             let plan = sign_in_all(&app, monitoring).await?;
             Ok(serde_json::json!({ "started": !plan.is_empty(), "plan": plan,
@@ -714,9 +716,9 @@ async fn start_add_account(app: AppHandle, provider: Provider, pending: Option<m
             known
         }
     };
-    // Who signs in is not known yet, so there is no email's profile to open: a private window if
-    // the user chose those, else the CLI's default browser.
-    let options = signin_options(&app, None);
+    // A fresh profile of its own (who signs in is not known yet), held until the sign-in ends.
+    let session = signin_session(&app);
+    let options = signin_options(&app, None, session.as_deref());
     // Probing for the CLI runs wsl.exe / where.exe; keep it off the async runtime.
     let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, None, options))
         .await
@@ -724,6 +726,7 @@ async fn start_add_account(app: AppHandle, provider: Provider, pending: Option<m
     tauri::async_runtime::spawn(async move {
         let _pending = pending;
         let added = job.wait(&http_client()).await;
+        end_session(session).await;
         if let Some(slot) = added {
             forget_pending(slot.provider, &slot.id);
             let _ = app.emit("account-added", (slot.provider, slot.email));
@@ -733,10 +736,26 @@ async fn start_add_account(app: AppHandle, provider: Provider, pending: Option<m
     Ok(())
 }
 
-/// Where a sign-in as `email` opens its page, from the user's choice (see `signin`).
-fn signin_options(app: &AppHandle, email: Option<&str>) -> accounts::LoginOptions {
+/// A brand-new browser profile for a sign-in, or for an email's run of them, when the user chose
+/// those (see `signin::Session`). Dropping the last handle closes its browser and deletes it.
+fn signin_session(app: &AppHandle) -> Option<Arc<signin::Session>> {
     let window = app.state::<AppState>().settings.lock().unwrap().signin_window;
-    accounts::LoginOptions { email: email.map(str::to_owned), target: signin::Target::choose(window, email) }
+    (window == signin::Window::Profile).then(signin::Session::create).flatten().map(Arc::new)
+}
+
+/// Lets go of a session off the async runtime: the last handle closes the browser and deletes
+/// the profile, which can wait a few seconds on files the browser still holds.
+async fn end_session(session: Option<Arc<signin::Session>>) {
+    if session.is_some() {
+        let _ = tauri::async_runtime::spawn_blocking(move || drop(session)).await;
+    }
+}
+
+/// Where a sign-in as `email` opens its page, from the user's choice (see `signin`): `session`'s
+/// profile, a private window, or the CLI's default browser.
+fn signin_options(app: &AppHandle, email: Option<&str>, session: Option<&signin::Session>) -> accounts::LoginOptions {
+    let window = app.state::<AppState>().settings.lock().unwrap().signin_window;
+    accounts::LoginOptions { email: email.map(str::to_owned), target: signin::Target::choose(window, session) }
 }
 
 /// A restored account that is signed in again is no longer pending.
@@ -752,12 +771,12 @@ fn forget_pending(provider: Provider, id: &str) {
 /// Signs a restored account in again, as "Add account" does, but only as that account: a login
 /// of any other account is not saved and is revoked, the way monitoring rejects a wrong account.
 /// Returns once the user is done.
-async fn add_expected(app: &AppHandle, expected: &bulk::Step) -> Result<(), String> {
+async fn add_expected(app: &AppHandle, expected: &bulk::Step, session: Option<&signin::Session>) -> Result<(), String> {
     let provider = expected.target.provider;
     let _operation = app.state::<AppState>().account_operations.begin(provider, "add-account")?;
     let _sign_in = app.state::<AppState>().account_operations.begin_key(monitoring::SIGN_IN)?;
     let found = app.state::<AppState>().sources.lock().unwrap().clone();
-    let options = signin_options(app, expected.email.as_deref());
+    let options = signin_options(app, expected.email.as_deref(), session);
     let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, None, options))
         .await.map_err(|_| "monitor_login_failed".to_string())??;
     let client = http_client();
@@ -780,13 +799,13 @@ async fn add_expected(app: &AppHandle, expected: &bulk::Step) -> Result<(), Stri
 async fn connect_monitoring(app: AppHandle, provider: Provider, id: String) -> Result<(), String> {
     let key = format!("{}:{id}", provider.name());
     auto_monitor_saved(&app, |t| t.manual(&key, true));
-    start_monitoring_login(app, provider, id, false).await.map(|_| ())
+    start_monitoring_login(app, provider, id, false, None).await.map(|_| ())
 }
 
 /// Connect monitoring's sign-in, started by the user or on its own (`auto`, see `auto_monitor`).
 /// One sign-in is open at a time across the app (`monitoring::SIGN_IN`); the returned task
 /// ends with its outcome once the user is done.
-async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, auto: bool) -> Result<tauri::async_runtime::JoinHandle<Result<(), String>>, String> {
+async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, auto: bool, session: Option<Arc<signin::Session>>) -> Result<tauri::async_runtime::JoinHandle<Result<(), String>>, String> {
     let operation = app.state::<AppState>().account_operations.begin(provider, &id)?;
     let sign_in = app.state::<AppState>().account_operations.begin_key(monitoring::SIGN_IN)?;
     let expected = accounts::load_slots().into_iter().find(|s| s.provider == provider && s.id == id)
@@ -796,7 +815,9 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
     app.state::<AppState>().diagnostics.record(Some(provider), Some(&id), diagnostics::Event::Action { action: diagnostics::Action::ConnectStarted, code: diagnostics::Code::Ok, elapsed_ms: 0 });
     let found = app.state::<AppState>().sources.lock().unwrap().clone();
     let context = diagnostics::Context { recorder: app.state::<AppState>().diagnostics.clone(), provider, id: id.clone() };
-    let options = signin_options(&app, expected.email.as_deref());
+    // The email group's profile in "Sign in all accounts", else a fresh one of its own.
+    let session = session.or_else(|| signin_session(&app));
+    let options = signin_options(&app, expected.email.as_deref(), session.as_deref());
     let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, Some(context), options)).await;
     let job = match job {
         Ok(Ok(job)) => job,
@@ -828,6 +849,7 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
             }
             None => Err("monitor_login_failed".into()),
         };
+        end_session(session).await;
         drop(operation);
         drop(sign_in);
         if auto {
@@ -898,12 +920,47 @@ fn roster_waiting(state: &AppState, snapshot: &Snapshot) -> Vec<bulk::Pending> {
     roster::waiting(&state.roster_seen.lock().unwrap(), &snapshot.accounts)
 }
 
+/// A task that is aborted when this is dropped, as a stopped "Sign in all accounts" drops its
+/// open sign-in.
+struct AbortOnDrop<T>(tauri::async_runtime::JoinHandle<T>);
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = tauri::Result<T>;
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Resolves once `session`'s browser, having opened, is closed: the user closed the window, so
+/// the sign-in can no longer finish. Never resolves without a session.
+async fn browser_closed(session: Option<&signin::Session>) {
+    let Some(session) = session else { return std::future::pending().await };
+    let mut seen = false;
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let open = signin::browser_open(session.dir());
+        if seen && !open {
+            return;
+        }
+        seen |= open;
+    }
+}
+
 /// Runs the sign-ins one terminal at a time, each started once the previous one finished, an
-/// email's sign-ins back to back so its browser profile is signed in to Google once for all of
-/// them. Stops at the first that fails (the user closed it, or signed in as another account).
+/// email's sign-ins back to back in one fresh browser profile so Google is asked once for all of
+/// them; the profile's browser is closed and the profile deleted when the email's turn ends.
+/// Stops at the first that fails (the user closed it, closed the browser, signed in as another
+/// account, or pressed Stop).
 fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Result<(), String> {
     let state = app.state::<AppState>();
     let total = groups.iter().map(|g| g.steps.len()).sum();
+    let stop = Arc::new(tokio::sync::Notify::new());
     {
         let mut running = state.bulk_connect.lock().unwrap();
         if running.as_ref().is_some_and(|b| !b.finished) {
@@ -911,12 +968,15 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Re
         }
         *running = Some(BulkConnect { total, done: 0, current: None, kind: None, emails: if by_email { groups.len() } else { 0 }, email: 0,
             finished: total == 0, error: None });
+        *state.bulk_stop.lock().unwrap() = Some(stop.clone());
     }
     let h = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut error = None;
         let mut done = 0;
         'groups: for (index, group) in groups.iter().enumerate() {
+            // Made at the email's first sign-in that still has to run, ended with its turn.
+            let mut group_session: Option<Option<Arc<signin::Session>>> = None;
             for step in &group.steps {
                 let target = &step.target;
                 publish_bulk(&h, |b| {
@@ -939,28 +999,40 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Re
                 if !still {
                     continue;
                 }
-                // Another sign-in is open (one the user or automatic monitoring started): wait for it.
-                while h.state::<AppState>().account_operations.busy(monitoring::SIGN_IN) {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-                let outcome = match step.kind {
-                    bulk::Kind::Add => add_expected(&h, step).await,
-                    bulk::Kind::Connect => {
-                        // The user asked for these, so they count as manual starts, never automatic ones.
-                        let key = format!("{}:{}", target.provider.name(), target.id);
-                        auto_monitor_saved(&h, |t| t.manual(&key, true));
-                        match start_monitoring_login(h.clone(), target.provider, target.id.clone(), false).await {
-                            Ok(task) => task.await.unwrap_or_else(|_| Err("monitor_login_failed".into())),
-                            Err(e) => Err(e),
+                let session = group_session.get_or_insert_with(|| signin_session(&h)).clone();
+                let run = async {
+                    // Another sign-in is open (one the user or automatic monitoring started): wait for it.
+                    while h.state::<AppState>().account_operations.busy(monitoring::SIGN_IN) {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    match step.kind {
+                        bulk::Kind::Add => add_expected(&h, step, session.as_deref()).await,
+                        bulk::Kind::Connect => {
+                            // The user asked for these, so they count as manual starts, never automatic ones.
+                            let key = format!("{}:{}", target.provider.name(), target.id);
+                            auto_monitor_saved(&h, |t| t.manual(&key, true));
+                            match start_monitoring_login(h.clone(), target.provider, target.id.clone(), false, session.clone()).await {
+                                // Stopping drops this future, and with it the sign-in.
+                                Ok(task) => AbortOnDrop(task).await.unwrap_or_else(|_| Err("monitor_login_failed".into())),
+                                Err(e) => Err(e),
+                            }
                         }
                     }
+                };
+                let outcome = tokio::select! {
+                    outcome = run => outcome,
+                    _ = stop.notified() => Err("signin_stopped".into()),
+                    _ = browser_closed(session.as_deref()) => Err("signin_window_closed".into()),
                 };
                 if let Err(e) = outcome {
                     done -= 1;
                     error = Some(e);
+                    drop(group_session);
+                    end_session(session).await;
                     break 'groups;
                 }
             }
+            end_session(group_session.flatten()).await;
         }
         publish_bulk(&h, |b| {
             b.done = done;
@@ -999,10 +1071,20 @@ async fn sign_in_all_accounts(app: AppHandle, monitoring: bool) -> Result<Vec<bu
     sign_in_all(&app, monitoring).await
 }
 
-/// "Forget sign-in profiles": deletes the browser profiles sign-ins used, with their cookies.
+/// "Clear old sign-in profiles": deletes the profiles earlier versions kept per email, and any a
+/// stopped SlopBar left, with their cookies (see `signin::cleanup`).
 #[tauri::command]
 async fn forget_signin_profiles() -> Result<usize, String> {
-    tauri::async_runtime::spawn_blocking(signin::forget).await.map_err(|_| "signin_profiles_busy".to_string())?
+    tauri::async_runtime::spawn_blocking(signin::cleanup).await.map_err(|_| "signin_profiles_busy".to_string())?
+}
+
+/// Stops a running "Sign in all accounts" or "Connect monitoring for all": the open sign-in is
+/// closed with its browser, and nothing after it starts.
+#[tauri::command]
+fn stop_sign_ins(state: tauri::State<AppState>) {
+    if let Some(stop) = state.bulk_stop.lock().unwrap().as_ref() {
+        stop.notify_one();
+    }
 }
 
 /// Removes every account whose plan has ended, as each row's remove does; accounts in use stay.
@@ -2201,7 +2283,7 @@ fn auto_connect_tick(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let key = format!("{}:{id}", provider.name());
-        if let Err(e) = start_monitoring_login(app.clone(), provider, id, true).await {
+        if let Err(e) = start_monitoring_login(app.clone(), provider, id, true, None).await {
             // Someone else started on it meanwhile: no reason to wait a day.
             let ok = e == "monitor_busy";
             auto_monitor_saved(&app, |t| t.finished(&key, ok, chrono::Utc::now()));
@@ -2306,6 +2388,7 @@ pub fn run() {
         health: Mutex::default(),
         profile_states: Mutex::default(),
         bulk_connect: Mutex::default(),
+        bulk_stop: Mutex::default(),
         hotkey_error: Mutex::default(),
         settings_page: Mutex::default(),
         leases: Mutex::default(),
@@ -2380,6 +2463,7 @@ pub fn run() {
             connect_monitoring_all,
             sign_in_all_accounts,
             forget_signin_profiles,
+            stop_sign_ins,
             remove_lapsed_accounts,
             bulk_status,
             list_project_pins,
@@ -2402,6 +2486,9 @@ pub fn run() {
             tauri::async_runtime::spawn_blocking(|| {
                 if let Some(dir) = door::exports_dir() { diagnostics::prune_exports(&dir, std::time::SystemTime::now()); }
                 if let Some(dir) = inspect::captures_dir() { inspect::prune(&dir); }
+                // The browser profiles earlier versions kept per email (they offered stale Google
+                // accounts), and fresh ones a SlopBar that ended mid-sign-in left behind.
+                let _ = signin::cleanup();
             });
             // Before the first refresh reads the vault; a slot that fails stays readable as plaintext.
             let vault = accounts::migrate_vault();
@@ -2488,6 +2575,8 @@ pub fn run() {
                 if let Some(store) = presence::store(&settings) {
                     presence::withdraw(store.as_ref(), settings.refresh_minutes.max(1) as u64 * 60);
                 }
+                // A sign-in still open loses its browser and fresh profile with SlopBar.
+                signin::close_all();
                 app.state::<AppState>().diagnostics.record(None, None, diagnostics::Event::Shutdown);
             }
         });

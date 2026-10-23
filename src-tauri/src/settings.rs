@@ -173,8 +173,8 @@ pub struct Settings {
     /// Where to look for CLI sign-ins in WSL (see `sources::WslScan`): by default only distros
     /// already running, plus stopped ones that held sign-ins before.
     pub wsl_accounts: crate::sources::WslScan,
-    /// Where CLI sign-ins open their web page (see `signin`): a browser profile per email unless
-    /// the user picks a private window or the default browser.
+    /// Where CLI sign-ins open their web page (see `signin`): a fresh browser profile per email,
+    /// deleted after, unless the user picks a private window or the default browser.
     pub signin_window: crate::signin::Window,
     /// Share the list of accounts (provider, account id, email and plan; never sign-ins) with the
     /// user's other machines through the in-use sharing location, encrypted with a roster
