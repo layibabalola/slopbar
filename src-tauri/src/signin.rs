@@ -106,6 +106,8 @@ fn is_active(dir: &Path) -> bool {
 #[derive(Debug)]
 pub struct Session {
     dir: PathBuf,
+    /// Its browser has been seen running (see [`Session::browser_closed`]).
+    opened: std::sync::atomic::AtomicBool,
 }
 
 impl Session {
@@ -113,9 +115,13 @@ impl Session {
     pub fn create_in(root: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(root)?;
         let dir = root.join(uuid::Uuid::new_v4().simple().to_string());
-        std::fs::create_dir(&dir)?;
+        // Active before it exists, so a cleanup running now never takes it.
         set_active(&dir, true);
-        Ok(Self { dir })
+        if let Err(e) = std::fs::create_dir(&dir) {
+            set_active(&dir, false);
+            return Err(e);
+        }
+        Ok(Self { dir, opened: Default::default() })
     }
 
     /// A new profile in [`sessions_root`].
@@ -130,14 +136,43 @@ impl Session {
     pub fn target(&self) -> Target {
         Target::Profile(self.dir.clone())
     }
+
+    /// Whether the browser, having opened for any of the email's sign-ins, is gone: the user
+    /// closed it, so no sign-in can finish there.
+    pub fn browser_closed(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if browser_open(&self.dir) {
+            self.opened.store(true, Ordering::Relaxed);
+            return false;
+        }
+        self.opened.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for Session {
+    /// Closing and deleting can wait seconds on a browser letting go of its files, so on an async
+    /// runtime it runs on a thread of its own.
     fn drop(&mut self) {
-        close_browser(&self.dir);
-        let _ = remove_profile(&self.dir);
-        set_active(&self.dir, false);
+        let dir = std::mem::take(&mut self.dir);
+        if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::spawn(move || end(&dir));
+        } else {
+            end(&dir);
+        }
     }
+}
+
+fn end(dir: &Path) {
+    close_browser(dir);
+    let _ = remove_profile(dir);
+    // A sign-in page whose browser was still starting (Claude's, through `BROWSER`) gets its
+    // window, and the folder again, only after the first pass: a second one takes those too.
+    if browser_open(dir) || dir.exists() {
+        std::thread::sleep(Duration::from_secs(1));
+        close_browser(dir);
+        let _ = remove_profile(dir);
+    }
+    set_active(dir, false);
 }
 
 /// Closes every running session's browser and deletes its profile, as SlopBar exits.
@@ -175,14 +210,17 @@ pub fn close_browser(dir: &Path) {
             CloseHandle(snap);
         }
     }
-    for p in pids {
+    // Every handle is held before anything ends: a process ID is only that process's while it
+    // runs, and one freed by a child that just exited could name another program.
+    let handles: Vec<_> = pids.into_iter().map(|p| unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, p) })
+        .filter(|h| !h.is_null()).collect();
+    for h in &handles {
+        unsafe { TerminateProcess(*h, 0) };
+    }
+    for h in handles {
         unsafe {
-            let h = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, p);
-            if !h.is_null() {
-                TerminateProcess(h, 0);
-                WaitForSingleObject(h, 3000);
-                CloseHandle(h);
-            }
+            WaitForSingleObject(h, 3000);
+            CloseHandle(h);
         }
     }
 }
@@ -223,12 +261,21 @@ fn browser_pid(dir: &Path) -> Option<u32> {
 /// Deletes a profile folder, first overwriting each file with zeros so its cookies do not linger
 /// in freed disk space. Files a closing browser still holds are retried for a few seconds.
 pub fn remove_profile(dir: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // A link where a profile should be: only the link goes, never what it points at.
+        Ok(m) if m.file_type().is_symlink() => return std::fs::remove_dir(dir).or_else(|_| std::fs::remove_file(dir)),
+        _ => {}
+    }
     let mut last = Ok(());
     for attempt in 0..20 {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(250));
         }
-        scrub(dir);
+        // Again now and then for files that were held: what was deleted needs no second pass.
+        if attempt % 5 == 0 {
+            scrub(dir);
+        }
         last = match std::fs::remove_dir_all(dir) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             other => other,
@@ -253,6 +300,10 @@ fn scrub(dir: &Path) {
         } else if kind.is_dir() {
             scrub(&path);
         } else if let (Ok(len), Ok(mut f)) = (entry.metadata().map(|m| m.len()), std::fs::OpenOptions::new().write(true).open(&path)) {
+            // A hard link shares its bytes with a file elsewhere: deleting the link is enough.
+            if linked_elsewhere(&f) {
+                continue;
+            }
             let mut left = len;
             while left > 0 {
                 let n = left.min(zeros.len() as u64) as usize;
@@ -264,6 +315,28 @@ fn scrub(dir: &Path) {
             let _ = f.sync_all();
         }
     }
+}
+
+#[cfg(windows)]
+fn linked_elsewhere(file: &std::fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) == 0 || info.nNumberOfLinks > 1 }
+}
+
+#[cfg(not(windows))]
+fn linked_elsewhere(file: &std::fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().map_or(true, |m| m.nlink() > 1)
+}
+
+/// A session's own folder: named as [`Session::create_in`] names them, directly under
+/// [`sessions_root`], and a real folder rather than a link to one.
+fn session_folder(dir: &Path) -> bool {
+    let named = dir.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.len() == 32 && n.bytes().all(|b| b.is_ascii_hexdigit()));
+    named && sessions_root().is_some_and(|root| dir.parent() == Some(root.as_path()))
+        && std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
 }
 
 /// An email safe to hand to a CLI on its command line (Claude's `--email`). The sign-in runs
@@ -338,8 +411,7 @@ pub fn open(url: &str, target: &Target) -> Result<(), String> {
         return Err("signin_url_rejected".into());
     }
     if let Target::Profile(dir) = target {
-        let root = sessions_root().ok_or("signin_profile_storage")?;
-        if dir.parent() != Some(root.as_path()) || !dir.is_dir() {
+        if !session_folder(dir) {
             return Err("signin_profile_storage".into());
         }
     }
@@ -411,6 +483,10 @@ pub fn launch_from_env(args: &[OsString]) -> Option<i32> {
 /// `sessions` (ones left by a SlopBar that ended mid-sign-in).
 fn stale_in(legacy: Option<&Path>, sessions: Option<&Path>) -> Vec<PathBuf> {
     let dirs = |root: &Path| -> Vec<PathBuf> {
+        // A root that is a link would lead the cleanup out of the app's folder.
+        if std::fs::symlink_metadata(root).map_or(true, |m| m.file_type().is_symlink()) {
+            return vec![];
+        }
         std::fs::read_dir(root).map(|e| e.flatten().map(|e| e.path())
             .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())).collect())
             .unwrap_or_default()
@@ -553,6 +629,27 @@ mod tests {
         let root = TempDir::new();
         assert!(!browser_open(&root.0));
         close_browser(&root.0);
+        let session = Session::create_in(&root.0).unwrap();
+        assert!(!session.browser_closed(), "a browser that never opened was not closed");
+    }
+
+    #[test]
+    fn a_hard_link_is_deleted_but_never_overwritten() {
+        let (profile, elsewhere) = (TempDir::new(), TempDir::new());
+        let original = elsewhere.0.join("keep.txt");
+        std::fs::write(&original, b"the user's own file").unwrap();
+        std::fs::hard_link(&original, profile.0.join("link.txt")).unwrap();
+        remove_profile(&profile.0).unwrap();
+        assert!(!profile.0.exists());
+        assert_eq!(std::fs::read(&original).unwrap(), b"the user's own file");
+    }
+
+    #[test]
+    fn only_a_session_folder_opens() {
+        let Some(root) = sessions_root() else { return };
+        for dir in [root.join(".."), root.join("not-a-session"), root.join("0123456789abcdef0123456789abcdef").join("..")] {
+            assert_eq!(open("https://claude.ai/oauth", &Target::Profile(dir.clone())), Err("signin_profile_storage".into()), "{}", dir.display());
+        }
     }
 
     #[test]

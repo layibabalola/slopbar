@@ -726,7 +726,7 @@ async fn start_add_account(app: AppHandle, provider: Provider, pending: Option<m
     tauri::async_runtime::spawn(async move {
         let _pending = pending;
         let added = job.wait(&http_client()).await;
-        end_session(session).await;
+        drop(session);
         if let Some(slot) = added {
             forget_pending(slot.provider, &slot.id);
             let _ = app.emit("account-added", (slot.provider, slot.email));
@@ -741,14 +741,6 @@ async fn start_add_account(app: AppHandle, provider: Provider, pending: Option<m
 fn signin_session(app: &AppHandle) -> Option<Arc<signin::Session>> {
     let window = app.state::<AppState>().settings.lock().unwrap().signin_window;
     (window == signin::Window::Profile).then(signin::Session::create).flatten().map(Arc::new)
-}
-
-/// Lets go of a session off the async runtime: the last handle closes the browser and deletes
-/// the profile, which can wait a few seconds on files the browser still holds.
-async fn end_session(session: Option<Arc<signin::Session>>) {
-    if session.is_some() {
-        let _ = tauri::async_runtime::spawn_blocking(move || drop(session)).await;
-    }
 }
 
 /// Where a sign-in as `email` opens its page, from the user's choice (see `signin`): `session`'s
@@ -849,7 +841,7 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
             }
             None => Err("monitor_login_failed".into()),
         };
-        end_session(session).await;
+        drop(session);
         drop(operation);
         drop(sign_in);
         if auto {
@@ -937,18 +929,12 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-/// Resolves once `session`'s browser, having opened, is closed: the user closed the window, so
-/// the sign-in can no longer finish. Never resolves without a session.
+/// Resolves once `session`'s browser, having opened for any of the email's sign-ins, is closed:
+/// the user closed the window, so the sign-in can no longer finish. Never resolves without one.
 async fn browser_closed(session: Option<&signin::Session>) {
     let Some(session) = session else { return std::future::pending().await };
-    let mut seen = false;
-    loop {
+    while !session.browser_closed() {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let open = signin::browser_open(session.dir());
-        if seen && !open {
-            return;
-        }
-        seen |= open;
     }
 }
 
@@ -1019,20 +1005,26 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Re
                         }
                     }
                 };
+                let mut run = Box::pin(run);
                 let outcome = tokio::select! {
-                    outcome = run => outcome,
+                    outcome = &mut run => outcome,
                     _ = stop.notified() => Err("signin_stopped".into()),
-                    _ = browser_closed(session.as_deref()) => Err("signin_window_closed".into()),
+                    // Closing the window once the provider's page says "done" is fine: the
+                    // sign-in may still be saving, so it gets a moment to finish.
+                    _ = browser_closed(session.as_deref()) => tokio::time::timeout(Duration::from_secs(15), &mut run).await
+                        .unwrap_or_else(|_| Err("signin_window_closed".into())),
                 };
                 if let Err(e) = outcome {
                     done -= 1;
                     error = Some(e);
+                    drop(run);
                     drop(group_session);
-                    end_session(session).await;
+                    drop(session);
                     break 'groups;
                 }
             }
-            end_session(group_session.flatten()).await;
+            // The last handle: closes the browser and deletes the profile (see `signin::Session`).
+            drop(group_session);
         }
         publish_bulk(&h, |b| {
             b.done = done;
