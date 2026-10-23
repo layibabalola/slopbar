@@ -1,4 +1,4 @@
-use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, desktop, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, pairing, panel, phone, pins, plan_alerts, presence, providers, reset_credits, roster, settings, signin, sources, subscriptions, unexpected, updates, usage_index};
+use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, desktop, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, pairing, panel, phone, pins, plan_alerts, presence, providers, reset_credits, roster, settings, signin, sources, subscriptions, unexpected, updates, usage_index, wind_down};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -48,6 +48,8 @@ pub struct AppState {
     pub(crate) usage_index: Mutex<Option<std::sync::Arc<usage_index::Index>>>,
     /// When each provider was last switched automatically (the balancer's cooldown).
     pub(crate) last_switch: Mutex<HashMap<Provider, Instant>>,
+    /// A graceful switch waiting for Claude Code sessions to wrap up (see `wind_down`).
+    pub(crate) wind_down: Mutex<wind_down::Tracker>,
     /// The past few hours of readings, for the agents' pace forecasts.
     pub(crate) recent: Mutex<headroom::Recent>,
     /// Sources found by the last refresh, where switches are written.
@@ -558,6 +560,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             Ok(leased)
         }
         R::RecordSession { session_id, cwd, config_dir } => record_session(&app, session_id, cwd, config_dir).await,
+        R::Turn { session_id, event, config_dir } => record_turn(&app, session_id, event, config_dir).await,
         R::AddAccount { provider } => {
             desktop_shown()?;
             // One pending sign-in per provider, so a retrying agent cannot flood the desktop.
@@ -1657,6 +1660,111 @@ async fn record_session(app: &AppHandle, session_id: String, cwd: Option<String>
     Ok(serde_json::json!({ "recorded": true }))
 }
 
+/// Claude Code's turn hook (see `turn_hook`, `wind_down`). Only sessions on the default login
+/// take part: a switch moves the default login, never a session's own config dir.
+async fn record_turn(app: &AppHandle, session_id: String, event: String, config_dir: Option<String>) -> Result<serde_json::Value, String> {
+    let event = match event.as_str() {
+        "prompt" => wind_down::Event::Prompt,
+        "stop" => wind_down::Event::Stop,
+        _ => return Err("bad_event".into()),
+    };
+    if !crate::session_hook::valid_session_id(&session_id) {
+        return Err("bad_session_id".into());
+    }
+    let none = || Ok(serde_json::json!({ "context": null, "block": null }));
+    if config_dir.is_some() {
+        return none();
+    }
+    let state = app.state::<AppState>();
+    // The account it started on (SessionStart hook); a session SlopBar has not heard of yet is
+    // on the default login's account now.
+    let known = state.active_log.lock().unwrap().session(&session_id).map(str::to_string);
+    let account = match known {
+        Some(id) => id,
+        None => {
+            record_session(app, session_id.clone(), None, None).await?;
+            let Some(id) = state.active_log.lock().unwrap().session(&session_id).map(str::to_string) else { return none() };
+            id
+        }
+    };
+    let now = chrono::Utc::now();
+    let (reply, ready) = {
+        let mut tracker = state.wind_down.lock().unwrap();
+        let reply = tracker.on_event(&session_id, &account, event, now);
+        (reply, event == wind_down::Event::Stop && tracker.ready(now))
+    };
+    if ready {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move { finish_wind_down(&app).await });
+    }
+    Ok(match reply {
+        wind_down::Reply::None => serde_json::json!({ "context": null, "block": null }),
+        wind_down::Reply::Context(c) => serde_json::json!({ "context": c, "block": null }),
+        wind_down::Reply::Block(b) => serde_json::json!({ "context": null, "block": b }),
+    })
+}
+
+/// The balancer's switches, with a Claude account that has its own percentage (`rotate_at`) held
+/// back while its sessions wind down (see `wind_down`): the wind-down starts at that percentage,
+/// and the switch goes ahead once it is ready or usage reaches the hard limit. A wind-down whose
+/// reason went away (a manual switch, a reset, no account to move to) ends without switching.
+fn graceful_decisions(app: &AppHandle, list: &[model::AccountUsage], settings: &Settings, decisions: Vec<(Provider, String)>) -> Vec<(Provider, String)> {
+    let state = app.state::<AppState>();
+    let now = chrono::Utc::now();
+    let current = list.iter().find(|a| a.provider == Provider::Claude && a.active);
+    let own = current.and_then(|a| settings.rotate_at.get(&format!("claude:{}", a.id)).copied());
+    let target = decisions.iter().find(|(p, _)| *p == Provider::Claude).map(|(_, id)| id.clone());
+    let mut tracker = state.wind_down.lock().unwrap();
+    let (Some(target), Some(current), Some(own)) = (target, current, own) else {
+        tracker.finish();
+        return decisions;
+    };
+    let peak = current.peak().unwrap_or(0.0);
+    let hold = peak < wind_down::hard_limit(own);
+    let mut started = None;
+    if hold && tracker.active.as_ref().is_none_or(|a| a.from != current.id) {
+        tracker.start(&current.id, chrono::Duration::minutes(settings.rotate_grace_minutes as i64), now);
+        started = tracker.active.as_ref().map(|a| a.deadline);
+    }
+    if hold && !tracker.ready(now) {
+        drop(tracker);
+        if let Some(deadline) = started {
+            let label = |id: &str| list.iter().find(|a| a.provider == Provider::Claude && a.id == id).and_then(|a| a.alias.clone().or(a.email.clone()));
+            crate::alerts::on_wind_down(app, label(&current.id).as_deref(), label(&target).as_deref(), peak);
+            let wait = (deadline - now).to_std().unwrap_or_default() + Duration::from_secs(1);
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(wait).await;
+                finish_wind_down(&app).await;
+            });
+        }
+        return decisions.into_iter().filter(|(p, _)| *p != Provider::Claude).collect();
+    }
+    tracker.finish();
+    decisions
+}
+
+/// Ends a wind-down that is ready: switches to the account the balancer picks now (the one chosen
+/// at the start may have changed), unless the account is no longer signed in or no longer needs it.
+async fn finish_wind_down(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let Some(done) = ({
+        let mut tracker = state.wind_down.lock().unwrap();
+        if tracker.ready(chrono::Utc::now()) { tracker.finish() } else { None }
+    }) else { return };
+    let (accounts, settings) = (state.snapshot.lock().unwrap().accounts.clone(), state.settings.lock().unwrap().clone());
+    if !accounts.iter().any(|a| a.provider == Provider::Claude && a.active && a.id == done.from) {
+        return;
+    }
+    let leased = state.leases.lock().unwrap().accounts();
+    let Some((_, target)) = balancer::decide_avoiding(&accounts, &settings, &HashMap::new(), &leased)
+        .into_iter().find(|(p, _)| *p == Provider::Claude) else { return };
+    if switch_to(app, Provider::Claude, target, true).await.is_ok() {
+        state.last_switch.lock().unwrap().insert(Provider::Claude, Instant::now());
+        do_refresh(app).await;
+    }
+}
+
 fn pin_listing(app: &AppHandle) -> pins::Listing {
     let state = app.state::<AppState>();
     let settings = state.settings.lock().unwrap().clone();
@@ -2268,6 +2376,7 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
         let leased = state.leases.lock().unwrap().accounts();
         balancer::decide_avoiding(&list, &settings, &last, &leased)
     };
+    let decisions = graceful_decisions(app, &list, &settings, decisions);
     for (provider, id) in decisions {
         // Publish the current numbers first so the switch notice can name both accounts.
         *state.snapshot.lock().unwrap() = Snapshot { accounts: list.clone(), updated_at: Some(chrono::Utc::now()) };
@@ -2965,6 +3074,7 @@ pub fn run() {
         settings_lock: tokio::sync::Mutex::new(()),
         account_operations: monitoring::Operations::default(),
         last_switch: Mutex::default(),
+        wind_down: Mutex::default(),
         recent: Mutex::default(),
         sources: Mutex::default(),
         presence_tracks: Mutex::default(),

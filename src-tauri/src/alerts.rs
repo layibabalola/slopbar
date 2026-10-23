@@ -360,6 +360,15 @@ pub fn switch_notice(lang: &str, provider: Provider, to: Option<&str>, auto: boo
     })
 }
 
+/// A graceful switch started (see `wind_down`): it waits for running sessions to wrap up.
+pub fn wind_down_notice(lang: &str, from: Option<&str>, to: Option<&str>, percent: f64, prefs: &Notifications) -> Option<Notice> {
+    prefs.switches.then(|| {
+        let name = provider_name("claude");
+        let percent = format!("{}", percent.round() as i64);
+        plain(name.to_string(), t(lang, "windDownStarted", &[("from", from.unwrap_or("")), ("to", to.unwrap_or("")), ("percent", &percent)]))
+    })
+}
+
 /// An automatic monitoring sign-in started (see `auto_monitor`): the user finishes it in the browser.
 pub fn monitor_auto_notice(lang: &str, name: Option<&str>) -> Notice {
     let unknown = t(lang, "unknownAccount", &[]);
@@ -367,7 +376,7 @@ pub fn monitor_auto_notice(lang: &str, name: Option<&str>) -> Notice {
 }
 
 #[cfg(feature = "desktop")]
-pub use glue::{on_monitor_auto_started, on_snapshot, on_switch};
+pub use glue::{on_monitor_auto_started, on_snapshot, on_switch, on_wind_down};
 
 #[cfg(feature = "desktop")]
 mod glue {
@@ -437,6 +446,13 @@ mod glue {
     pub fn on_switch(app: &AppHandle, provider: Provider, to: Option<&str>, auto: bool) {
         let (prefs, lang) = context(app);
         if let Some(n) = switch_notice(&lang, provider, to, auto, &prefs) {
+            send(app, vec![n]);
+        }
+    }
+
+    pub fn on_wind_down(app: &AppHandle, from: Option<&str>, to: Option<&str>, percent: f64) {
+        let (prefs, lang) = context(app);
+        if let Some(n) = wind_down_notice(&lang, from, to, percent, &prefs) {
             send(app, vec![n]);
         }
     }

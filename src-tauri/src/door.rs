@@ -129,6 +129,14 @@ pub enum Request {
         #[serde(default)]
         config_dir: Option<String>,
     },
+    /// Claude Code's turn hook (see `turn_hook`): a session started ("prompt") or ended ("stop") a
+    /// turn. The reply's `context` or `block` is what the hook prints (see `wind_down`).
+    Turn {
+        session_id: String,
+        event: String,
+        #[serde(default)]
+        config_dir: Option<String>,
+    },
     SwitchAccount { provider: Provider, id: String },
     AddAccount { provider: Provider },
     ConnectMonitoring { provider: Provider, id: String },

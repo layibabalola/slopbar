@@ -7,7 +7,8 @@
 //!
 //! With `--statusline` it instead prints one line for Claude Code's status line and exits (see
 //! `statusline`); with `--session-hook` it is Claude Code's SessionStart hook (see
-//! `session_hook`); `--pick` and `--release` serve the `slopbar-run` launcher (see `launcher`);
+//! `session_hook`); with `--turn-hook` its UserPromptSubmit and Stop hook for graceful rotation (see
+//! `turn_hook`); `--pick` and `--release` serve the `slopbar-run` launcher (see `launcher`);
 //! `--call` runs one tool and prints its result, which is how another computer reaches this one
 //! over SSH, and `--pair-receive` takes a pairing key on standard input (see `pairing`).
 fn main() {
@@ -15,6 +16,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("--statusline") => slopbar_lib::statusline(),
         Some("--session-hook") => slopbar_lib::session_hook(),
+        Some("--turn-hook") => slopbar_lib::turn_hook(),
         Some("--pick" | "--release") => std::process::exit(slopbar_lib::launcher_helper(&args)),
         Some("--call" | "--call-b64") => std::process::exit(slopbar_lib::call_cli(&args)),
         Some("--pair-receive") => std::process::exit(slopbar_lib::pair_receive()),
