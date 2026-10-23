@@ -35,6 +35,8 @@ mod calendar;
 mod digest;
 mod statusline;
 mod session_hook;
+mod turn_hook;
+mod wind_down;
 mod leases;
 mod launcher;
 mod i18n;
@@ -46,6 +48,7 @@ mod widget_draw;
 #[cfg(all(windows, feature = "desktop"))]
 mod widget_win;
 pub use session_hook::run as session_hook;
+pub use turn_hook::run as turn_hook;
 pub use launcher::helper as launcher_helper;
 pub use statusline::run as statusline;
 pub use diagnostics::write_build_info;

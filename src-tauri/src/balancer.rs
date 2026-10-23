@@ -3,6 +3,10 @@
 //! among those well below it: the one whose weekly reset or renewal comes soonest, so capacity
 //! that would be lost is used first. Accounts in use on another machine, on a plan that is
 //! ending or lapsed, or without a fresh reading are never targets.
+//!
+//! An account with its own percentage (`Settings::rotate_at`) is rotated off at that percentage
+//! even with automatic switching off, and is a target only well below it, so an account kept for
+//! the web is not picked again for coding (`wind_down` makes that rotation graceful).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -36,12 +40,17 @@ pub fn decide_avoiding(
     let mut out = Vec::new();
     for provider in Provider::ALL {
         let rule = settings.balancer.rule(provider);
-        if !rule.auto || last_switch.get(&provider).is_some_and(|t| t.elapsed() < COOLDOWN) {
+        let own = |id: &str| settings.rotate_at.get(&format!("{}:{id}", provider.key())).copied();
+        let threshold_of = |id: &str| own(id).unwrap_or(rule.threshold) as f64;
+        if last_switch.get(&provider).is_some_and(|t| t.elapsed() < COOLDOWN) {
             continue;
         }
         let of_provider: Vec<&AccountUsage> = accounts.iter().filter(|a| a.provider == provider && !a.stale && a.error.is_none()).collect();
         let Some(current) = of_provider.iter().find(|a| a.active) else { continue };
-        let threshold = rule.threshold as f64;
+        if !rule.auto && own(&current.id).is_none() {
+            continue;
+        }
+        let threshold = threshold_of(&current.id);
         if current.peak().unwrap_or(0.0) < threshold {
             continue;
         }
@@ -49,7 +58,7 @@ pub fn decide_avoiding(
         let rec = crate::headroom::recommend(accounts, settings, provider, None, None, chrono::Utc::now());
         let best = rec.ranking.iter()
             .filter(|c| c.fits && !c.active && !leased.iter().any(|(p, id)| *p == provider && *id == c.id))
-            .find(|c| of_provider.iter().any(|a| a.id == c.id && a.peak().is_some_and(|p| p < threshold - HYSTERESIS)));
+            .find(|c| of_provider.iter().any(|a| a.id == c.id && a.peak().is_some_and(|p| p < threshold_of(&a.id) - HYSTERESIS)));
         if let Some(target) = best {
             out.push((provider, target.id.clone()));
         }
@@ -82,6 +91,23 @@ mod tests {
         let both = [(Provider::Claude, "leased".to_string()), (Provider::Claude, "free".to_string())];
         assert!(decide_avoiding(&accounts, &settings, &HashMap::new(), &both).is_empty());
         assert_eq!(decide_avoiding(&accounts, &settings, &HashMap::new(), &[(Provider::Codex, "leased".to_string())]).len(), 1, "another provider's lease");
+    }
+
+    #[test]
+    fn an_accounts_own_percentage_rotates_it_and_keeps_it_from_being_picked() {
+        let mut settings = Settings::default();
+        settings.rotate_at.insert("claude:main".into(), 90);
+        let accounts = [account("main", true, Some(91.0)), account("spare", false, Some(30.0))];
+        assert_eq!(decide_avoiding(&accounts, &settings, &HashMap::new(), &[]), [(Provider::Claude, "spare".into())], "even with auto off");
+        let below = [account("main", true, Some(85.0)), account("spare", false, Some(30.0))];
+        assert!(decide_avoiding(&below, &settings, &HashMap::new(), &[]).is_empty());
+        // Automatic switching off another account never lands back on main at 85% (its own 90% less the margin).
+        settings.balancer.claude.auto = true;
+        let back = [account("spare", true, Some(95.0)), account("main", false, Some(85.0))];
+        assert!(decide_avoiding(&back, &settings, &HashMap::new(), &[]).is_empty());
+        // Without its own percentage an account still follows the provider rule only.
+        settings.balancer.claude.auto = false;
+        assert!(decide_avoiding(&back, &settings, &HashMap::new(), &[]).is_empty());
     }
 
     #[test]

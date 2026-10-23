@@ -117,6 +117,7 @@ function accountRow(p, a) {
         ${a.monitor_connected && (settings.presence_folder || settings.presence_remote)
           ? `<label class="web-use" title="${esc(t("webUseHint"))}"><input type="checkbox" data-web-use="${esc(key)}" ${settings.web_use?.[key] ? "checked" : ""} /> ${t("webUse")}</label>`
           : ""}
+        ${p === "claude" ? rotateControl(key) : ""}
       </div>
       ${meter}
       ${a.active
@@ -159,6 +160,15 @@ function patch(container, html) {
     const twin = next.querySelectorAll(".balancer")[i];
     if (twin && twin.outerHTML !== el.outerHTML) el.replaceWith(twin);
   });
+}
+
+// A Claude account's own rotation percentage (`rotate_at`): it is rotated off gracefully there.
+function rotateControl(key) {
+  const at = settings.rotate_at?.[key];
+  const hint = t("gracefulHint", { minutes: settings.rotate_grace_minutes ?? 20, hard: at ? Math.min(at + 5, 98) : "" });
+  const options = [`<option value="" ${at ? "" : "selected"}>${t("presenceOff")}</option>`]
+    .concat([50, 55, 60, 65, 70, 75, 80, 85, 90, 95].map((v) => `<option value="${v}" ${at === v ? "selected" : ""}>${v}%</option>`));
+  return `<label class="web-use" title="${esc(hint)}">${t("graceful")} <select data-rotate-at="${esc(key)}">${options.join("")}</select></label>`;
 }
 
 function renderAccounts() {
@@ -279,6 +289,11 @@ $("accounts").addEventListener("change", (e) => {
     if (el.checked) web_use[el.dataset.webUse] = true;
     else delete web_use[el.dataset.webUse];
     update({ web_use });
+  } else if (el.dataset.rotateAt) {
+    const rotate_at = { ...settings.rotate_at };
+    if (el.value) rotate_at[el.dataset.rotateAt] = Number(el.value);
+    else delete rotate_at[el.dataset.rotateAt];
+    update({ rotate_at });
   } else if (el.dataset.auto) {
     const p = el.dataset.auto;
     update({ balancer: { ...settings.balancer, [p]: { ...settings.balancer[p], auto: el.checked } } });
