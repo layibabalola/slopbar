@@ -2,6 +2,10 @@
 
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
+    // A CLI sign-in opening its page through `BROWSER` (see `signin`): open it and exit.
+    if let Some(code) = slopbar_lib::signin_launch(&args) {
+        std::process::exit(code);
+    }
     if args.len() == 3 && args[1] == "--build-info-to" {
         // Offline metadata only. Do not initialize Tauri or read user credentials.
         let status = slopbar_lib::write_build_info(std::path::Path::new(&args[2]));
