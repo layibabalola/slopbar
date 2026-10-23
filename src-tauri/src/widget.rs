@@ -345,6 +345,7 @@ pub struct Layout {
 
 /// Lays the view out in a window `height` DIPs tall. `measure` gives a text's width at the
 /// widget's font (DirectWrite on Windows).
+#[cfg(test)]
 pub fn layout(view: &View, height: f32, measure: &dyn Fn(&str) -> f32) -> Layout {
     layout_within(view, height, f32::INFINITY, measure)
 }
