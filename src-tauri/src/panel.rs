@@ -29,6 +29,10 @@ static READY: AtomicBool = AtomicBool::new(false);
 static SHOW_WHEN_BUILT: AtomicBool = AtomicBool::new(false);
 /// The flyout is being built (by `prepare` or a click), so a second build is not started.
 static BUILDING: AtomicBool = AtomicBool::new(false);
+/// The flyout's webview has been on screen at least once, so hiding may suspend it.
+static SHOWN: AtomicBool = AtomicBool::new(false);
+/// The flyout's webview was suspended when it was last hidden.
+static SUSPENDED: AtomicBool = AtomicBool::new(false);
 
 /// The flyout's page has laid itself out (it reports its height through `set_panel_height`).
 pub fn page_ready() {
@@ -50,6 +54,8 @@ async fn build(app: &AppHandle) {
         return;
     }
     READY.store(false, Ordering::Release);
+    SHOWN.store(false, Ordering::Release);
+    SUSPENDED.store(false, Ordering::Release);
     let built = crate::app::on_demand_window(app, LABEL).await;
     if built.is_some() {
         let started = Instant::now();
@@ -189,15 +195,22 @@ fn set_webview_visible(win: &tauri::WebviewWindow, visible: bool) {
         let controller = w.controller();
         let webview = controller.CoreWebView2().ok().and_then(|c| c.cast::<ICoreWebView2_3>().ok());
         if visible {
-            if let Some(webview) = &webview {
-                let _ = webview.Resume();
+            if SUSPENDED.swap(false, Ordering::AcqRel) {
+                if let Some(webview) = &webview {
+                    let _ = webview.Resume();
+                }
             }
             let _ = controller.SetIsVisible(true);
             let _ = controller.NotifyParentWindowPositionChanged();
+            SHOWN.store(true, Ordering::Release);
         } else {
             let _ = controller.SetIsVisible(false);
-            if let Some(webview) = &webview {
-                let _ = webview.TrySuspend(&TrySuspendCompletedHandler::create(Box::new(|_, _| Ok(()))));
+            // Never before it has been on screen once: suspended before it ever drew, it opens empty.
+            if SHOWN.load(Ordering::Acquire) {
+                if let Some(webview) = &webview {
+                    let _ = webview.TrySuspend(&TrySuspendCompletedHandler::create(Box::new(|_, _| Ok(()))));
+                    SUSPENDED.store(true, Ordering::Release);
+                }
             }
         }
     });
