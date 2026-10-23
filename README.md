@@ -138,6 +138,35 @@ Claude Code's transcripts do not name the account they ran on, so the usage brea
 
 Merge it into an existing `hooks` object if you have one. `SLOPBAR_HOOK_DEBUG=1` makes the hook say on stderr what happened.
 
+### Graceful rotation (an account kept for the web)
+
+Settings > Accounts > a Claude account > **Rotate off at** gives that account its own usage percentage (`rotate_at`, 50–95%). It suits an account you also use on claude.ai and never want coding to drain: at that percentage SlopBar rotates off it even with automatic switching off, and automatic switching never moves back to it until it is 10 points below.
+
+The rotation is graceful. Running Claude Code sessions on the account finish the task they are on, then save their state before the switch:
+
+- a prompt submitted on the account gets context saying it is rotating: finish this task and don't start new work;
+- the first time each of its sessions ends a turn, SlopBar blocks that stop once with the wrap-up instruction: update durable memory and each project's canonical state on disk (handoff, checkpoint or status files, following that project's own conventions), then end the turn;
+- once no session is still busy or wrapping up, SlopBar switches to the account it would pick for automatic switching.
+
+It never waits past `rotate_grace_minutes` (20 by default, 5–120) or past 5 points above the percentage (at most 98%), whichever comes first. Sessions idle when the rotation starts are not waited on. Only sessions on the default login take part, since a switch never moves a project profile. A Windows notification says when a rotation starts; the usual switch notice says when it is done.
+
+The turn hook needs these entries (and the SessionStart hook above, so sessions are tied to their account from the start):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "C:/Users/<you>/AppData/Local/SlopBar/slopbar-mcp.exe --turn-hook" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "C:/Users/<you>/AppData/Local/SlopBar/slopbar-mcp.exe --turn-hook" } ] }
+    ]
+  }
+}
+```
+
+It prints nothing unless the session's account is rotating, sends only the session id, the event and `CLAUDE_CONFIG_DIR` through the door (never the prompt), waits at most 1.5 seconds and always exits 0.
+
 ### Smart launcher (`slopbar-run`)
 
 SlopBar keeps a launcher at `%APPDATA%\dev.thelio.slopbar\bin\slopbar-run.cmd` (Settings > Accounts > Projects shows the exact path). Put that folder on your `PATH`, then:
@@ -175,6 +204,8 @@ The `tauri/custom-protocol` feature selects Tauri's release configuration with e
 Local builds disable upstream updates at compile time, including if an existing settings file enables automatic updates. This prevents an unpatched upstream release from replacing this fix. Release maintainers can explicitly enable the `upstream-updates` Cargo feature after merging the fix. The Settings page shows when updates are unavailable.
 
 An optional frontend smoke check is available as `node scripts/test-telemetry-ui.cjs` with Playwright and Chromium installed. It uses synthetic accounts and mocked Tauri commands to check monitoring controls, stale usage, error feedback, and the minimum supported window width. Set `CHROMIUM_PATH` to use an existing Chromium binary. These checks do not authenticate with a provider or exercise a real Windows credential store; the Rust tests run DPAPI checks when executed on Windows.
+
+To check that a click on the taskbar widget really draws the flyout in the running app, run `powershell -ExecutionPolicy Bypass -File scripts/test-flyout-click.ps1` on an unlocked desktop. It posts a click to the native widget, fronts and captures the flyout from the screen with BitBlt (not PrintWindow, which repaints and would hide a flyout that is shown but never composited), closes it with a second click and captures what was behind it. It prints the time until the flyout is visible, its distinct colour count and how much it matches what is behind it, then PASS or FAIL: it fails when the flyout is not visible within 2 seconds, matches the background by more than 50%, or has fewer than 20 colours. Both captures are saved as PNGs in `%TEMP%` and can show account emails, so do not attach them to public issues. It refuses to run without a foreground window (a locked screen or disconnected remote session), where no capture means anything.
 
 The Rust suite also runs the real HTTP code against a local server with synthetic tokens: JSON request encoding, saved Claude scopes, nested OAuth errors, rate limits, delayed responses, and revocation. It covers failed credential-file deletion after handoff, non-revocation of imported sessions, and successful-response bodies that must never be replayed. Windows tests check suspended process startup and descendant termination. `Telemetry tests` runs core tests on Linux and Windows, then checks the official updater feature and builds an unsigned native Windows desktop executable. Its test-build artifact includes the exact source and SHA256 manifest; it does not publish a release or use signing secrets. Fork PR workflows can require maintainer approval before they execute.
 

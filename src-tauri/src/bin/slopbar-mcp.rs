@@ -7,12 +7,14 @@
 //!
 //! With `--statusline` it instead prints one line for Claude Code's status line and exits (see
 //! `statusline`); with `--session-hook` it is Claude Code's SessionStart hook (see
-//! `session_hook`); `--pick` and `--release` serve the `slopbar-run` launcher (see `launcher`).
+//! `session_hook`); with `--turn-hook` its UserPromptSubmit and Stop hook for graceful rotation (see
+//! `turn_hook`); `--pick` and `--release` serve the `slopbar-run` launcher (see `launcher`).
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--statusline") => slopbar_lib::statusline(),
         Some("--session-hook") => slopbar_lib::session_hook(),
+        Some("--turn-hook") => slopbar_lib::turn_hook(),
         Some("--pick" | "--release") => std::process::exit(slopbar_lib::launcher_helper(&args)),
         _ => std::process::exit(if slopbar_lib::serve_mcp().is_ok() { 0 } else { 1 }),
     }
