@@ -193,6 +193,7 @@ impl Renderer {
     }
 
     /// Draws `view` `height` physical pixels tall for a monitor at `dpi`.
+    #[cfg(test)]
     pub fn draw(&self, view: &View, look: Look, dpi: u32, height: i32) -> Option<(Surface, Layout)> {
         self.draw_within(view, look, dpi, height, None)
     }
