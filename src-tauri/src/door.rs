@@ -17,7 +17,7 @@ use std::time::Duration;
 use crate::accounts::Provider;
 
 /// Bumped when the request or reply shape changes.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 /// Requests are one JSON line (a settings patch with aliases is the largest).
 const MAX_REQUEST: u64 = 16 * 1024;
 /// Replies are one JSON line (a usage snapshot is the largest).
@@ -195,6 +195,9 @@ pub enum Request {
         #[serde(default)]
         sync: bool,
     },
+    /// Whether sign-ins can run here (see `pairing::assess`): build, desktop session, browser,
+    /// roster and the accounts waiting.
+    GetReadiness,
     /// `get_roster` with `sync`, for the MCP tool `sync_roster`.
     SyncRoster,
     /// Saves the roster passphrase on this machine (null deletes it), then syncs with it.
