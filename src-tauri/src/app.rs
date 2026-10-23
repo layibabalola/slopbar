@@ -1693,6 +1693,8 @@ async fn set_project_pin(app: AppHandle, folder: String, provider: Provider, id:
 
 /// How long the switcher stays loaded after it hides, so opening it again soon is instant.
 const SWITCHER_LINGER: Duration = Duration::from_secs(30);
+/// How long after a blur the switcher checks whether it really lost the foreground.
+const SWITCHER_BLUR_SETTLE: Duration = Duration::from_millis(80);
 
 /// Settings and the quick switcher are not created at startup (`"create": false`): each is
 /// built when first opened and destroyed when closed, so neither keeps a WebView2 renderer
@@ -1740,7 +1742,16 @@ fn watch_switcher(win: &tauri::WebviewWindow) {
     let w = win.clone();
     win.on_window_event(move |e| {
         if let WindowEvent::Focused(false) = e {
-            hide_switcher_window(&w);
+            // Just shown, WebView2 takes the keyboard focus from the window, which reports a blur
+            // while the switcher is still in front; hiding then made it flash and vanish. Hide only
+            // once the foreground has really gone elsewhere.
+            let w = w.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(SWITCHER_BLUR_SETTLE).await;
+                if w.is_visible().unwrap_or(false) && !dock::is_foreground(&w) {
+                    hide_switcher_window(&w);
+                }
+            });
         }
     });
 }
