@@ -1,4 +1,4 @@
-use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, panel, phone, pins, plan_alerts, presence, providers, reset_credits, settings, sources, subscriptions, unexpected, updates, usage_index, wind_down};
+use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, panel, phone, pins, plan_alerts, presence, providers, reset_credits, settings, signin, sources, subscriptions, unexpected, updates, usage_index, wind_down};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -87,13 +87,19 @@ pub struct AppState {
 
 pub(crate) const SWITCHER_LABEL: &str = "switcher";
 
-/// Progress of "Connect monitoring for all", sent to Settings as `bulk-monitoring`.
+/// Progress of "Connect monitoring for all" and "Sign in all accounts", sent to Settings as
+/// `bulk-monitoring`.
 #[derive(Clone, Serialize)]
 struct BulkConnect {
     total: usize,
     done: usize,
     /// The account whose sign-in is open now: sign in as this one.
     current: Option<bulk::Target>,
+    /// What the open sign-in is for (None: a monitoring sign-in of "Connect monitoring for all").
+    kind: Option<bulk::Kind>,
+    /// "Sign in all accounts": how many emails, and which one (1-based) is signing in now.
+    emails: usize,
+    email: usize,
     finished: bool,
     error: Option<String>,
 }
@@ -528,6 +534,15 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             Ok(serde_json::json!({ "started": !queued.is_empty(), "queued": queued,
                 "next": "Each sign-in opens after the previous one finishes; the user signs in as the account named in Settings. get_usage shows monitor_connected as they complete." }))
         }
+        R::SignInAll { confirm, monitoring } => {
+            if !confirm {
+                return Ok(serde_json::json!({ "started": false, "plan": sign_in_plan(&app, monitoring),
+                    "next": "Nothing was started. With confirm: true the sign-ins open one at a time, an email's back to back in that email's own browser profile; the user signs in as each account named here and completes every page." }));
+            }
+            let plan = sign_in_all(&app, monitoring).await?;
+            Ok(serde_json::json!({ "started": !plan.is_empty(), "plan": plan,
+                "next": "Each sign-in opens after the previous one finishes. get_usage shows the accounts and monitor_connected as they complete." }))
+        }
         R::RemoveLapsedAccounts { confirm } => {
             if !confirm {
                 let state = app.state::<AppState>();
@@ -696,18 +711,64 @@ async fn start_add_account(app: AppHandle, provider: Provider, pending: Option<m
             known
         }
     };
+    // Who signs in is not known yet, so there is no email's profile to open: a private window if
+    // the user chose those, else the CLI's default browser.
+    let options = signin_options(&app, None);
     // Probing for the CLI runs wsl.exe / where.exe; keep it off the async runtime.
-    let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login(provider, &found))
+    let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, None, options))
         .await
         .map_err(|e| e.to_string())??;
     tauri::async_runtime::spawn(async move {
         let _pending = pending;
         let added = job.wait(&http_client()).await;
         if let Some(slot) = added {
+            forget_pending(slot.provider, &slot.id);
             let _ = app.emit("account-added", (slot.provider, slot.email));
             do_refresh(&app).await;
         }
     });
+    Ok(())
+}
+
+/// Where a sign-in as `email` opens its page, from the user's choice (see `signin`).
+fn signin_options(app: &AppHandle, email: Option<&str>) -> accounts::LoginOptions {
+    let window = app.state::<AppState>().settings.lock().unwrap().signin_window;
+    accounts::LoginOptions { email: email.map(str::to_owned), target: signin::Target::choose(window, email) }
+}
+
+/// A restored account that is signed in again is no longer pending.
+fn forget_pending(provider: Provider, id: &str) {
+    let mut list = bulk::load_pending();
+    let before = list.len();
+    list.retain(|p| !(p.provider == provider && p.id == id));
+    if list.len() != before {
+        let _ = bulk::save_pending(&list);
+    }
+}
+
+/// Signs a restored account in again, as "Add account" does, but only as that account: a login
+/// of any other account is not saved and is revoked, the way monitoring rejects a wrong account.
+/// Returns once the user is done.
+async fn add_expected(app: &AppHandle, expected: &bulk::Step) -> Result<(), String> {
+    let provider = expected.target.provider;
+    let _operation = app.state::<AppState>().account_operations.begin(provider, "add-account")?;
+    let _sign_in = app.state::<AppState>().account_operations.begin_key(monitoring::SIGN_IN)?;
+    let found = app.state::<AppState>().sources.lock().unwrap().clone();
+    let options = signin_options(app, expected.email.as_deref());
+    let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, None, options))
+        .await.map_err(|_| "monitor_login_failed".to_string())??;
+    let client = http_client();
+    let login = job.wait_isolated(&client).await.ok_or("monitor_login_failed")?;
+    // The slot id names the account and, for Claude, its organization (server-verified above).
+    if login.provider != provider || login.id != expected.target.id {
+        // Never a token a stored login or monitor holds; this fresh login holds none of those.
+        app.state::<AppState>().monitor.discard_unstored_login(&login, &accounts::load_slots(), &client).await;
+        return Err("monitor_wrong_account".into());
+    }
+    accounts::store_login(&login).map_err(|_| "monitor_storage".to_string())?;
+    forget_pending(provider, &login.id);
+    let _ = app.emit("account-added", (login.provider, login.email.clone()));
+    do_refresh(app).await;
     Ok(())
 }
 
@@ -732,7 +793,8 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
     app.state::<AppState>().diagnostics.record(Some(provider), Some(&id), diagnostics::Event::Action { action: diagnostics::Action::ConnectStarted, code: diagnostics::Code::Ok, elapsed_ms: 0 });
     let found = app.state::<AppState>().sources.lock().unwrap().clone();
     let context = diagnostics::Context { recorder: app.state::<AppState>().diagnostics.clone(), provider, id: id.clone() };
-    let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, Some(context))).await;
+    let options = signin_options(&app, expected.email.as_deref());
+    let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, Some(context), options)).await;
     let job = match job {
         Ok(Ok(job)) => job,
         _ => {
@@ -793,55 +855,102 @@ fn publish_bulk(app: &AppHandle, change: impl FnOnce(&mut BulkConnect)) {
     }
 }
 
-/// Queues a monitoring sign-in for every account without one: one terminal at a time, each
-/// started once the previous sign-in finished, stopping at the first that fails (the user closed
-/// it, or signed in as another account). Returns the queued accounts.
+/// Queues a monitoring sign-in for every account without one (see `run_sign_ins`). Returns the
+/// queued accounts.
 async fn connect_all(app: &AppHandle) -> Result<Vec<bulk::Target>, String> {
+    let groups = bulk::sign_in_plan(&app.state::<AppState>().snapshot.lock().unwrap(), &[], true);
+    let targets = groups.iter().flat_map(|g| g.steps.iter().map(|s| s.target.clone())).collect();
+    run_sign_ins(app, groups, false)?;
+    Ok(targets)
+}
+
+/// "Sign in all accounts": signs every pending account in again and, with `monitoring`, connects
+/// monitoring for each account without it, one email at a time (see `bulk::sign_in_plan`).
+/// Returns the plan.
+async fn sign_in_all(app: &AppHandle, monitoring: bool) -> Result<Vec<bulk::Group>, String> {
+    let groups = sign_in_plan(app, monitoring);
+    run_sign_ins(app, groups.clone(), true)?;
+    Ok(groups)
+}
+
+fn sign_in_plan(app: &AppHandle, monitoring: bool) -> Vec<bulk::Group> {
+    let pending = bulk::load_pending();
+    bulk::sign_in_plan(&app.state::<AppState>().snapshot.lock().unwrap(), &pending, monitoring)
+}
+
+/// Runs the sign-ins one terminal at a time, each started once the previous one finished, an
+/// email's sign-ins back to back so its browser profile is signed in to Google once for all of
+/// them. Stops at the first that fails (the user closed it, or signed in as another account).
+fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let targets = bulk::unmonitored(&state.snapshot.lock().unwrap());
+    let total = groups.iter().map(|g| g.steps.len()).sum();
     {
         let mut running = state.bulk_connect.lock().unwrap();
         if running.as_ref().is_some_and(|b| !b.finished) {
             return Err("monitor_busy".into());
         }
-        *running = Some(BulkConnect { total: targets.len(), done: 0, current: None, finished: targets.is_empty(), error: None });
+        *running = Some(BulkConnect { total, done: 0, current: None, kind: None, emails: if by_email { groups.len() } else { 0 }, email: 0,
+            finished: total == 0, error: None });
     }
     let h = app.clone();
-    let queue = targets.clone();
     tauri::async_runtime::spawn(async move {
         let mut error = None;
-        for (done, target) in queue.iter().enumerate() {
-            publish_bulk(&h, |b| { b.done = done; b.current = Some(target.clone()); });
-            // Connected (or removed) since the queue started: nothing to do.
-            let waiting = h.state::<AppState>().snapshot.lock().unwrap().accounts.iter()
-                .any(|a| a.provider == target.provider && a.id == target.id && !a.monitor_connected);
-            if !waiting {
-                continue;
-            }
-            // Another sign-in is open (one the user or automatic monitoring started): wait for it.
-            while h.state::<AppState>().account_operations.busy(monitoring::SIGN_IN) {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-            // The user asked for these, so they count as manual starts, never automatic ones.
-            let key = format!("{}:{}", target.provider.name(), target.id);
-            auto_monitor_saved(&h, |t| t.manual(&key, true));
-            let outcome = match start_monitoring_login(h.clone(), target.provider, target.id.clone(), false).await {
-                Ok(task) => task.await.unwrap_or_else(|_| Err("monitor_login_failed".into())),
-                Err(e) => Err(e),
-            };
-            if let Err(e) = outcome {
-                error = Some(e);
-                break;
+        let mut done = 0;
+        'groups: for (index, group) in groups.iter().enumerate() {
+            for step in &group.steps {
+                let target = &step.target;
+                publish_bulk(&h, |b| {
+                    b.done = done;
+                    b.current = Some(target.clone());
+                    b.kind = by_email.then_some(step.kind);
+                    b.email = if by_email { index + 1 } else { 0 };
+                });
+                done += 1;
+                // Done (or removed) since the queue started: nothing to do.
+                let still = {
+                    let state = h.state::<AppState>();
+                    let snapshot = state.snapshot.lock().unwrap();
+                    let account = snapshot.accounts.iter().find(|a| a.provider == target.provider && a.id == target.id);
+                    match step.kind {
+                        bulk::Kind::Add => account.is_none(),
+                        bulk::Kind::Connect => account.is_some_and(|a| !a.monitor_connected),
+                    }
+                };
+                if !still {
+                    continue;
+                }
+                // Another sign-in is open (one the user or automatic monitoring started): wait for it.
+                while h.state::<AppState>().account_operations.busy(monitoring::SIGN_IN) {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                let outcome = match step.kind {
+                    bulk::Kind::Add => add_expected(&h, step).await,
+                    bulk::Kind::Connect => {
+                        // The user asked for these, so they count as manual starts, never automatic ones.
+                        let key = format!("{}:{}", target.provider.name(), target.id);
+                        auto_monitor_saved(&h, |t| t.manual(&key, true));
+                        match start_monitoring_login(h.clone(), target.provider, target.id.clone(), false).await {
+                            Ok(task) => task.await.unwrap_or_else(|_| Err("monitor_login_failed".into())),
+                            Err(e) => Err(e),
+                        }
+                    }
+                };
+                if let Err(e) = outcome {
+                    done -= 1;
+                    error = Some(e);
+                    break 'groups;
+                }
             }
         }
         publish_bulk(&h, |b| {
-            if error.is_none() { b.done = b.total; }
+            b.done = done;
             b.current = None;
+            b.kind = None;
             b.finished = true;
             b.error = error;
         });
     });
-    Ok(targets)
+    Ok(())
 }
 
 #[tauri::command]
@@ -858,7 +967,21 @@ fn bulk_status(state: tauri::State<AppState>) -> serde_json::Value {
         "unmonitored": bulk::unmonitored(&snapshot),
         "lapsed": bulk::lapsed(&snapshot, &settings, chrono::Utc::now()),
         "connecting": state.bulk_connect.lock().unwrap().clone(),
+        // "Sign in all accounts" with monitoring; without it, only the `add` steps run.
+        "sign_in": bulk::sign_in_plan(&snapshot, &bulk::load_pending(), true),
+        "signin_profiles": signin::count(),
     })
+}
+
+#[tauri::command]
+async fn sign_in_all_accounts(app: AppHandle, monitoring: bool) -> Result<Vec<bulk::Group>, String> {
+    sign_in_all(&app, monitoring).await
+}
+
+/// "Forget sign-in profiles": deletes the browser profiles sign-ins used, with their cookies.
+#[tauri::command]
+async fn forget_signin_profiles() -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(signin::forget).await.map_err(|_| "signin_profiles_busy".to_string())?
 }
 
 /// Removes every account whose plan has ended, as each row's remove does; accounts in use stay.
@@ -2048,6 +2171,11 @@ async fn apply_backup(app: &AppHandle, bytes: Vec<u8>, passphrase: backup::Passp
     ledger::save(&ledger)?;
     store_settings(app, merged_settings).await?;
     drop(held);
+    // Accounts to sign in again here: "Sign in all accounts" walks through them by email.
+    let mut pending = bulk::load_pending();
+    bulk::add_pending(&mut pending, preview.accounts.iter().filter(|a| !a.connected)
+        .map(|a| bulk::Pending { provider: a.provider, id: a.id.clone(), email: a.email.clone() }));
+    let _ = bulk::save_pending(&pending);
     sync_pins(app, None).await;
     do_refresh(app).await;
     Ok(preview)
@@ -2313,6 +2441,8 @@ pub fn run() {
             revoke_account_sessions,
             remove_account,
             connect_monitoring_all,
+            sign_in_all_accounts,
+            forget_signin_profiles,
             remove_lapsed_accounts,
             bulk_status,
             list_project_pins,
