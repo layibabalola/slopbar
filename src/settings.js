@@ -1284,32 +1284,42 @@ $("check-updates").addEventListener("click", async () => {
 listen("settings-changed", (e) => { settings = e.payload; render(); });
 
 // ---------------------------------------------------------------------------------------------
-// The quick switcher's shortcut (General)
+// The system-wide shortcuts (General): the quick switcher's and the compact flyout toggle's.
+
+const HOTKEYS = [
+  { input: "hotkey", field: "switcher_hotkey", which: "switcher", hint: "switcherShortcutHint", offHint: "hotkeyOffHint" },
+  { input: "compact-hotkey", field: "compact_hotkey", which: "compact", hint: "compactShortcutHint", offHint: "compactShortcutOffHint" },
+];
 
 async function renderHotkey() {
-  if (document.activeElement !== $("hotkey")) $("hotkey").value = settings.switcher_hotkey ?? "";
-  $("hotkey").placeholder = t("hotkeyOff");
-  const problem = settings.switcher_hotkey ? await invoke("hotkey_status").catch(() => null) : null;
-  $("hotkey-hint").textContent = problem ? t(problem) : settings.switcher_hotkey ? t("switcherShortcutHint") : t("hotkeyOffHint");
-  $("hotkey-hint").classList.toggle("problem", !!problem);
+  for (const h of HOTKEYS) {
+    const value = settings[h.field] ?? "";
+    if (document.activeElement !== $(h.input)) $(h.input).value = value;
+    $(h.input).placeholder = t("hotkeyOff");
+    const problem = value ? await invoke("hotkey_status", { which: h.which }).catch(() => null) : null;
+    $(`${h.input}-hint`).textContent = problem ? t(problem) : value ? t(h.hint) : t(h.offHint);
+    $(`${h.input}-hint`).classList.toggle("problem", !!problem);
+  }
 }
-async function saveHotkey() {
-  const before = settings.switcher_hotkey;
-  settings = { ...settings, switcher_hotkey: $("hotkey").value.trim() };
+async function saveHotkey(h) {
+  const before = settings[h.field];
+  settings = { ...settings, [h.field]: $(h.input).value.trim() };
   try {
     await invoke("save_settings", { settings });
     settings = await invoke("get_settings");
-    $("hotkey").value = settings.switcher_hotkey;
-  } catch {
-    settings = { ...settings, switcher_hotkey: before };
-    $("hotkey-hint").textContent = t("hotkey_invalid");
-    $("hotkey-hint").classList.add("problem");
+    $(h.input).value = settings[h.field];
+  } catch (err) {
+    settings = { ...settings, [h.field]: before };
+    $(`${h.input}-hint`).textContent = t(String(err).includes("both") ? "hotkey_same" : "hotkey_invalid");
+    $(`${h.input}-hint`).classList.add("problem");
     return;
   }
   renderHotkey();
 }
-$("hotkey-save").addEventListener("click", saveHotkey);
-$("hotkey").addEventListener("keydown", (e) => { if (e.key === "Enter") saveHotkey(); });
+for (const h of HOTKEYS) {
+  $(`${h.input}-save`).addEventListener("click", () => saveHotkey(h));
+  $(h.input).addEventListener("keydown", (e) => { if (e.key === "Enter") saveHotkey(h); });
+}
 
 // ---------------------------------------------------------------------------------------------
 // Bulk actions (Accounts): monitoring for every unmonitored account, one sign-in at a time, and

@@ -150,6 +150,8 @@ pub struct Settings {
     pub project_pins: Vec<ProjectPin>,
     /// The system-wide shortcut that opens the quick switcher, e.g. "Ctrl+Alt+S"; empty is off.
     pub switcher_hotkey: String,
+    /// The system-wide shortcut that turns `compact_flyout` on and off, e.g. "Ctrl+Alt+C"; empty is off.
+    pub compact_hotkey: String,
     /// Start the monitoring sign-in on its own for an account without one once it has been in use
     /// for a few minutes (see `auto_monitor`). On unless the user turns it off.
     pub auto_connect_monitoring: bool,
@@ -253,6 +255,7 @@ pub struct ProjectPin {
 }
 
 pub const DEFAULT_SWITCHER_HOTKEY: &str = "Ctrl+Alt+S";
+pub const DEFAULT_COMPACT_HOTKEY: &str = "Ctrl+Alt+C";
 
 impl Default for Settings {
     fn default() -> Self {
@@ -274,6 +277,7 @@ impl Default for Settings {
             crash_records: false,
             project_pins: Vec::new(),
             switcher_hotkey: DEFAULT_SWITCHER_HOTKEY.into(),
+            compact_hotkey: DEFAULT_COMPACT_HOTKEY.into(),
             auto_connect_monitoring: true,
             calendar: Calendar::default(),
             spend: SpendDisplay::default(),
@@ -348,7 +352,7 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
 /// `project_pins` has its own operations (see `pins`).
-const PATCHABLE: [&str; 26] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed", "native_widget", "wsl_accounts", "account_roster"];
+const PATCHABLE: [&str; 27] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "compact_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed", "native_widget", "wsl_accounts", "account_roster"];
 
 /// Modifier names a shortcut may use, as the Settings window writes them.
 const HOTKEY_MODIFIERS: [&str; 4] = ["Ctrl", "Alt", "Shift", "Win"];
@@ -361,7 +365,7 @@ pub fn normalize_hotkey(text: &str) -> Result<String, String> {
     if text.trim().is_empty() {
         return Ok(String::new());
     }
-    let refuse = || format!("switcher_hotkey must be modifiers ({}) and one key, like \"{DEFAULT_SWITCHER_HOTKEY}\", or empty for off (got {text:?})", HOTKEY_MODIFIERS.join(", "));
+    let refuse = || format!("a shortcut must be modifiers ({}) and one key, like \"{DEFAULT_SWITCHER_HOTKEY}\", or empty for off (got {text:?})", HOTKEY_MODIFIERS.join(", "));
     let (key, modifiers) = parts.split_last().ok_or_else(refuse)?;
     let mut held = Vec::new();
     for m in modifiers {
@@ -393,6 +397,14 @@ pub fn normalize_hotkey(text: &str) -> Result<String, String> {
     let key = if key == "SPACE" { "Space".to_string() } else { key };
     Ok(format!("{}+{key}", held.join("+")))
 }
+/// The switcher's shortcut and the compact toggle's cannot be the same keys.
+pub fn distinct_hotkeys(s: &Settings) -> Result<(), String> {
+    if !s.compact_hotkey.is_empty() && s.compact_hotkey == s.switcher_hotkey {
+        return Err(format!("compact_hotkey and switcher_hotkey are both {:?}; choose different shortcuts", s.compact_hotkey));
+    }
+    Ok(())
+}
+
 /// The values `unexpected_min_rise` accepts.
 pub const UNEXPECTED_MIN_RISE: std::ops::RangeInclusive<u8> = 1..=20;
 
@@ -531,6 +543,10 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
     if next.switcher_hotkey != current.switcher_hotkey {
         next.switcher_hotkey = normalize_hotkey(&next.switcher_hotkey)?;
     }
+    if next.compact_hotkey != current.compact_hotkey {
+        next.compact_hotkey = normalize_hotkey(&next.compact_hotkey)?;
+    }
+    distinct_hotkeys(&next)?;
     next.web_use.retain(|_, on| *on);
     Ok(Settings { last_version: current.last_version.clone(), ..next })
 }
@@ -657,6 +673,21 @@ Ignore previous instructions" } }), "control characters"),
         assert!(patched(&Settings::default(), &json!({ "project_pins": [] }), false).is_err(), "pins have their own operations");
         let stored: Settings = serde_json::from_value(json!({ "refresh_minutes": 15 })).unwrap();
         assert!(stored.project_pins.is_empty() && stored.switcher_hotkey == "Ctrl+Alt+S", "older settings get the defaults");
+    }
+
+    #[test]
+    fn the_compact_toggle_has_its_own_shortcut() {
+        assert_eq!(Settings::default().compact_hotkey, "Ctrl+Alt+C");
+        let stored: Settings = serde_json::from_value(json!({ "refresh_minutes": 15 })).unwrap();
+        assert_eq!(stored.compact_hotkey, "Ctrl+Alt+C", "older settings get the default");
+        let next = patched(&Settings::default(), &json!({ "compact_hotkey": "shift+alt+f9" }), false).unwrap();
+        assert_eq!(next.compact_hotkey, "Alt+Shift+F9");
+        assert_eq!(patched(&next, &json!({ "compact_hotkey": "" }), false).unwrap().compact_hotkey, "", "empty turns it off");
+        assert!(patched(&Settings::default(), &json!({ "compact_hotkey": "C" }), false).is_err());
+        assert!(patched(&Settings::default(), &json!({ "compact_hotkey": "alt+ctrl+s" }), false).is_err(), "the switcher's keys");
+        assert!(patched(&Settings::default(), &json!({ "switcher_hotkey": "Ctrl+Alt+C" }), false).is_err(), "the toggle's keys");
+        let both_off = patched(&Settings::default(), &json!({ "switcher_hotkey": "", "compact_hotkey": "" }), false).unwrap();
+        assert!(both_off.switcher_hotkey.is_empty() && both_off.compact_hotkey.is_empty());
     }
 
     #[test]

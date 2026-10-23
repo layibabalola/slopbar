@@ -34,6 +34,7 @@ const RINGS: f32 = 66.0;
 const MENU_REFRESH: usize = 1;
 const MENU_SETTINGS: usize = 2;
 const MENU_QUIT: usize = 3;
+const MENU_COMPACT: usize = 4;
 
 /// Where dock.rs puts the widget, in physical pixels, and the DPI of that monitor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +263,11 @@ fn listen(app: &AppHandle) {
     app.listen_any("update-installed", move |e| {
         let v: String = serde_json::from_str(e.payload()).unwrap_or_default();
         toast(&a, lang(&a).t("updatedTo", &[("v", &v)]));
+    });
+    let a = app.clone();
+    app.listen_any("compact-toggled", move |e| {
+        let on: bool = serde_json::from_str(e.payload()).unwrap_or_default();
+        toast(&a, lang(&a).t(if on { "compactOn" } else { "compactOff" }, &[]));
     });
     let a = app.clone();
     app.listen_any("account-switched", move |e| {
@@ -497,17 +503,19 @@ fn on_app(f: impl FnOnce(&AppHandle) + Send + 'static) {
     }
 }
 
-/// The right-click menu: the same items as the web widget's (refresh, settings, quit), drawn in
-/// the taskbar's theme like the shell's own menus.
+/// The right-click menu: the same items as the web widget's (refresh, compact flyout, settings,
+/// quit), drawn in the taskbar's theme like the shell's own menus.
 unsafe fn menu(hwnd: HWND) {
     let texts = lang_of_app();
     let menu = wm::CreatePopupMenu();
     if menu.is_null() {
         return;
     }
-    for (id, key) in [(MENU_REFRESH, "refresh"), (MENU_SETTINGS, "settings")] {
+    let compact = APP.get().is_some_and(|app| app.state::<AppState>().settings.lock().unwrap().compact_flyout);
+    for (id, key) in [(MENU_REFRESH, "refresh"), (MENU_COMPACT, "compactFlyout"), (MENU_SETTINGS, "settings")] {
         let text = wide(&texts.t(key, &[]));
-        wm::AppendMenuW(menu, wm::MF_STRING, id, text.as_ptr());
+        let checked = if id == MENU_COMPACT && compact { wm::MF_CHECKED } else { 0 };
+        wm::AppendMenuW(menu, wm::MF_STRING | checked, id, text.as_ptr());
     }
     wm::AppendMenuW(menu, wm::MF_SEPARATOR, 0, std::ptr::null());
     let quit = wide(&texts.t("quit", &[]));
@@ -523,6 +531,7 @@ unsafe fn menu(hwnd: HWND) {
     let id = match chosen as usize {
         MENU_REFRESH => "refresh",
         MENU_SETTINGS => "settings",
+        MENU_COMPACT => crate::app::MENU_COMPACT,
         MENU_QUIT => "quit",
         _ => return,
     };

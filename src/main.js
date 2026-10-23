@@ -64,6 +64,9 @@ function showToast(text) {
 
 listen("update-installed", ({ payload: version }) => showToast(t("updatedTo", { v: version })));
 
+// The menus' Compact flyout item or its shortcut: the flyout is usually closed, so say which.
+if (IS_DOCK) listen("compact-toggled", ({ payload: on }) => showToast(t(on ? "compactOn" : "compactOff")));
+
 listen("account-switched", ({ payload: s }) => {
   const name = PROVIDER_NAME[s.provider];
   showToast(t(s.auto ? "switchedAuto" : "switched", { provider: name, to: s.to ?? "" }));
@@ -314,6 +317,7 @@ function applySettings(settings) {
   loadSubs();
   if (IS_DOCK) {
     const labels = Object.fromEntries(["refresh", "settings", "quit"].map((k) => [k, t(k)]));
+    labels.compact_flyout = t("compactFlyout");
     invoke("set_menu_labels", { labels });
   }
   render(lastSnap);

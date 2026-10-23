@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::{AppHandle, Emitter, Manager, WindowEvent, Wry};
 use tauri_plugin_autostart::ManagerExt;
 
@@ -14,6 +14,8 @@ use settings::Settings;
 
 pub(crate) const SETTINGS_LABEL: &str = "settings";
 const MENU_IDS: [&str; 3] = ["refresh", "settings", "quit"];
+/// The menus' checkable item that turns the compact flyout on and off.
+pub(crate) const MENU_COMPACT: &str = "compact_flyout";
 
 pub struct AppState {
     monitor: monitoring::Monitor,
@@ -82,6 +84,10 @@ pub struct AppState {
     bulk_revision: std::sync::atomic::AtomicU64,
     /// Why the switcher's shortcut could not be registered (taken by another app, say).
     hotkey_error: Mutex<Option<String>>,
+    /// The same for the compact toggle's shortcut.
+    compact_hotkey_error: Mutex<Option<String>>,
+    /// The widget menu's compact flyout item, checked while the setting is on.
+    compact_item: Mutex<Option<CheckMenuItem<Wry>>>,
     /// The page Settings opens on when it is being created (it is destroyed when closed).
     settings_page: Mutex<Option<String>>,
     /// Accounts reserved for jobs (see `leases`); in memory only.
@@ -1784,27 +1790,69 @@ fn hide_switcher(app: AppHandle) {
     }
 }
 
-/// Registers the switcher's system-wide shortcut from settings, replacing the previous one.
-fn apply_hotkey(app: &AppHandle) {
-    use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
-    let hotkey = app.state::<AppState>().settings.lock().unwrap().switcher_hotkey.clone();
-    let shortcuts = app.global_shortcut();
-    let _ = shortcuts.unregister_all();
-    let error = if hotkey.is_empty() {
-        None
-    } else {
-        match hotkey.replace("Win", "Super").parse::<Shortcut>() {
-            Ok(shortcut) => shortcuts.register(shortcut).err().map(|_| "hotkey_taken".to_string()),
-            Err(_) => Some("hotkey_invalid".to_string()),
-        }
-    };
-    *app.state::<AppState>().hotkey_error.lock().unwrap() = error;
+/// A settings shortcut ("Ctrl+Alt+S") as the plugin parses it.
+fn parse_hotkey(hotkey: &str) -> Option<tauri_plugin_global_shortcut::Shortcut> {
+    hotkey.replace("Win", "Super").parse().ok()
 }
 
-/// Why the shortcut is not working, if it is not: "hotkey_taken" or "hotkey_invalid".
+/// Registers the system-wide shortcuts from settings (the switcher's and the compact toggle's),
+/// replacing the previous ones.
+fn apply_hotkey(app: &AppHandle) {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    let (switcher, compact) = {
+        let state = app.state::<AppState>();
+        let s = state.settings.lock().unwrap();
+        (s.switcher_hotkey.clone(), s.compact_hotkey.clone())
+    };
+    let shortcuts = app.global_shortcut();
+    let _ = shortcuts.unregister_all();
+    let register = |hotkey: &str| if hotkey.is_empty() {
+        None
+    } else {
+        match parse_hotkey(hotkey) {
+            Some(shortcut) => shortcuts.register(shortcut).err().map(|_| "hotkey_taken".to_string()),
+            None => Some("hotkey_invalid".to_string()),
+        }
+    };
+    let state = app.state::<AppState>();
+    *state.hotkey_error.lock().unwrap() = register(&switcher);
+    *state.compact_hotkey_error.lock().unwrap() = register(&compact);
+}
+
+/// A pressed shortcut: the compact toggle's, or else the switcher's.
+fn hotkey_pressed(app: &AppHandle, shortcut: &tauri_plugin_global_shortcut::Shortcut) {
+    let compact = app.state::<AppState>().settings.lock().unwrap().compact_hotkey.clone();
+    if !compact.is_empty() && parse_hotkey(&compact).as_ref() == Some(shortcut) {
+        toggle_compact_flyout(app);
+    } else {
+        toggle_switcher(app);
+    }
+}
+
+/// Why a shortcut is not working, if it is not: "hotkey_taken" or "hotkey_invalid". `which` is
+/// "compact" for the compact toggle's; otherwise the switcher's.
 #[tauri::command]
-fn hotkey_status(state: tauri::State<AppState>) -> Option<String> {
-    state.hotkey_error.lock().unwrap().clone()
+fn hotkey_status(state: tauri::State<AppState>, which: Option<String>) -> Option<String> {
+    let error = if which.as_deref() == Some("compact") { &state.compact_hotkey_error } else { &state.hotkey_error };
+    error.lock().unwrap().clone()
+}
+
+/// Turns the compact flyout on or off (the menus' item and its shortcut), and says which in the
+/// widget, since the flyout is usually closed.
+pub(crate) fn toggle_compact_flyout(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let _held = state.settings_lock.lock().await;
+        let mut settings = state.settings.lock().unwrap().clone();
+        settings.compact_flyout = !settings.compact_flyout;
+        // Choosing a layout answers the flyout's offer of the compact one.
+        settings.compact_suggested = true;
+        let on = settings.compact_flyout;
+        if store_settings(&app, settings).await.is_ok() {
+            let _ = app.emit("compact-toggled", on);
+        }
+    });
 }
 
 #[derive(Serialize)]
@@ -1943,10 +1991,18 @@ async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String>
 /// Saves and applies settings; callers hold `settings_lock`.
 async fn store_settings(app: &AppHandle, settings: Settings) -> Result<(), String> {
     // A changed shortcut is checked here too: the window saves whole settings.
-    let stored = app.state::<AppState>().settings.lock().unwrap().switcher_hotkey.clone();
+    let (stored, stored_compact) = {
+        let state = app.state::<AppState>();
+        let s = state.settings.lock().unwrap();
+        (s.switcher_hotkey.clone(), s.compact_hotkey.clone())
+    };
     let settings = if settings.switcher_hotkey == stored { settings } else {
         Settings { switcher_hotkey: settings::normalize_hotkey(&settings.switcher_hotkey)?, ..settings }
     };
+    let settings = if settings.compact_hotkey == stored_compact { settings } else {
+        Settings { compact_hotkey: settings::normalize_hotkey(&settings.compact_hotkey)?, ..settings }
+    };
+    settings::distinct_hotkeys(&settings)?;
     // And a changed phone-alert URL: only an ntfy topic URL, never plain http to the internet.
     let stored_phone = app.state::<AppState>().settings.lock().unwrap().phone.url.clone();
     let mut settings = settings;
@@ -1965,7 +2021,7 @@ async fn store_settings(app: &AppHandle, settings: Settings) -> Result<(), Strin
     let providers_changed = previous.providers.claude != settings.providers.claude
         || previous.providers.codex != settings.providers.codex;
     let presence_changed = previous.presence_folder != settings.presence_folder || previous.presence_remote != settings.presence_remote;
-    if previous.switcher_hotkey != settings.switcher_hotkey {
+    if previous.switcher_hotkey != settings.switcher_hotkey || previous.compact_hotkey != settings.compact_hotkey {
         apply_hotkey(app);
     }
     if presence_changed {
@@ -2064,6 +2120,9 @@ fn set_menu_labels(state: tauri::State<AppState>, labels: HashMap<String, String
             let _ = item.set_text(text);
         }
     }
+    if let (Some(item), Some(text)) = (state.compact_item.lock().unwrap().as_ref(), labels.get(MENU_COMPACT)) {
+        let _ = item.set_text(text);
+    }
 }
 
 pub(crate) fn show_settings(app: &AppHandle) {
@@ -2103,6 +2162,7 @@ pub(crate) fn menu_event(app: &AppHandle, id: &str) {
             tauri::async_runtime::spawn(async move { do_refresh(&app).await });
         }
         "settings" => show_settings(app),
+        MENU_COMPACT => toggle_compact_flyout(app),
         "quit" => app.exit(0),
         _ => {}
     }
@@ -2117,6 +2177,9 @@ pub(crate) fn apply_settings(app: &AppHandle) {
     }
     dock::apply_mode(app, settings.native_widget);
     sources::set_wsl_mode(settings.wsl_accounts);
+    if let Some(item) = app.state::<AppState>().compact_item.lock().unwrap().as_ref() {
+        let _ = item.set_checked(settings.compact_flyout);
+    }
     let _ = app.emit("settings-changed", &settings);
 }
 
@@ -2901,6 +2964,8 @@ pub fn run() {
         bulk_changed: tokio::sync::Notify::new(),
         bulk_revision: Default::default(),
         hotkey_error: Mutex::default(),
+        compact_hotkey_error: Mutex::default(),
+        compact_item: Mutex::default(),
         settings_page: Mutex::default(),
         leases: Mutex::default(),
     };
@@ -2910,9 +2975,9 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new()
-            .with_handler(|app, _shortcut, event| {
+            .with_handler(|app, shortcut, event| {
                 if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                    toggle_switcher(app);
+                    hotkey_pressed(app, shortcut);
                 }
             })
             .build())
@@ -3025,10 +3090,13 @@ pub fn run() {
                 .zip(defaults)
                 .map(|(id, text)| MenuItem::with_id(app, *id, text, true, None::<&str>))
                 .collect::<Result<Vec<_>, _>>()?;
+            let compact_on = app.state::<AppState>().settings.lock().unwrap().compact_flyout;
+            let compact = CheckMenuItem::with_id(app, MENU_COMPACT, "Compact flyout", true, compact_on, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
-            let menu = Menu::with_items(app, &[&items[0], &items[1], &separator, &items[2]])?;
+            let menu = Menu::with_items(app, &[&items[0], &compact, &items[1], &separator, &items[2]])?;
             *app.state::<AppState>().menu.lock().unwrap() = Some(menu);
             *app.state::<AppState>().menu_items.lock().unwrap() = items;
+            *app.state::<AppState>().compact_item.lock().unwrap() = Some(compact);
             app.on_menu_event(|app, event| menu_event(app, event.id().as_ref()));
 
             apply_settings(handle);
