@@ -32,6 +32,10 @@ Add accounts in **Settings → Accounts**: SlopBar opens the CLI's own sign-in (
 > [!NOTE]
 > A running Codex session keeps its account until you restart it.
 
+### A new computer
+
+Turn on **Share account list with my other computers** (Settings → Data → Other computers) on each computer, with the same roster passphrase on each. Every SlopBar then adds its accounts' provider, id, email and plan (never sign-ins) to the sharing folder or rclone remote, encrypted. A computer that reads them shows "N accounts from your other machines are waiting to be signed in" in the flyout and Health, and **Sign in all accounts** (Settings → Accounts) queues every one, one email at a time.
+
 ### Monitoring accounts you aren't using
 
 While an account is the one signed in to the CLI, SlopBar reads its usage with the CLI's own access token. That stops when you switch away: the CLI's refresh token rotates every time it is used, so SlopBar can't keep renewing a copy of it in the background without signing the CLI out. To keep reading an account you aren't using, SlopBar needs its own sign-in for it, a separate session it alone renews.

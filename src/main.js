@@ -369,13 +369,19 @@ setInterval(() => { if (IS_DOCK || panelOpen) invoke("get_usage").then(render); 
 
 // A warning sign in the flyout's header while any self-check (Settings > Health) has a problem.
 const $health = document.getElementById("health-badge");
+const $rosterWaiting = document.getElementById("roster-waiting");
 async function checkHealth() {
   if (IS_DOCK) return;
   const report = await invoke("get_health").catch(() => null);
   $health.hidden = !report?.problems;
   if (report?.problems) { $health.title = t("healthIssues", { n: report.problems }); $health.setAttribute("aria-label", $health.title); }
+  // Accounts other computers' rosters name that are not signed in here (Settings > Accounts signs them in).
+  const waiting = report?.checks?.find((c) => c.id === "roster_waiting")?.count ?? 0;
+  $rosterWaiting.hidden = !waiting;
+  $rosterWaiting.textContent = waiting ? t("rosterWaiting", { n: waiting }) : "";
 }
 $health.addEventListener("click", () => invoke("open_settings", { page: "health" }));
+$rosterWaiting.addEventListener("click", () => invoke("open_settings", { page: "accounts" }));
 listen("usage-updated", checkHealth);
 listen("monitoring-login", checkHealth);
 checkHealth();
