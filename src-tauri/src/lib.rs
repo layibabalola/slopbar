@@ -26,6 +26,7 @@ mod usage_index;
 mod csv_export;
 mod presence;
 mod rclone;
+mod roster;
 mod unexpected;
 mod health;
 mod pins;

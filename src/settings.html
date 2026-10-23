@@ -283,9 +283,24 @@
             <button class="btn" id="presence-save" data-i18n="presenceSave"></button>
           </div>
         </div>
+        <div class="row">
+          <div class="title"><label for="account-roster" data-i18n="rosterShare"></label><small data-i18n="rosterShareHint"></small></div>
+          <input type="checkbox" class="switch" id="account-roster" />
+        </div>
+        <div class="row">
+          <div class="title"><label for="roster-passphrase" data-i18n="rosterPassphrase"></label><small id="roster-passphrase-state"></small></div>
+        </div>
+        <div class="row">
+          <div class="presence-path">
+            <input type="password" id="roster-passphrase" autocomplete="new-password" spellcheck="false" />
+            <button class="btn" id="roster-passphrase-save" data-i18n="rosterPassphraseSave"></button>
+            <button class="btn" id="roster-passphrase-clear" data-i18n="phoneTokenClear"></button>
+          </div>
+        </div>
       </div>
       <p class="hint" id="presence-rclone-hint" data-i18n="presenceRcloneHint" hidden></p>
       <p class="hint" id="presence-status" role="status" hidden></p>
+      <p class="hint" id="roster-status" role="status" hidden></p>
     </section>
 
     <!-- General -->

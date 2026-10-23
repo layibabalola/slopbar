@@ -20,6 +20,8 @@ const DIR: &str = "SlopBar/presence";
 const MAX_RECORD: u64 = 256 * 1024;
 /// rclone's exit code for "directory not found".
 const DIR_NOT_FOUND: i32 = 3;
+/// rclone's exit code for "file not found".
+const FILE_NOT_FOUND: i32 = 4;
 
 /// What one rclone run produced.
 pub struct Ran {
@@ -165,8 +167,13 @@ impl<R: Runner> Rclone<R> {
         Rclone { remote: remote.into(), runner }
     }
 
+    #[cfg(test)]
     fn path(&self, name: &str) -> String {
-        format!("{}:{DIR}/{name}", self.remote)
+        self.path_in(DIR, name)
+    }
+
+    fn path_in(&self, dir: &str, name: &str) -> String {
+        format!("{}:{dir}/{name}", self.remote)
     }
 
     fn run(&self, args: &[&str], input: Option<&[u8]>) -> std::io::Result<Ran> {
@@ -174,6 +181,47 @@ impl<R: Runner> Rclone<R> {
         match ran.code {
             Some(0) => Ok(ran),
             code => Err(std::io::Error::other(format!("rclone {} failed ({code:?})", args[0]))),
+        }
+    }
+
+    /// The files directly in `dir` on the remote named `*.<ext>` and at most `max` bytes, with
+    /// their contents and modification times. A missing folder is an empty one.
+    pub fn files(&self, dir: &str, ext: &str, max: u64) -> std::io::Result<Vec<(String, Vec<u8>, Option<DateTime<Utc>>)>> {
+        let path = format!("{}:{dir}", self.remote);
+        let ran = self.runner.run(&["lsjson", "--files-only", "--no-mimetype", &path], None)?;
+        match ran.code {
+            Some(0) => {}
+            // Nobody has written yet.
+            Some(DIR_NOT_FOUND) => return Ok(vec![]),
+            code => return Err(std::io::Error::other(format!("rclone lsjson failed ({code:?})"))),
+        }
+        let entries: Vec<Entry> = serde_json::from_slice(&ran.stdout).map_err(std::io::Error::other)?;
+        let suffix = format!(".{ext}");
+        Ok(entries
+            .into_iter()
+            .filter(|e| !e.is_dir && e.name.ends_with(&suffix) && (0..=max as i64).contains(&e.size) && !e.name.contains('/'))
+            .filter_map(|e| {
+                let ran = self.run(&["cat", &self.path_in(dir, &e.name)], None).ok()?;
+                Some((e.name, ran.stdout, e.mod_time))
+            })
+            .collect())
+    }
+
+    /// Uploads under a temporary name, then renames over `<dir>/<name>`, so a reader never sees
+    /// half of a file.
+    pub fn put(&self, dir: &str, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+        let tmp = self.path_in(dir, &format!("{stem}.tmp"));
+        self.run(&["rcat", &tmp], Some(bytes))?;
+        self.run(&["moveto", &tmp, &self.path_in(dir, name)], None).map(|_| ())
+    }
+
+    /// Deletes `<dir>/<name>`; one already gone is fine.
+    pub fn delete(&self, dir: &str, name: &str) -> std::io::Result<()> {
+        let ran = self.runner.run(&["deletefile", &self.path_in(dir, name)], None)?;
+        match ran.code {
+            Some(0) | Some(DIR_NOT_FOUND) | Some(FILE_NOT_FOUND) => Ok(()),
+            code => Err(std::io::Error::other(format!("rclone deletefile failed ({code:?})"))),
         }
     }
 }
@@ -192,37 +240,18 @@ struct Entry {
 
 impl<R: Runner> PresenceStore for Rclone<R> {
     fn list(&self) -> std::io::Result<Vec<(Presence, Option<DateTime<Utc>>)>> {
-        let dir = format!("{}:{DIR}", self.remote);
-        let ran = self.runner.run(&["lsjson", "--files-only", "--no-mimetype", &dir], None)?;
-        match ran.code {
-            Some(0) => {}
-            // Nobody has written yet.
-            Some(DIR_NOT_FOUND) => return Ok(vec![]),
-            code => return Err(std::io::Error::other(format!("rclone lsjson failed ({code:?})"))),
-        }
-        let entries: Vec<Entry> = serde_json::from_slice(&ran.stdout).map_err(std::io::Error::other)?;
-        Ok(entries
+        Ok(self.files(DIR, "json", MAX_RECORD)?
             .into_iter()
-            .filter(|e| !e.is_dir && e.name.ends_with(".json") && (0..=MAX_RECORD as i64).contains(&e.size) && !e.name.contains('/'))
-            .filter_map(|e| {
-                let ran = self.run(&["cat", &self.path(&e.name)], None).ok()?;
-                let presence: Presence = serde_json::from_slice(&ran.stdout).ok()?;
-                Some((presence, e.mod_time))
-            })
+            .filter_map(|(_, bytes, at)| Some((serde_json::from_slice::<Presence>(&bytes).ok()?, at)))
             .collect())
     }
 
-    /// Uploads under a temporary name, then renames over the record, so a reader never sees half
-    /// of one.
     fn write(&self, presence: &Presence) -> std::io::Result<()> {
         let safe: String = presence.machine_id.chars().filter(|c| c.is_ascii_hexdigit() || *c == '-').collect();
         if safe.is_empty() {
             return Err(std::io::Error::other("no machine id"));
         }
-        let bytes = serde_json::to_vec_pretty(presence)?;
-        let tmp = self.path(&format!("{safe}.tmp"));
-        self.run(&["rcat", &tmp], Some(&bytes))?;
-        self.run(&["moveto", &tmp, &self.path(&format!("{safe}.json"))], None).map(|_| ())
+        self.put(DIR, &format!("{safe}.json"), &serde_json::to_vec_pretty(presence)?)
     }
 }
 
@@ -265,6 +294,10 @@ mod tests {
                     ok(serde_json::to_vec(&list).unwrap())
                 }
                 ["cat", path] => ok(files.get(*path).cloned().unwrap_or_default()),
+                ["deletefile", path] => {
+                    files.remove(*path);
+                    ok(vec![])
+                }
                 ["rcat", path] => {
                     files.insert(path.to_string(), input.unwrap_or_default().to_vec());
                     ok(vec![])
@@ -310,6 +343,22 @@ mod tests {
         assert_eq!(peers[0].seats.len(), 1);
         store.clear(&other.machine_id, "LAPTOP-2", 300).unwrap();
         assert!(read(&store, &mine.machine_id, Utc::now())[0].seats.is_empty(), "a clean quit empties the record");
+    }
+
+    #[test]
+    fn rosters_go_encrypted_to_their_own_folder_on_the_remote() {
+        use crate::roster::{RosterStore, Syncer};
+        let store = Rclone::with("cloud", Fake::default());
+        let passphrase = crate::backup::Passphrase("synthetic roster passphrase".into());
+        let mut sync = Syncer::default();
+        sync.sync(&store, &passphrase, ("11111111-1111-4111-8111-111111111111", "BACHELOR"), &[account("synthetic-a:org")], Utc::now(), false);
+        assert_eq!((sync.seen.wrote, sync.seen.own_accounts), (Some(true), Some(1)), "written and read back");
+        let files = store.runner.files.lock().unwrap().clone();
+        assert_eq!(files.keys().collect::<Vec<_>>(), ["cloud:SlopBar/roster/11111111-1111-4111-8111-111111111111.roster"]);
+        let text = String::from_utf8_lossy(files.values().next().unwrap());
+        assert!(!text.contains('@') && !text.contains("synthetic-a") && !text.contains("BACHELOR"), "{text}");
+        store.remove("11111111-1111-4111-8111-111111111111.roster").unwrap();
+        assert!(RosterStore::list(&store).unwrap().is_empty());
     }
 
     #[test]
