@@ -309,12 +309,14 @@ listen("taskbar-theme", ({ payload }) => (document.documentElement.dataset.theme
 
 document.getElementById("open-settings").addEventListener("click", () => invoke("open_settings"));
 document.getElementById("open-switcher").addEventListener("click", () => invoke("open_switcher"));
+document.getElementById("toggle-compact").addEventListener("click", () => invoke("toggle_compact"));
 
 function applySettings(settings) {
   current = settings;
   setLanguage(settings.language);
   translateDom();
   loadSubs();
+  document.getElementById("toggle-compact").setAttribute("aria-pressed", String(!!settings.compact_flyout));
   if (IS_DOCK) {
     const labels = Object.fromEntries(["refresh", "settings", "quit"].map((k) => [k, t(k)]));
     labels.compact_flyout = t("compactFlyout");
