@@ -350,6 +350,12 @@ pub fn layout(view: &View, height: f32, measure: &dyn Fn(&str) -> f32) -> Layout
     layout_within(view, height, f32::INFINITY, measure)
 }
 
+/// The narrowest the view can be laid out: rings without padding, text cut to nothing.
+pub fn least_width(view: &View) -> f32 {
+    let rings = view.items.iter().filter(|i| matches!(i, Item::Chip { .. })).count() as f32;
+    2.0 * BORDER + rings * RING_BOX + GAP * view.items.len().saturating_sub(1) as f32
+}
+
 /// As `layout`, at most `room` DIPs wide: text (a long notice) is cut short to fit, so the
 /// widget never reaches over the taskbar's other buttons. Rings are never cut.
 pub fn layout_within(view: &View, height: f32, room: f32, measure: &dyn Fn(&str) -> f32) -> Layout {
@@ -381,6 +387,8 @@ pub fn layout_within(view: &View, height: f32, room: f32, measure: &dyn Fn(&str)
             cut[i] = true;
         }
     }
+    // Still too wide (rings in a tight gap): the padding goes, down to none.
+    let pad = pad - (excess / 2.0).clamp(0.0, pad);
     let mut x = BORDER + pad;
     let mut boxes = Vec::with_capacity(view.items.len());
     for (i, (w, h)) in sizes.into_iter().enumerate() {
@@ -808,11 +816,17 @@ mod tests {
     }
 
     #[test]
-    fn rings_are_never_cut() {
+    fn rings_lose_their_padding_but_are_never_cut() {
         let s = snap(vec![account(Provider::Claude, "a", true, &[1.0]), account(Provider::Codex, "b", true, &[1.0])]);
-        let l = layout_within(&view(&s, None, 0, &En), 48.0, 30.0, &measure);
-        assert_eq!(l.width, 66.0);
+        let v = view(&s, None, 0, &En);
+        let tight = layout_within(&v, 48.0, 60.0, &measure);
+        assert_eq!(tight.width, 60.0);
+        assert_eq!((tight.items[0].x, tight.items[0].w), (4.0, 24.0));
+        let l = layout_within(&v, 48.0, 30.0, &measure);
+        assert_eq!(l.width, least_width(&v));
+        assert_eq!(l.width, 1.0 + 24.0 + 4.0 + 24.0 + 1.0);
         assert_eq!(l.cut, vec![false, false]);
+        assert!(l.items.iter().all(|b| b.w == 24.0));
     }
 
     #[test]
