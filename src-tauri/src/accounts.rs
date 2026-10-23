@@ -1222,9 +1222,10 @@ mod profile_tests {
         let vault = TempDir::new();
         let (a, b) = (claude("SYNTH-REFRESH-ALPHA", 1_000), codex("SYNTH-REFRESH-BRAVO", "2026-10-01T00:00:00Z"));
         let (pa, pb) = (plain(&vault.0, &a), plain(&vault.0, &b));
-        // Encrypting the Claude slot fails outright.
+        // Encrypting the Claude slot fails outright. Match the file name only: the temporary
+        // directory can contain "claude-" too (Claude Code's scratchpad paths do).
         let failing = |path: &Path, bytes: &[u8]| {
-            if path.to_string_lossy().contains("claude-") { Err(std::io::Error::other("disk full")) } else { crate::private_store::save_secret(path, bytes) }
+            if path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("claude-")) { Err(std::io::Error::other("disk full")) } else { crate::private_store::save_secret(path, bytes) }
         };
         let result = migrate_vault_in(&vault.0, failing, crate::private_store::load_secret);
         assert_eq!(result, VaultMigration { migrated: 1, failed: 1, unreadable: 0 });
