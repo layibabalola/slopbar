@@ -135,6 +135,35 @@ Claude Code's transcripts do not name the account they ran on, so the usage brea
 
 Merge it into an existing `hooks` object if you have one. `SLOPBAR_HOOK_DEBUG=1` makes the hook say on stderr what happened.
 
+### Graceful rotation (an account kept for the web)
+
+Settings > Accounts > a Claude account > **Rotate off at** gives that account its own usage percentage (`rotate_at`, 50–95%). It suits an account you also use on claude.ai and never want coding to drain: at that percentage SlopBar rotates off it even with automatic switching off, and automatic switching never moves back to it until it is 10 points below.
+
+The rotation is graceful. Running Claude Code sessions on the account finish the task they are on, then save their state before the switch:
+
+- a prompt submitted on the account gets context saying it is rotating: finish this task and don't start new work;
+- the first time each of its sessions ends a turn, SlopBar blocks that stop once with the wrap-up instruction: update durable memory and each project's canonical state on disk (handoff, checkpoint or status files, following that project's own conventions), then end the turn;
+- once no session is still busy or wrapping up, SlopBar switches to the account it would pick for automatic switching.
+
+It never waits past `rotate_grace_minutes` (20 by default, 5–120) or past 5 points above the percentage (at most 98%), whichever comes first. Sessions idle when the rotation starts are not waited on. Only sessions on the default login take part, since a switch never moves a project profile. A Windows notification says when a rotation starts; the usual switch notice says when it is done.
+
+The turn hook needs these entries (and the SessionStart hook above, so sessions are tied to their account from the start):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "C:/Users/<you>/AppData/Local/SlopBar/slopbar-mcp.exe --turn-hook" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "C:/Users/<you>/AppData/Local/SlopBar/slopbar-mcp.exe --turn-hook" } ] }
+    ]
+  }
+}
+```
+
+It prints nothing unless the session's account is rotating, sends only the session id, the event and `CLAUDE_CONFIG_DIR` through the door (never the prompt), waits at most 1.5 seconds and always exits 0.
+
 ### Smart launcher (`slopbar-run`)
 
 SlopBar keeps a launcher at `%APPDATA%\dev.thelio.slopbar\bin\slopbar-run.cmd` (Settings > Accounts > Projects shows the exact path). Put that folder on your `PATH`, then:

@@ -140,6 +140,12 @@ pub struct Settings {
     /// Accounts the user also uses on the web or a phone, keyed like `aliases`: their use away
     /// from every computer is expected, so it is never reported as unexpected.
     pub web_use: HashMap<String, bool>,
+    /// Claude accounts rotated off gracefully at their own usage percentage, keyed like `aliases`:
+    /// running Claude Code sessions finish their task and save their state first (see
+    /// `wind_down`), whether or not automatic switching is on for Claude.
+    pub rotate_at: HashMap<String, u8>,
+    /// How long a graceful rotation waits for sessions at most.
+    pub rotate_grace_minutes: u16,
     /// Points the weekly window must rise between two readings to count as unexpected use.
     pub unexpected_min_rise: u8,
     /// Keep a redacted record of crashes (where in SlopBar's code, never the message) in the local
@@ -263,6 +269,8 @@ impl Default for Settings {
             presence_folder: None,
             presence_remote: None,
             web_use: HashMap::new(),
+            rotate_at: HashMap::new(),
+            rotate_grace_minutes: 20,
             unexpected_min_rise: 2,
             crash_records: false,
             project_pins: Vec::new(),
@@ -333,7 +341,7 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
 /// `project_pins` has its own operations (see `pins`).
-const PATCHABLE: [&str; 25] = ["refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed", "native_widget", "wsl_accounts"];
+const PATCHABLE: [&str; 27] = ["rotate_at", "rotate_grace_minutes", "refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed", "native_widget", "wsl_accounts"];
 
 /// Modifier names a shortcut may use, as the Settings window writes them.
 const HOTKEY_MODIFIERS: [&str; 4] = ["Ctrl", "Alt", "Shift", "Win"];
@@ -407,7 +415,7 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
             match value {
                 Value::Null => { target.remove(key); }
                 // An account's existing plan details merge field by field, like everything else.
-                Value::Object(inner) if !open || target.get(key).is_some_and(Value::is_object) => merge(target.get_mut(key).unwrap(), inner, &here, ["aliases", "subscriptions", "web_use"].contains(&here.as_str()))?,
+                Value::Object(inner) if !open || target.get(key).is_some_and(Value::is_object) => merge(target.get_mut(key).unwrap(), inner, &here, ["aliases", "subscriptions", "web_use", "rotate_at"].contains(&here.as_str()))?,
                 _ => { target.insert(key.clone(), value.clone()); }
             }
         }
@@ -485,6 +493,14 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
         if !key.split_once(':').is_some_and(|(p, id)| ["claude", "codex"].contains(&p) && !id.is_empty()) {
             return Err(format!("web_use is keyed \"provider:account id\" with true or false (got {key:?})"));
         }
+    }
+    for (key, at) in next.rotate_at.iter().filter(|(k, v)| current.rotate_at.get(*k) != Some(*v)) {
+        if !key.strip_prefix("claude:").is_some_and(|id| !id.is_empty()) || !(50..=95).contains(at) || at % 5 != 0 {
+            return Err(format!("rotate_at is keyed \"claude:account id\" with 50–95 in steps of 5 (got {key:?})"));
+        }
+    }
+    if next.rotate_grace_minutes != current.rotate_grace_minutes && !(5..=120).contains(&next.rotate_grace_minutes) {
+        return Err("rotate_grace_minutes must be 5–120".into());
     }
     if next.unexpected_min_rise != current.unexpected_min_rise && !UNEXPECTED_MIN_RISE.contains(&next.unexpected_min_rise) {
         return Err(format!("unexpected_min_rise must be {}–{} points", UNEXPECTED_MIN_RISE.start(), UNEXPECTED_MIN_RISE.end()));
