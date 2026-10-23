@@ -36,6 +36,7 @@ public static class SigninShot {
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);
   [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool f);
   [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr v);
   [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
@@ -96,9 +97,11 @@ foreach ($step in '1-claude', '2-codex', '3-closed', '4-next', '5-closed') {
     $windows = $T::Windows([uint32]$Matches[1])
     $i = 0
     foreach ($w in $windows) {
-      [void]$T::Front($w); Start-Sleep -Milliseconds 1200
+      # Topmost while captured: a screen copy must show this window, never one of the user's.
+      [void]$T::SetWindowPos($w, [IntPtr](-1), 0, 0, 0, 0, 0x13); [void]$T::Front($w); Start-Sleep -Milliseconds 1200
       $r = New-Object SigninShot+RECT; [void]$T::GetWindowRect($w, [ref]$r)
       Save-Rect $r (Join-Path $Out "$step-$i.png"); $i++
+      [void]$T::SetWindowPos($w, [IntPtr](-2), 0, 0, 0, 0, 0x13)
     }
     $report[$step] += " windows=$i"
   }
