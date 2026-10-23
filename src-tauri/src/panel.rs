@@ -4,7 +4,7 @@
 //! A click must open it at once, like the shell's own flyouts. Building a WebView2 takes
 //! seconds, so the flyout is built hidden shortly after startup (`prepare`) and is only ever
 //! hidden, never destroyed. (WebView2's low memory target while hidden was tried: the flyout then
-//! showed blank, so it is not used.)
+//! showed blank, so it is not used.) Once it has been on screen, hiding suspends its webview.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -184,8 +184,8 @@ pub fn on_blur(app: &AppHandle) {
 /// a webview that was built hidden, and stayed hidden, not drawing: the flyout then opens as an
 /// empty panel. `inspect` does the same when it shows a hidden window off-screen.
 ///
-/// Once hidden, the webview is also suspended, which lets WebView2 give back most of its working
-/// set (about 450 MB down to 130-200 MB across the app's processes); showing resumes it first.
+/// Once it has been shown, hiding also suspends the webview, which lets WebView2 give back most of
+/// its working set (about 450 MB down to 120 MB across the app's processes); showing resumes it first.
 #[cfg(windows)]
 fn set_webview_visible(win: &tauri::WebviewWindow, visible: bool) {
     use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_3;
@@ -206,10 +206,10 @@ fn set_webview_visible(win: &tauri::WebviewWindow, visible: bool) {
         } else {
             let _ = controller.SetIsVisible(false);
             // Never before it has been on screen once: suspended before it ever drew, it opens empty.
-            if SHOWN.load(Ordering::Acquire) {
+            // A close hides more than once (blur, then the click); suspend once.
+            if SHOWN.load(Ordering::Acquire) && !SUSPENDED.swap(true, Ordering::AcqRel) {
                 if let Some(webview) = &webview {
                     let _ = webview.TrySuspend(&TrySuspendCompletedHandler::create(Box::new(|_, _| Ok(()))));
-                    SUSPENDED.store(true, Ordering::Release);
                 }
             }
         }
