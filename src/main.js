@@ -362,7 +362,7 @@ let panelOpen = false;
 if (!IS_DOCK) {
   listen("panel-visible", ({ payload }) => {
     panelOpen = payload;
-    if (payload) invoke("get_usage").then(render);
+    if (payload) { invoke("get_usage").then(render); checkHealth(); }
   });
 }
 setInterval(() => { if (IS_DOCK || panelOpen) invoke("get_usage").then(render); }, 60_000);

@@ -203,6 +203,8 @@ pub enum Request {
         #[serde(default)]
         sync: bool,
     },
+    /// `get_roster` with `sync`, for the MCP tool `sync_roster`.
+    SyncRoster,
     /// Saves the roster passphrase on this machine (null deletes it), then syncs with it.
     SetRosterPassphrase { passphrase: Option<crate::backup::Passphrase> },
     /// Where in-use status can be shared: detected sync folders and rclone remotes.
