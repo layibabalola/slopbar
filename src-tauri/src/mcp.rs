@@ -407,7 +407,7 @@ fn explain(error: &str) -> String {
         "bad_ssh_host" => "ssh_host must be an SSH destination: an alias from ~/.ssh/config, a host or Tailscale name, or user@host.".into(),
         "ssh_missing" => "No OpenSSH client found. Install it (Settings > System > Optional features > OpenSSH Client); see the README's field guide.".into(),
         "ssh_timeout" => "The other computer did not answer over SSH in time.".into(),
-        "slopbar_not_installed" => "SlopBar is not installed for that user on the other computer (no slopbar-mcp.exe in %LOCALAPPDATA%\\SlopBar).".into(),
+        "slopbar_not_installed" => "SlopBar is not installed for that user on the other computer (no %LOCALAPPDATA%\\SlopBar\\slopbar-mcp.exe).".into(),
         "remote_no_answer" => "The other computer answered without a SlopBar result: its SlopBar may predate pairing; update it there first.".into(),
         "pairing_unreadable" | "pairing_unsupported" => "The pairing offer could not be read: update SlopBar on both computers to the same version.".into(),
         "not_from_a_remote_call" => "A computer reached over SSH cannot reach on to another one.".into(),
