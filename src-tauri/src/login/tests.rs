@@ -257,6 +257,11 @@ fn failed_handoff_keeps_credentials_private_and_native_login_uses_isolated_cwd()
     );
 }
 
+/// Stops a hung child process from hanging the suite. These tests check what processes do, not how
+/// fast a loaded machine starts them.
+#[cfg(windows)]
+const HANG_GUARD: Duration = Duration::from_secs(60);
+
 #[cfg(windows)]
 #[test]
 fn closing_windows_job_terminates_the_login_process() {
@@ -333,16 +338,18 @@ fn native_login_script_handles_profile_path_shell_metacharacters() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let (mut child, _tree) = ProcessTree::spawn(&mut cmd, false).unwrap();
+    // How fast the script runs is not under test, only that it succeeds. The limit only stops a
+    // hung script from hanging the suite; 5 s was too short with parallel suites loading the machine.
     let start = std::time::Instant::now();
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             assert!(status.success());
             break;
         }
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "login script did not exit"
-        );
+        if start.elapsed() > HANG_GUARD {
+            let _ = child.kill();
+            panic!("login script did not exit");
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
@@ -383,6 +390,9 @@ fn suspended_login_is_assigned_before_running_and_job_close_kills_descendants() 
     );
     let tree = ProcessTree::attach(&child).unwrap();
     resume(&child).unwrap();
+    // Two debug test binaries must start before the PID appears, which took over 5 s with parallel
+    // suites loading the machine. The parent waits on the leaf, so it exiting first is the real
+    // failure; the long limit only stops a hang.
     let start = std::time::Instant::now();
     let pid = loop {
         if let Ok(text) = std::fs::read_to_string(&file) {
@@ -390,10 +400,10 @@ fn suspended_login_is_assigned_before_running_and_job_close_kills_descendants() 
                 break pid;
             }
         }
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "descendant did not start"
-        );
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("launcher exited ({status}) before its descendant started");
+        }
+        assert!(start.elapsed() < HANG_GUARD, "descendant did not start");
         std::thread::sleep(Duration::from_millis(10));
     };
     // Keep a handle so process-ID reuse cannot make the termination check pass.
