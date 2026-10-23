@@ -59,10 +59,10 @@ async fn build(app: &AppHandle) {
     }
     BUILDING.store(false, Ordering::Release);
     let Some(win) = built else { return };
+    let _ = win;
+    // Not suspended here: a webview suspended before it ever drew opens as an empty panel.
     if SHOW_WHEN_BUILT.swap(false, Ordering::AcqRel) {
         show(app);
-    } else {
-        set_webview_visible(&win, false);
     }
 }
 
@@ -177,6 +177,9 @@ pub fn on_blur(app: &AppHandle) {
 /// Tells the flyout's webview it is (or is no longer) on screen. Showing the window alone can leave
 /// a webview that was built hidden, and stayed hidden, not drawing: the flyout then opens as an
 /// empty panel. `inspect` does the same when it shows a hidden window off-screen.
+///
+/// Once hidden, the webview is also suspended, which lets WebView2 give back most of its working
+/// set (about 450 MB down to 130-200 MB across the app's processes); showing resumes it first.
 #[cfg(windows)]
 fn set_webview_visible(win: &tauri::WebviewWindow, visible: bool) {
     use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_3;
