@@ -23,8 +23,8 @@ use crate::door::Request;
 
 pub const OFFER_FORMAT: &str = "slopbar-pairing";
 const OFFER_VERSION: u32 = 1;
-/// An offer is one short JSON line.
-const MAX_OFFER: u64 = 4 * 1024;
+/// An offer is one JSON line; a roster passphrase is at most 1024 characters of up to 4 bytes.
+const MAX_OFFER: u64 = 16 * 1024;
 /// A remote tool's answer (a usage snapshot is the largest).
 const MAX_ANSWER: u64 = 4 * 1024 * 1024;
 /// Random bytes in a generated key: 256 bits, far past any guessing.
@@ -48,7 +48,15 @@ pub struct Offer {
     /// path differs per computer.
     pub presence_remote: Option<String>,
     pub from: String,
+    /// Replace a different roster passphrase the target already has (which its other peers
+    /// share): only when the user said so.
+    #[serde(default)]
+    pub replace: bool,
 }
+
+/// Settings `run_on_machine` may change on another computer: where it shares and whether, and
+/// its sign-in window. Never phone alerts, aliases or anything else.
+pub const REMOTE_SETTINGS: [&str; 4] = ["presence_remote", "presence_folder", "account_roster", "signin_window"];
 
 /// A new pairing key: 256 random bits as lowercase base32.
 pub fn generate_key() -> Passphrase {
@@ -159,7 +167,7 @@ impl Remote for Ssh {
             return Err("bad_ssh_host".into());
         }
         let mut cmd = Command::new(Self::exe());
-        cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-T", host, command])
+        cmd.args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15", "-T", host, command])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         #[cfg(windows)]
         {
@@ -188,7 +196,18 @@ impl Remote for Ssh {
             return Err("ssh_timeout".into());
         };
         let _ = writer.join();
-        let status = child.wait().map_err(|_| "ssh_failed".to_string())?;
+        // Standard output closed (or hit its bound): the exit follows at once, or never.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+                _ => {
+                    let _ = child.kill();
+                    return Err("ssh_timeout".into());
+                }
+            }
+        };
         let err = errors.join().unwrap_or_default();
         // 255 is ssh's own failure (no connection, key refused, unknown host key).
         if status.code() == Some(255) {
@@ -223,7 +242,7 @@ fn answer(out: &[u8]) -> Result<Value, String> {
 /// The source's half: checks the target is up, makes sure this computer shares its roster with a
 /// key (its own passphrase, or a new random one), sends the key to `host` and syncs both.
 /// `saved` is this computer's saved roster passphrase, if any.
-pub fn pair(door: &dyn Door, remote: &dyn Remote, host: &str, saved: Option<Passphrase>, machine: &str) -> Result<Value, String> {
+pub fn pair(door: &dyn Door, remote: &dyn Remote, host: &str, saved: Option<Passphrase>, machine: &str, replace: bool) -> Result<Value, String> {
     if !valid_host(host) {
         return Err("bad_ssh_host".into());
     }
@@ -238,6 +257,19 @@ pub fn pair(door: &dyn Door, remote: &dyn Remote, host: &str, saved: Option<Pass
     if target.pointer("/app/running") != Some(&Value::Bool(true)) {
         return Err("target_not_running".into());
     }
+    // And that it can share where this computer does, before anything changes here.
+    match &presence_remote {
+        Some(name) => {
+            let places = remote_call(remote, host, "list_sharing_locations", &json!({})).map_err(|e| format!("target: {e}"))?;
+            let here_too = places.pointer("/current/presence_remote").and_then(Value::as_str) == Some(name)
+                || places.pointer("/rclone/remotes").and_then(Value::as_array).is_some_and(|l| l.iter().any(|r| r.get("name").and_then(Value::as_str) == Some(name)));
+            if !here_too {
+                return Err(format!("target: remote_missing_here: {name}"));
+            }
+        }
+        None if target.pointer("/roster/location") != Some(&Value::Bool(true)) => return Err("no_sharing_location_here".into()),
+        None => {}
+    }
     if settings.get("account_roster") != Some(&Value::Bool(true)) {
         door.call(&Request::UpdateSettings { patch: json!({ "account_roster": true }) })?;
     }
@@ -249,11 +281,17 @@ pub fn pair(door: &dyn Door, remote: &dyn Remote, host: &str, saved: Option<Pass
             (key, true)
         }
     };
-    let offer = Offer { format: OFFER_FORMAT.into(), v: OFFER_VERSION, key: key.0, presence_remote, from: machine.into() };
+    let shown = key.0 .0.clone();
+    let offer = Offer { format: OFFER_FORMAT.into(), v: OFFER_VERSION, key: key.0, presence_remote, from: machine.into(), replace };
     let mut line = serde_json::to_vec(&offer).map_err(|_| "pairing_failed")?;
     line.push(b'\n');
     drop(offer);
-    let received = answer(&remote.run(host, &remote_command(&["--pair-receive"]), &line)?).map_err(|e| format!("target: {e}"));
+    // Whatever the target sends back is scrubbed of the key, in case it echoes it.
+    let received = match remote.run(host, &remote_command(&["--pair-receive"]), &line) {
+        Ok(out) => answer(&out).map(|v| redact(v, &shown)).map_err(|e| format!("target: {}", e.replace(&shown, "[key]"))),
+        Err(e) if e.starts_with("ssh_failed") => Err("ssh_failed".into()),
+        Err(e) => Err(e),
+    };
     line.iter_mut().for_each(|b| *b = 0);
     let received = received?;
     let here = door.call(&Request::SyncRoster)?;
@@ -267,15 +305,25 @@ pub fn pair(door: &dyn Door, remote: &dyn Remote, host: &str, saved: Option<Pass
 }
 
 /// The target's half: reads the offer from `input`, points sharing at the source's rclone remote
-/// when it has one, turns the roster on and saves the key. Never echoes the key.
-pub fn receive(door: &dyn Door, input: &mut dyn Read) -> Result<Value, String> {
+/// when it has one, turns the roster on and saves the key. Never echoes the key. `saved` is the
+/// target's own roster passphrase: a different one is replaced only when the offer says so, since
+/// the target's other computers share it.
+pub fn receive(door: &dyn Door, input: &mut dyn Read, saved: Option<Passphrase>) -> Result<Value, String> {
     let mut bytes = Vec::new();
-    input.take(MAX_OFFER).read_to_end(&mut bytes).map_err(|_| "pairing_unreadable")?;
+    input.take(MAX_OFFER + 1).read_to_end(&mut bytes).map_err(|_| "pairing_unreadable")?;
+    if bytes.len() as u64 > MAX_OFFER {
+        bytes.iter_mut().for_each(|b| *b = 0);
+        return Err("pairing_unreadable".into());
+    }
     let offer: Result<Offer, _> = serde_json::from_slice(&bytes);
     bytes.iter_mut().for_each(|b| *b = 0);
     let offer = offer.map_err(|_| "pairing_unreadable")?;
     if offer.format != OFFER_FORMAT || offer.v != OFFER_VERSION {
         return Err("pairing_unsupported".into());
+    }
+    let replaced = saved.as_ref().is_some_and(|s| s.0 != offer.key.0);
+    if replaced && !offer.replace {
+        return Err("target_has_other_key".into());
     }
     let settings = door.call(&Request::GetSettings)?;
     let mut patch = serde_json::Map::new();
@@ -300,7 +348,17 @@ pub fn receive(door: &dyn Door, input: &mut dyn Read) -> Result<Value, String> {
         door.call(&Request::UpdateSettings { patch: Value::Object(patch) })?;
     }
     let roster = door.call(&Request::SetRosterPassphrase { passphrase: Some(offer.key) })?;
-    Ok(json!({ "paired": true, "from": offer.from.chars().filter(|c| !c.is_control()).take(63).collect::<String>(), "roster": roster_summary(&roster) }))
+    Ok(json!({ "paired": true, "replaced_key": replaced, "from": offer.from.chars().filter(|c| !c.is_control()).take(63).collect::<String>(), "roster": roster_summary(&roster) }))
+}
+
+/// `value` with every occurrence of `secret` in its strings replaced.
+fn redact(value: Value, secret: &str) -> Value {
+    match value {
+        Value::String(s) if !secret.is_empty() && s.contains(secret) => Value::String(s.replace(secret, "[key]")),
+        Value::Array(items) => Value::Array(items.into_iter().map(|v| redact(v, secret)).collect()),
+        Value::Object(map) => Value::Object(map.into_iter().map(|(k, v)| (k, redact(v, secret))).collect()),
+        other => other,
+    }
 }
 
 /// get_roster's result without the email list: machines, counts and what is waiting.
@@ -378,6 +436,20 @@ pub fn browser_name(kind: crate::signin::Kind) -> &'static str {
 // ---------------------------------------------------------------------------------------------
 // The MCP tools served by `slopbar-mcp` itself (see `mcp::step`)
 
+/// Whether `run_on_machine` may run `tool` with `arguments` on another computer.
+pub fn check_remote(tool: &str, arguments: &Value) -> Result<(), String> {
+    if !REMOTE_TOOLS.contains(&tool) {
+        return Err(format!("run_on_machine runs only {}", REMOTE_TOOLS.join(", ")));
+    }
+    if tool == "update_settings" {
+        let keys = arguments.pointer("/patch").and_then(Value::as_object).ok_or("Invalid arguments: update_settings takes a patch")?;
+        if let Some(k) = keys.keys().find(|k| !REMOTE_SETTINGS.contains(&k.as_str())) {
+            return Err(format!("run_on_machine changes only {} on another computer, not {k}", REMOTE_SETTINGS.join(", ")));
+        }
+    }
+    Ok(())
+}
+
 /// `get_machine_readiness`, `pair_machine` and `run_on_machine`. `remote_ok` is false inside a
 /// `--call` reached over SSH, so a target never reaches on to a third computer.
 pub fn local_tool(name: &str, args: &Value, pipe: &str, remote_ok: bool) -> Result<Value, String> {
@@ -395,14 +467,14 @@ pub fn local_tool(name: &str, args: &Value, pipe: &str, remote_ok: bool) -> Resu
         ("pair_machine", Some(host)) => {
             let saved = crate::settings::app_dir().and_then(|d| crate::roster::load_passphrase(&d));
             let machine = crate::presence::identity().map(|(_, name)| name.to_string()).unwrap_or_default();
-            pair(&LocalDoor(pipe.into()), &Ssh, host, saved, &machine)
+            let replace = args.get("replace_key").and_then(Value::as_bool).unwrap_or(false);
+            pair(&LocalDoor(pipe.into()), &Ssh, host, saved, &machine, replace)
         }
         ("run_on_machine", Some(host)) => {
             let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
-            if !REMOTE_TOOLS.contains(&tool) {
-                return Err(format!("run_on_machine runs only {}", REMOTE_TOOLS.join(", ")));
-            }
-            remote_call(&Ssh, host, tool, args.get("arguments").unwrap_or(&json!({})))
+            let arguments = args.get("arguments").cloned().unwrap_or(json!({}));
+            check_remote(tool, &arguments)?;
+            remote_call(&Ssh, host, tool, &arguments)
         }
         _ => Err("Invalid arguments: ssh_host is required".into()),
     }
@@ -463,12 +535,13 @@ mod tests {
     /// A fake app: records requests, answers settings and roster calls.
     struct FakeApp {
         settings: Value,
+        saved: Option<&'static str>,
         remotes: Vec<&'static str>,
         seen: RefCell<Vec<Request>>,
     }
 
     impl FakeApp {
-        fn new(settings: Value) -> Self { FakeApp { settings, remotes: vec!["dropbox"], seen: RefCell::default() } }
+        fn new(settings: Value) -> Self { FakeApp { settings, saved: None, remotes: vec!["dropbox"], seen: RefCell::default() } }
         fn key_set(&self) -> Option<String> {
             self.seen.borrow().iter().find_map(|r| match r { Request::SetRosterPassphrase { passphrase: Some(p) } => Some(p.0.clone()), _ => None })
         }
@@ -494,6 +567,8 @@ mod tests {
     struct FakeSsh<'a> {
         target: &'a FakeApp,
         running: bool,
+        /// A misbehaving target that echoes what it was sent.
+        echo: bool,
         commands: RefCell<Vec<String>>,
         inputs: RefCell<Vec<Vec<u8>>>,
     }
@@ -502,20 +577,26 @@ mod tests {
         fn run(&self, _host: &str, command: &str, input: &[u8]) -> Result<Vec<u8>, String> {
             self.commands.borrow_mut().push(command.into());
             self.inputs.borrow_mut().push(input.to_vec());
+            let asked = |tool: &str| command == remote_command(&["--call-b64", &base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, json!({ "tool": tool, "arguments": {} }).to_string())]);
             let out = if command == remote_command(&["--pair-receive"]) {
-                match receive(self.target, &mut &input[..]) {
-                    Ok(v) => json!({ "ok": v }),
+                match receive(self.target, &mut &input[..], self.target.saved.map(|s| Passphrase(s.into()))) {
+                    Ok(v) => json!({ "ok": if self.echo { json!({ "leak": String::from_utf8_lossy(input) }) } else { v } }),
                     Err(e) => json!({ "error": e }),
                 }
+            } else if asked("list_sharing_locations") {
+                let mut places = self.target.call(&Request::ListSharingLocations).unwrap();
+                places["current"] = json!({ "presence_remote": self.target.settings["presence_remote"] });
+                json!({ "ok": places })
             } else {
-                json!({ "ok": { "app": { "running": self.running } } })
+                let location = self.target.settings["presence_remote"].is_string() || self.target.settings["presence_folder"].is_string();
+                json!({ "ok": { "app": { "running": self.running }, "roster": { "location": location } } })
             };
             Ok(ascii_json(&out).into_bytes())
         }
     }
 
     fn ssh(target: &FakeApp, running: bool) -> FakeSsh<'_> {
-        FakeSsh { target, running, commands: RefCell::default(), inputs: RefCell::default() }
+        FakeSsh { target, running, echo: false, commands: RefCell::default(), inputs: RefCell::default() }
     }
 
     #[test]
@@ -523,7 +604,7 @@ mod tests {
         let source = FakeApp::new(json!({ "presence_remote": "dropbox", "presence_folder": null, "account_roster": false }));
         let target = FakeApp::new(json!({ "presence_remote": null, "presence_folder": null, "account_roster": false }));
         let link = ssh(&target, true);
-        let result = pair(&source, &link, "virtualten", None, "DESK-1").unwrap();
+        let result = pair(&source, &link, "virtualten", None, "DESK-1", false).unwrap();
         let key = source.key_set().expect("the source saved a new key");
         assert!(key.starts_with(KEY_PREFIX));
         assert_eq!(target.key_set().as_deref(), Some(key.as_str()), "the target saved the same key");
@@ -531,7 +612,7 @@ mod tests {
         assert_eq!(target.patches(), [json!({ "presence_remote": "dropbox", "account_roster": true })]);
         // The key is in ssh's input, never in a command line or the result.
         assert!(link.commands.borrow().iter().all(|c| !c.contains(&key)));
-        assert!(String::from_utf8_lossy(&link.inputs.borrow()[1]).contains(&key));
+        assert!(link.inputs.borrow().iter().filter(|i| String::from_utf8_lossy(i).contains(&key)).count() == 1, "sent once, as input");
         let shown = result.to_string();
         assert!(!shown.contains(&key) && !shown.contains(KEY_SHOWN), "{shown}");
         assert_eq!(result["key"], "generated");
@@ -544,10 +625,26 @@ mod tests {
     fn pairing_reuses_the_saved_passphrase() {
         let source = FakeApp::new(json!({ "presence_remote": "dropbox", "account_roster": true }));
         let target = FakeApp::new(json!({ "presence_remote": "dropbox", "account_roster": true }));
-        let result = pair(&source, &ssh(&target, true), "virtualten", Some(Passphrase("synthetic saved passphrase".into())), "A").unwrap();
+        let mut target = target;
+        target.saved = Some("synthetic saved passphrase");
+        let result = pair(&source, &ssh(&target, true), "virtualten", Some(Passphrase("synthetic saved passphrase".into())), "A", false).unwrap();
         assert_eq!(result["key"], "reused");
         assert!(source.key_set().is_none(), "the source keeps its passphrase");
         assert!(source.patches().is_empty() && target.patches().is_empty(), "nothing else to change");
+        assert_eq!(target.key_set().as_deref(), Some("synthetic saved passphrase"));
+        assert_eq!(result["target"]["replaced_key"], false, "the same key again is no change");
+    }
+
+    #[test]
+    fn a_target_keeps_the_key_its_other_computers_share_unless_told() {
+        let source = FakeApp::new(json!({ "presence_remote": "dropbox", "account_roster": true }));
+        let mut target = FakeApp::new(json!({ "presence_remote": "dropbox", "account_roster": true }));
+        target.saved = Some("synthetic other passphrase");
+        let mine = || Some(Passphrase("synthetic saved passphrase".into()));
+        assert_eq!(pair(&source, &ssh(&target, true), "virtualten", mine(), "A", false).unwrap_err(), "target: target_has_other_key");
+        assert!(target.key_set().is_none() && target.patches().is_empty(), "nothing changed there");
+        let result = pair(&source, &ssh(&target, true), "virtualten", mine(), "A", true).unwrap();
+        assert_eq!(result["target"]["replaced_key"], true);
         assert_eq!(target.key_set().as_deref(), Some("synthetic saved passphrase"));
     }
 
@@ -555,17 +652,32 @@ mod tests {
     fn pairing_changes_nothing_when_either_side_cannot_take_it() {
         let nowhere = FakeApp::new(json!({ "presence_remote": null, "presence_folder": null }));
         let target = FakeApp::new(json!({}));
-        assert_eq!(pair(&nowhere, &ssh(&target, true), "virtualten", None, "A").unwrap_err(), "no_sharing_location");
-        assert_eq!(pair(&nowhere, &ssh(&target, true), "-oProxyCommand=x", None, "A").unwrap_err(), "bad_ssh_host");
+        assert_eq!(pair(&nowhere, &ssh(&target, true), "virtualten", None, "A", false).unwrap_err(), "no_sharing_location");
+        assert_eq!(pair(&nowhere, &ssh(&target, true), "-oProxyCommand=x", None, "A", false).unwrap_err(), "bad_ssh_host");
         let source = FakeApp::new(json!({ "presence_remote": "dropbox", "account_roster": false }));
-        assert_eq!(pair(&source, &ssh(&target, false), "virtualten", None, "A").unwrap_err(), "target_not_running");
+        assert_eq!(pair(&source, &ssh(&target, false), "virtualten", None, "A", false).unwrap_err(), "target_not_running");
         assert!(source.key_set().is_none() && source.patches().is_empty(), "the target is checked before anything changes here");
-        // A target without the source's rclone remote refuses and saves nothing.
+        // A target without the source's rclone remote: nothing changes on either computer.
         let mut bare = FakeApp::new(json!({ "presence_remote": null, "presence_folder": null }));
         bare.remotes = vec![];
-        let err = pair(&source, &ssh(&bare, true), "virtualten", None, "A").unwrap_err();
+        let err = pair(&source, &ssh(&bare, true), "virtualten", None, "A", false).unwrap_err();
         assert_eq!(err, "target: remote_missing_here: dropbox");
         assert!(bare.key_set().is_none() && bare.patches().is_empty());
+        assert!(source.key_set().is_none() && source.patches().is_empty(), "checked before anything changed here");
+        // A folder-sharing source and a target with no location at all.
+        let folder = FakeApp::new(json!({ "presence_remote": null, "presence_folder": "C:/Dropbox", "account_roster": true }));
+        assert_eq!(pair(&folder, &ssh(&bare, true), "virtualten", None, "A", false).unwrap_err(), "no_sharing_location_here");
+    }
+
+    #[test]
+    fn a_target_echoing_the_key_never_shows_it() {
+        let source = FakeApp::new(json!({ "presence_remote": "dropbox", "account_roster": true }));
+        let target = FakeApp::new(json!({ "presence_remote": "dropbox", "account_roster": true }));
+        let mut link = ssh(&target, true);
+        link.echo = true;
+        let result = pair(&source, &link, "virtualten", Some(Passphrase("synthetic saved passphrase".into())), "A", false).unwrap();
+        assert!(!result.to_string().contains("synthetic saved passphrase"), "{result}");
+        assert!(result.to_string().contains("[key]"));
     }
 
     #[test]
@@ -573,15 +685,19 @@ mod tests {
         let target = FakeApp::new(json!({ "presence_folder": "C:/Dropbox" }));
         for bad in [&b""[..], b"not json", b"{\"format\":\"slopbar-pairing\",\"v\":2,\"key\":\"synthetic key 123\",\"presence_remote\":null,\"from\":\"A\"}",
                     b"{\"format\":\"other\",\"v\":1,\"key\":\"synthetic key 123\",\"presence_remote\":null,\"from\":\"A\"}"] {
-            assert!(receive(&target, &mut &bad[..]).is_err());
+            assert!(receive(&target, &mut &bad[..], None).is_err());
         }
         assert!(target.key_set().is_none());
         // A folder-sharing source: the target keeps its own folder.
         let ok = br#"{"format":"slopbar-pairing","v":1,"key":"synthetic key 123","presence_remote":null,"from":"A"}"#;
-        receive(&target, &mut &ok[..]).unwrap();
+        receive(&target, &mut &ok[..], None).unwrap();
         assert_eq!(target.patches(), [json!({ "account_roster": true })]);
         let none = FakeApp::new(json!({ "presence_remote": null, "presence_folder": null }));
-        assert_eq!(receive(&none, &mut &ok[..]).unwrap_err(), "no_sharing_location_here");
+        assert_eq!(receive(&none, &mut &ok[..], None).unwrap_err(), "no_sharing_location_here");
+        let huge = format!(r#"{{"format":"slopbar-pairing","v":1,"key":"{}","presence_remote":null,"from":"A"}}"#, "é".repeat(1024));
+        receive(&target, &mut huge.as_bytes(), None).expect("the longest passphrase fits");
+        let too_big = vec![b' '; MAX_OFFER as usize + 1];
+        assert_eq!(receive(&target, &mut &too_big[..], None).unwrap_err(), "pairing_unreadable");
     }
 
     #[test]
@@ -605,6 +721,10 @@ mod tests {
         assert_eq!(local_tool("run_on_machine", &json!({ "ssh_host": "virtualten", "tool": "set_roster_passphrase" }), "x", true).unwrap_err().split(' ').next(), Some("run_on_machine"));
         assert_eq!(local_tool("pair_machine", &json!({ "ssh_host": "virtualten" }), "x", false).unwrap_err(), "not_from_a_remote_call");
         assert!(local_tool("pair_machine", &json!({}), "x", true).unwrap_err().contains("ssh_host is required"));
+        assert!(check_remote("update_settings", &json!({ "patch": { "presence_remote": "dropbox", "account_roster": true } })).is_ok());
+        assert!(check_remote("update_settings", &json!({ "patch": { "phone": { "url": "https://ntfy.sh/x" } } })).unwrap_err().contains("not phone"));
+        assert!(check_remote("update_settings", &json!({})).is_err());
+        assert!(check_remote("sign_in_all", &json!({ "confirm": true })).is_ok());
         for t in REMOTE_TOOLS {
             assert!(!t.contains("passphrase") && !t.contains("backup") && !t.contains("remove"), "{t}");
         }

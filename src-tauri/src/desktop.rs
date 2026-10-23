@@ -120,6 +120,25 @@ mod imp {
 #[cfg(windows)]
 pub use imp::{of_process, of_user};
 
+/// Seconds since the last keyboard or mouse input in this process's session: whether someone has
+/// been at the screen lately (an agent asks before starting sign-ins; nothing waits on it).
+#[cfg(windows)]
+pub fn idle_seconds() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::GetTickCount;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    // SAFETY: `info` is a valid, sized out-parameter.
+    unsafe {
+        if GetLastInputInfo(&mut info) == 0 {
+            return None;
+        }
+        Some(u64::from(GetTickCount().wrapping_sub(info.dwTime) / 1000))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn idle_seconds() -> Option<u64> { None }
+
 #[cfg(not(windows))]
 pub fn of_process() -> Option<Desktop> { None }
 
