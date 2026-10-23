@@ -1281,11 +1281,14 @@ pub(crate) fn toggle_switcher(app: &AppHandle) {
 
 #[tauri::command]
 async fn open_switcher(app: AppHandle) {
-    if let Some(panel) = app.get_webview_window(panel::LABEL) {
-        let _ = panel.hide();
-    }
+    // The switcher takes the focus while the flyout still holds the foreground; the flyout then
+    // hides on its own blur. Hiding the flyout first handed the foreground back to the previous
+    // app while the switcher was being built, and the switcher hid as soon as it appeared.
     if let Some(w) = on_demand_window(&app, SWITCHER_LABEL).await {
         if !w.is_visible().unwrap_or(false) { show_switcher(&app, &w); }
+    }
+    if let Some(panel) = app.get_webview_window(panel::LABEL) {
+        if panel.is_visible().unwrap_or(false) { panel::close(&app); }
     }
 }
 
