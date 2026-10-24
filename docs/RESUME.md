@@ -23,7 +23,8 @@ git log --oneline -3 origin/ultra                          # fork build branch (
 git log --oneline --no-merges origin/ultra..origin/claude/subscription-value   # not yet in ultra
 gh pr list --repo thelioo/slopbar --author layibabalola --state open --limit 5  # upstream stack head
 $h = gh pr view <top PR number> --repo thelioo/slopbar --json headRefOid --jq .headRefOid
-git log --oneline --no-merges "$h..origin/claude/subscription-value"   # work with no upstream PR yet
+git diff --stat "$h" origin/claude/subscription-value      # work with no upstream PR yet (by content)
+git cherry -v "$h" origin/claude/subscription-value        # its commits ('+' lines; some are reworked copies)
 git worktree list                                           # leftover session worktrees
 ```
 
@@ -44,7 +45,9 @@ them with `~/.claude/ops/remote-slopbar/README.md`.
 - Verify on screen before calling anything done: `scripts\test-flyout-click.ps1` must PASS, and you
   look at the PNG. Unit tests alone are not verification.
 - Each feature goes upstream as a PR to thelioo/slopbar, cut as a pinned `pr/<name>` branch and
-  stacked on the previous one. Update `docs/ROADMAP.md` on `ultra`.
+  stacked on the previous one: cherry-pick the commits onto the previous PR's head, because the PR
+  branches are linear copies, not ancestors of `claude/subscription-value` (so `git log $h..` overcounts).
+  Update `docs/ROADMAP.md` on `ultra`.
 - Never ask Layi to restart SlopBar: the install script restarts it through the door.
 
 ## Known open items (re-derive; don't trust this list)
