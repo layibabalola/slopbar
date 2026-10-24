@@ -127,7 +127,7 @@ h2 { font-size: 14px; font-weight: 600; margin: 28px 0 8px 1px; }
 }
 .bulk-retry { margin: 8px 1px 0; }
 /* "Signing in on <machine>": another computer's Sign in all accounts, followed through the roster. */
-.peer-run { margin-top: 12px; }
+.hint.notice.peer-run { margin: 0 0 12px; }
 .peer-run h3 { font-size: 14px; line-height: 20px; font-weight: 600; margin-bottom: 4px; }
 .peer-run p + p { margin-top: 4px; }
 .peer-run .dim { color: var(--dim); font-size: 12px; line-height: 16px; }
