@@ -1,4 +1,4 @@
-import { t, windowResetText, windowLabel, errorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, duration, resetText, groupResets, visibleResetWindows, placesText } from "./i18n.js";
+import { t, windowResetText, windowLabel, errorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, duration, resetText, groupResets, visibleResetWindows, placesText, overlapText } from "./i18n.js";
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { creditAdviceText } from "./alerts.js";
@@ -104,6 +104,19 @@ function loadCreditAdvice() {
   }, () => {});
 }
 
+/** The full card's amber line when the account is in use on several machines at once. */
+function overlapLine(a) {
+  const o = overlapText(a);
+  if (!o.chip) return "";
+  return `<div class="overlap" role="note" title="${esc(o.lines.join("\n"))}"><span class="overlap-icon" aria-hidden="true">\uE772</span><span>${esc(o.lines[0])}</span></div>`;
+}
+
+/** The compact row's amber mark for the same; its tooltip (the row's) says it in full. */
+function overlapBadge(a) {
+  const o = overlapText(a);
+  return o.chip ? `<span class="overlap-badge" role="img" aria-label="${esc(o.lines.join(" "))}" title="${esc(o.lines.join("\n"))}"><span class="overlap-icon" aria-hidden="true">\uE772</span>${(a.overlap ?? []).length}</span>` : "";
+}
+
 function resetLines(a) {
   return groupResets(a.resets).map((r) =>
     `<div class="reset-grant ${r.usable ? "usable" : ""}"><span>↺</span>${esc(resetText(r))}</div>`).join("");
@@ -161,6 +174,7 @@ function renderDetails(snap) {
               ? `<span class="in-use ${a.pending ? "pending" : ""}">${t("inUse")}</span>`
               : `<button class="use" data-provider="${provider}" data-id="${esc(a.id)}">${t("use")}</button>`}
           </div>
+          ${overlapLine(a)}
           <div class="acc-meta" title="${esc([meta, a.leased ? t("leasedHint") : "", a.used_outside ? t("usedOutsideHint") : ""].filter(Boolean).join("\n"))}">${esc(meta)}</div>
           ${a.error || a.monitor_error ? `<div class="error">${esc(errorText(PROVIDER_NAME[provider], a.error ?? a.monitor_error))}</div>` : ""}
           ${!a.monitor_connected || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account", "monitor_network", "monitor_uncertain"].includes(a.monitor_error ?? a.error)
@@ -194,6 +208,7 @@ function renderCompactList(snap) {
         <span class="provider-mark ${a.provider}" role="img" aria-label="${PROVIDER_NAME[a.provider]}">${MARK[a.provider]}</span>
         <span class="who">${esc(accountName(a))}</span>
         ${problem ? `<span class="problem" role="img" aria-label="${esc(problem)}">!</span>` : ""}
+        ${overlapBadge(a)}
         ${sparkline(trails[key], { tooltip: false })}
         <b class="pct" style="color:${w ? color(w.used_percent) : "var(--text-2)"}" aria-label="${esc(usedText)}">${used}</b>
         ${a.active

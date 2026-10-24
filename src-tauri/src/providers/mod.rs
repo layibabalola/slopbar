@@ -118,7 +118,7 @@ pub async fn fetch_all(
                 fetched_at: None,
                 monitor_connected: monitor.connected(slot),
                 billing: slot.billing(),
-                remote: vec![],
+                remote: vec![], overlap: vec![],
                 used_outside: false,
                 runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None,
             };

@@ -64,11 +64,14 @@ pub struct Notifications {
     /// Codex reset credits: spend one or switch when an account hits its limit, and one about to
     /// expire unused (see `reset_credits`).
     pub reset_credits: bool,
+    /// An account in use on more than one of the user's machines at once (see
+    /// `presence::overlap`), once per overlap. Needs in-use sharing.
+    pub multi_machine: bool,
 }
 
 impl Default for Notifications {
     fn default() -> Self {
-        Self { usage: true, resets: true, switches: true, renewals: true, unexpected_use: true, digest: true, extra_usage: true, burn: true, reset_credits: true }
+        Self { usage: true, resets: true, switches: true, renewals: true, unexpected_use: true, digest: true, extra_usage: true, burn: true, reset_credits: true, multi_machine: true }
     }
 }
 

@@ -432,6 +432,15 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         },
     });
 
+    // One account on several computers at once (seen through sharing, live ones only).
+    for a in inputs.accounts.iter().filter(|a| a.overlap.len() > 1) {
+        let n = a.overlap.len();
+        checks.push(check(format!("overlap:{}:{}", a.provider.key(), a.id), Status::Warning,
+            format!("{}: in use on {n} computers at once", name(a)),
+            format!("In use on {} at the same time: its limits drain about {n}x as fast and the provider may sign sessions out. Switch one of them to another account (recommend_account names a free one).", a.overlap.join(", ")),
+            Some(Fix::OpenSettings { page: "accounts" })));
+    }
+
     checks.extend(roster_checks(&inputs.roster, place_set(sharing)));
 
     checks.extend(wsl_check(&inputs.wsl));
@@ -772,6 +781,19 @@ mod tests {
         assert_eq!(find(&r, "sharing").status, Status::Problem);
         case.sharing.rclone_installed = true;
         assert_eq!(find(&case.run(), "rclone").status, Status::Ok);
+    }
+
+    #[test]
+    fn an_account_on_several_computers_is_a_warning() {
+        let mut case = Case::healthy();
+        assert!(case.run().checks.iter().all(|c| !c.id.starts_with("overlap:")));
+        case.accounts[0].overlap = vec!["DESK-1".into(), "LAPTOP-2".into()];
+        let r = case.run();
+        let c = r.checks.iter().find(|c| c.id.starts_with("overlap:")).unwrap();
+        assert_eq!(c.status, Status::Warning);
+        assert!(c.title.ends_with("in use on 2 computers at once"), "{}", c.title);
+        assert!(c.reason.starts_with("In use on DESK-1, LAPTOP-2 at the same time"), "{}", c.reason);
+        assert_eq!(c.fix, Some(Fix::OpenSettings { page: "accounts" }));
     }
 
     #[test]

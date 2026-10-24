@@ -2,7 +2,7 @@
 // the plan's renewal, verdict and advice (from get_subscriptions), and the flyout's full tooltip,
 // which carries everything the full card shows for an account in the one-line layout.
 import { t, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows,
-  placesText, errorText, creditsText, groupResets, resetText } from "./i18n.js";
+  placesText, overlapText, errorText, creditsText, groupResets, resetText } from "./i18n.js";
 import { sparklineText } from "./sparkline.js";
 
 export const money = (v) => (v == null ? "" : `$${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`);
@@ -71,6 +71,7 @@ export function accountTipLines(a, { sub = null, trail = null, creditAdvice = ""
     a.alias && a.email ? `${name} (${a.email})` : name,
     [provider, a.plan, a.org].filter(Boolean).join(" · "),
     places.inUse ? (a.active ? `${t("inUse")}: ${places.inUse}` : places.inUse) : "",
+    ...overlapText(a).lines,
     ...places.seen,
     a.used_outside ? t("usedOutside") : "",
     a.leased ? t("leased", { purpose: a.leased }) : "",

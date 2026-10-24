@@ -384,6 +384,31 @@ pub fn attach(accounts: &mut [AccountUsage], peers: &[Peer], now: DateTime<Utc>)
     }
 }
 
+/// Fills each account's `overlap`: the machines it is in use on at once, when there are two or
+/// more. Here counts when it is the account signed in on this machine (`me` names it); another
+/// machine counts only while live, so one that shut down or stopped writing drops out by the same
+/// expiry as everywhere else (`peers`). Names are compared without case, so a second install on
+/// a machine with the same name is not a second machine.
+pub fn overlap(accounts: &mut [AccountUsage], me: &str) {
+    for a in accounts.iter_mut() {
+        let mut names: Vec<String> = vec![];
+        let mut add = |n: &str| {
+            if !n.is_empty() && !names.iter().any(|m| m.eq_ignore_ascii_case(n)) {
+                names.push(n.to_string());
+            }
+        };
+        if a.active {
+            add(me);
+        }
+        let mut live: Vec<&str> = a.remote.iter().filter(|r| r.live).map(|r| r.machine.as_str()).collect();
+        live.sort_unstable();
+        for n in live {
+            add(n);
+        }
+        a.overlap = if names.len() > 1 { names } else { vec![] };
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Inference: used outside this PC
 
@@ -486,7 +511,7 @@ mod tests {
             fetched_at: None,
             monitor_connected: true,
             billing: Default::default(),
-            remote: vec![],
+            remote: vec![], overlap: vec![],
             used_outside: false,
             runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None,
         }
@@ -609,6 +634,47 @@ mod tests {
         let peers = read(&store, &mine.machine_id, now + Duration::minutes(1));
         attach(&mut idle, &peers, now);
         assert!(idle[0].remote.is_empty());
+    }
+
+    #[test]
+    fn overlap_names_every_machine_using_the_account_at_once() {
+        let now = at(0);
+        let files = vec![
+            (file("p1", "LAPTOP-2", now - Duration::minutes(2), vec![seat("x"), seat("y")]), None),
+            (file("p2", "DESK-3", now - Duration::minutes(4), vec![seat("y")]), None),
+            // Shut down an hour ago without withdrawing: past 3 × 300 s and 15 min, not live.
+            (file("p3", "OLD-PC", now - Duration::minutes(60), vec![seat("x"), seat("z")]), None),
+        ];
+        let peers = peers(files, "me", now);
+        let mut list = vec![account("x", true), account("y", false), account("z", true), account("w", true)];
+        attach(&mut list, &peers, now);
+        overlap(&mut list, "BACHELOR");
+        // Here and on a live peer.
+        assert_eq!(list[0].overlap, ["BACHELOR", "LAPTOP-2"]);
+        // Not here, but on two live peers: still on two machines at once.
+        assert_eq!(list[1].overlap, ["DESK-3", "LAPTOP-2"]);
+        // The only other machine went quiet: shown dimmed, never an overlap.
+        assert_eq!(list[2].remote.len(), 1);
+        assert!(list[2].overlap.is_empty());
+        // Only here.
+        assert!(list[3].overlap.is_empty());
+
+        // A second install with this machine's own name is the same machine.
+        let same = peers_of(vec![(file("p4", "bachelor", now, vec![seat("w")]), None)], now);
+        attach(&mut list, &same, now);
+        overlap(&mut list, "BACHELOR");
+        assert!(list[3].overlap.is_empty());
+
+        // Once LAPTOP-2 stops writing, x is only in use here again.
+        let later = now + Duration::minutes(16);
+        let quiet = peers_of(vec![(file("p1", "LAPTOP-2", now - Duration::minutes(2), vec![seat("x")]), None)], later);
+        attach(&mut list, &quiet, later);
+        overlap(&mut list, "BACHELOR");
+        assert!(list[0].overlap.is_empty());
+    }
+
+    fn peers_of(files: Vec<(Presence, Option<DateTime<Utc>>)>, now: DateTime<Utc>) -> Vec<Peer> {
+        peers(files, "me", now)
     }
 
     /// A backend other than a folder, as a cloud API store would be.
