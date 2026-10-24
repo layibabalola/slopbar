@@ -48,7 +48,7 @@ signed in at its desktop, a browser); pair_machine with ssh_host pairs it (the k
 run_on_machine with get_roster lists the accounts waiting there. Then tell the user to sit at that computer's screen, and \
 only once they say they are there, run_on_machine with sign_in_all (confirm: true; the same for connect_monitoring_all): the sign-in pages open on that \
 computer's desktop, never in the SSH session, and are refused while that desktop is locked or not shown. Guide the user \
-email by email: the user's screen shows a notification for each step, and get_machine_readiness's sign_in shows the same progress here; never sign in or approve anything yourself. \
+email by email: the user's screen shows a notification for each step, and get_machine_readiness's sign_in shows the same progress here (with wait_seconds and since it answers at the next change, so narrate without polling); when a run stops, the notification and Settings offer Retry, and sign_in_all again retries what is still missing; never sign in or approve anything yourself. \
 Results name accounts by email: keep emails out of commits, pull requests and anything you publish.";
 
 fn schema(properties: Value, required: &[&str]) -> Value {
@@ -195,7 +195,7 @@ fn catalog() -> Vec<Tool> {
             }), &["provider", "id"]), false, true, true, true),
         tool("connect_monitoring_all", "Connect monitoring for all", "Monitoring sign-ins for every account without monitoring, queued one after another (one terminal at a time, never in parallel); each waits for the user to sign in as the account named in Settings and the queue stops at the first that fails. Without confirm: true it only returns the accounts it would queue (to_connect); with it, it starts the queue and returns at once. Only when the user asked.",
             schema(json!({ "confirm": { "type": "boolean", "description": "Start the queue (default false: only list the accounts)." } }), &[]), false, false, false, true),
-        tool("sign_in_all", "Sign in all accounts", "On a new computer: signs in every account that is not signed in here but that a restored backup named or that another computer's account roster lists (get_roster's waiting), and (monitoring, default true) connects monitoring for each account without it. Grouped by email: an email's sign-ins run back to back in a brand-new empty browser profile (Settings > Accounts > sign-in window), so no earlier Google account is offered and Google is asked once per email; when the email's turn ends (done, failed or stopped) that browser is closed and its profile deleted, and the next email gets a new one. Claude's email is prefilled (Codex's page would hide Continue with Google). One sign-in at a time; the queue stops at the first that fails, when the user closes the sign-in browser or presses Stop in Settings, and a sign-in as another account is rejected and revoked. Without confirm: true it only returns the plan (groups of steps: add or connect); with it, it starts and returns at once. The user completes every page. Only when the user asked.",
+        tool("sign_in_all", "Sign in all accounts", "On a new computer: signs in every account that is not signed in here but that a restored backup named or that another computer's account roster lists (get_roster's waiting), and (monitoring, default true) connects monitoring for each account without it. Grouped by email: an email's sign-ins run back to back in a brand-new empty browser profile (Settings > Accounts > sign-in window), so no earlier Google account is offered and Google is asked once per email; when the email's turn ends (done, failed or stopped) that browser is closed and its profile deleted, and the next email gets a new one. Claude's email is prefilled (Codex's page would hide Continue with Google). One sign-in at a time; the queue stops at the first that fails, when the user closes the sign-in browser or presses Stop in Settings, or when a page never opens (signin_no_page, after 40 s), and a sign-in as another account is rejected and revoked (monitor_wrong_workspace: a Codex sign-in with the right email but another ChatGPT workspace). Each email's browser starts on a tab naming the account. A sign-in still open after 5 minutes gets a notification with Retry and Stop. Calling it again while nothing runs retries: its plan holds only what is still missing. Without confirm: true it only returns the plan (groups of steps: add or connect); with it, it starts and returns at once. The user completes every page. Only when the user asked.",
             schema(json!({ "confirm": { "type": "boolean", "description": "Start the sign-ins (default false: only return the plan)." },
                 "monitoring": { "type": "boolean", "description": "Also connect monitoring (default true)." } }), &[]), false, false, false, true),
         tool("remove_lapsed_accounts", "Remove lapsed accounts", "Remove every saved account whose plan has ended: its last paid day (subscriptions cancel_after) has passed, or the provider said it would not renew and its end has passed. Accounts in use are never removed (in_use). Without confirm: true it only returns what it would remove (to_remove, each with the day it ended); with it, it removes them as remove_account does, revoking their monitoring sign-ins. Only when the user asked.",
@@ -241,8 +241,10 @@ fn catalog() -> Vec<Tool> {
             schema(json!({
                 "passphrase": { "type": ["string", "null"], "description": "Supplied by the user; null deletes it." },
             }), &["passphrase"]), false, true, true, false),
-        tool("get_machine_readiness", "Get machine readiness", "Whether a computer is ready for sign_in_all: app (running, version, build), desktop (the Windows session SlopBar runs in: state active or disconnected, locked), idle_seconds (since the last keyboard or mouse input there), browser (edge or chrome, for sign-in pages), roster (as get_roster, waiting as a count), accounts here, waiting (the accounts to sign in: provider, id, email), sign_in (Sign in all accounts as it runs: email of emails, done of total, current account and kind add or connect, finished, error), ready_for_sign_in, problems (codes such as no_desktop_session, desktop_locked, app_not_running, roster_off, no_roster_key, rclone_remote_missing) and next (what to do). With ssh_host, asks that computer over SSH (key auth, BatchMode; a ~/.ssh/config alias, host name or Tailscale name); without, this one. Works when SlopBar is not running: it then says whether anyone is signed in at the desktop.",
-            schema(json!({ "ssh_host": { "type": "string", "description": "Another of the user's computers, as ssh reaches it (alias from ~/.ssh/config, host name, Tailscale name or user@host)." } }), &[]), true, false, true, true),
+        tool("get_machine_readiness", "Get machine readiness", "Whether a computer is ready for sign_in_all: app (running, version, build), desktop (the Windows session SlopBar runs in: state active or disconnected, locked), idle_seconds (since the last keyboard or mouse input there), browser (edge or chrome, for sign-in pages), roster (as get_roster, waiting as a count), accounts here, waiting (the accounts to sign in: provider, id, email), sign_in (Sign in all accounts as it runs or last ran: email of emails, done of total, current account and kind add or connect, still_waiting, finished, error, and steps: each sign-in's account, kind and state pending, running, done, skipped or failed with its error), sign_in_revision (pass as since with wait_seconds to wait for the next change instead of polling), ready_for_sign_in, problems (codes such as no_desktop_session, desktop_locked, app_not_running, roster_off, no_roster_key, rclone_remote_missing) and next (what to do). With ssh_host, asks that computer over SSH (key auth, BatchMode; a ~/.ssh/config alias, host name or Tailscale name); without, this one. Works when SlopBar is not running: it then says whether anyone is signed in at the desktop.",
+            schema(json!({ "ssh_host": { "type": "string", "description": "Another of the user's computers, as ssh reaches it (alias from ~/.ssh/config, host name, Tailscale name or user@host)." },
+                "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 45, "description": "Wait up to this long (at most 45) for Sign in all accounts to change before answering, instead of polling." },
+                "since": { "type": "integer", "minimum": 0, "description": "The sign_in_revision of the last answer: with wait_seconds, answer as soon as the run moves past it." } }), &[]), true, false, true, true),
         tool("pair_machine", "Pair another computer", "Brings another of the user's computers onto this computer's account roster over SSH, so nobody types a roster passphrase: checks the other computer's SlopBar is running, turns the roster on here, uses this computer's roster passphrase (or, with none saved, generates a 256-bit key and saves it here), sends it over the SSH connection's input to the other computer's SlopBar, which points sharing at the same rclone remote (or keeps its own synced folder), turns its roster on and saves the key with DPAPI, then syncs both. The key never appears in arguments, results, errors or logs. When the other computer already has a different roster passphrase it refuses (target_has_other_key) unless replace_key is true. Needs a sharing location here and SSH key auth to the other computer. Only when the user asked to pair or set up that computer.",
             schema(json!({
                 "ssh_host": { "type": "string", "description": "The computer to pair, as ssh reaches it." },
@@ -272,7 +274,7 @@ fn tools() -> Value {
 /// are required.
 fn local_args(name: &str) -> Option<(&'static [&'static str], &'static [&'static str])> {
     match name {
-        "get_machine_readiness" => Some((&["ssh_host"], &[])),
+        "get_machine_readiness" => Some((&["ssh_host", "wait_seconds", "since"], &[])),
         "pair_machine" => Some((&["ssh_host", "replace_key"], &["ssh_host"])),
         "run_on_machine" => Some((&["ssh_host", "tool", "arguments"], &["ssh_host", "tool"])),
         _ => None,
@@ -288,8 +290,8 @@ fn check_local(name: &str, args: &Value) -> Option<Result<(), String>> {
     if let Some(k) = required.iter().find(|k| !map.contains_key(**k)) {
         return Some(Err(format!("Invalid arguments: {k} is required")));
     }
-    let typed = map.iter().all(|(k, v)| match k.as_str() { "arguments" => v.is_object(), "replace_key" => v.is_boolean(), _ => v.is_string() });
-    Some(if typed { Ok(()) } else { Err("Invalid arguments: ssh_host and tool are strings, arguments an object, replace_key a boolean".into()) })
+    let typed = map.iter().all(|(k, v)| match k.as_str() { "arguments" => v.is_object(), "replace_key" => v.is_boolean(), "wait_seconds" | "since" => v.is_u64(), _ => v.is_string() });
+    Some(if typed { Ok(()) } else { Err("Invalid arguments: ssh_host and tool are strings, arguments an object, replace_key a boolean, wait_seconds and since whole numbers".into()) })
 }
 
 /// The door request for a tool call, or a message for the agent when the arguments are wrong.
@@ -399,6 +401,8 @@ fn explain(error: &str) -> String {
         "monitor_wrong_account" => "No saved account matches that provider and id. Use the ids from get_usage.".into(),
         "no_active_account" => "No account is in use for that provider on this machine. Pass an id from get_usage.".into(),
         "monitor_login_failed" => "The monitoring sign-in could not be started.".into(),
+        "monitor_wrong_workspace" => "The Codex sign-in used the right email but chose another ChatGPT workspace than this account's. Ask the user to retry and pick this account's workspace on the page.".into(),
+        "signin_no_page" => "The sign-in page never opened (the CLI did not start its sign-in, or no browser window could open there). Check get_machine_readiness, then retry with sign_in_all.".into(),
         "CLI not found" => "That provider's CLI is not installed or not found on PATH.".into(),
         "desktop_locked" => "Nothing was started: this computer's desktop is locked, so nobody would see the sign-in windows. Ask the user to unlock it at the screen, then try again.".into(),
         "desktop_not_shown" => "Nothing was started: the desktop SlopBar runs on is not shown on any screen (a closed Remote Desktop, or another Windows user switched in). Ask the user to go back to it, then try again.".into(),
@@ -596,7 +600,7 @@ fn run_tool(name: &str, args: Value, pipe: &str, remote_ok: bool) -> Result<Valu
     // Called in from another computer: a sign-in reaches only an app that refuses it while
     // nobody sees the desktop (older ones did not check).
     if !remote_ok && matches!(name, "sign_in_all" | "connect_monitoring_all") && args.get("confirm") == Some(&Value::Bool(true)) {
-        if let Err(e) = crate::door::call(pipe, &Request::GetReadiness) {
+        if let Err(e) = crate::door::call(pipe, &Request::GetReadiness { wait_seconds: None, since: None }) {
             return Err(explain(if e == "unsupported_request" { "app_outdated" } else { &e }));
         }
     }
@@ -820,6 +824,8 @@ mod tests {
             ("pair_machine", json!({ "ssh_host": "virtualten", "key": "k" })),
             ("run_on_machine", json!({ "ssh_host": "virtualten" })),
             ("get_machine_readiness", json!({ "ssh_host": 1 })),
+            ("get_machine_readiness", json!({ "wait_seconds": "soon" })),
+            ("get_machine_readiness", json!({ "since": -1 })),
             ("run_on_machine", json!({ "ssh_host": "virtualten", "tool": "get_roster", "arguments": [] })),
             ("restore_backup", json!({ "path": "C:\\x", "passphrase": "p", "confirm": true })),
         ] {

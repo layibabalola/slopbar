@@ -1344,13 +1344,17 @@ function renderBulk() {
     : bulk.lapsed.in_use.length ? t("bulkRemoveInUse", { list: bulk.lapsed.in_use.map(who).join(", ") }) : t("bulkRemoveNone");
   const status = $("bulk-status");
   const where = settings.signin_window === "system" ? t("signInWhereTerminal") : t("signInWhereBrowser");
-  if (running && c.current && c.emails) {
+  if (running && c.current && c.still_waiting) {
+    status.textContent = t("signInStillWaiting", { account: who(c.current), where });
+  } else if (running && c.current && c.emails) {
     status.textContent = t(c.kind === "add" ? "signInAllAdding" : "signInAllConnecting",
       { g: c.email, e: c.emails, i: c.done + 1, n: c.total, account: who(c.current), where });
   } else if (running && c.current) status.textContent = t("bulkConnecting", { i: c.done + 1, n: c.total, account: who(c.current) });
   else if (c?.finished && c.error) status.textContent = t("bulkConnectStopped", { done: c.done, n: c.total, error: errorText("", c.error) });
   else if (c?.finished && c.total) status.textContent = t(c.emails ? "signInAllDone" : "bulkConnectDone", { n: c.total });
   status.hidden = !(running || (c?.finished && c.total)) || !status.textContent;
+  // A stopped or failed run, or a sign-in left waiting: Retry runs it again with what is still missing.
+  $("bulk-retry-row").hidden = !((c?.finished && c.error) || (running && c.still_waiting));
 }
 async function loadBulk() {
   bulk = await invoke("bulk_status").catch(() => bulk);
@@ -1364,6 +1368,12 @@ $("sign-in-all").addEventListener("click", async () => {
   loadBulk();
 });
 $("sign-in-all-monitoring").addEventListener("change", renderBulk);
+$("bulk-retry").addEventListener("click", async () => {
+  $("bulk-retry").disabled = true;
+  try { await invoke("retry_sign_ins"); } catch (err) { alert(errorText("", String(err))); }
+  finally { $("bulk-retry").disabled = false; }
+  loadBulk();
+});
 $("signin-forget").addEventListener("click", async () => {
   if (!confirm(t("signinForgetConfirm", { n: bulk.signin_profiles }))) return;
   $("signin-forget").disabled = true;

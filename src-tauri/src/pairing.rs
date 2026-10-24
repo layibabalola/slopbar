@@ -461,8 +461,16 @@ pub fn local_tool(name: &str, args: &Value, pipe: &str, remote_ok: bool) -> Resu
         return Err("not_from_a_remote_call".into());
     }
     match (name, host) {
-        ("get_machine_readiness", Some(host)) => remote_call(&Ssh, host, "get_machine_readiness", &json!({})),
-        ("get_machine_readiness", None) => match crate::door::call(pipe, &Request::GetReadiness) {
+        ("get_machine_readiness", Some(host)) => {
+            // Waiting for a change is passed on: the other computer's app does the waiting.
+            let wait: serde_json::Map<String, Value> = args.as_object().into_iter().flatten()
+                .filter(|(k, _)| matches!(k.as_str(), "wait_seconds" | "since")).map(|(k, v)| (k.clone(), v.clone())).collect();
+            remote_call(&Ssh, host, "get_machine_readiness", &Value::Object(wait))
+        }
+        ("get_machine_readiness", None) => match crate::door::call(pipe, &Request::GetReadiness {
+            wait_seconds: args.get("wait_seconds").and_then(Value::as_u64).map(|s| s.min(45) as u32),
+            since: args.get("since").and_then(Value::as_u64),
+        }) {
             Ok(value) => Ok(value),
             Err(e) if matches!(e.as_str(), "not_running" | "unsupported_request" | "door_unavailable" | "timeout") => Ok(readiness_without_app(&e)),
             Err(e) => Err(e),
