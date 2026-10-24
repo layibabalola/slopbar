@@ -612,8 +612,18 @@ mod imp {
             Ok(Err(_)) => return Err("door_unavailable".into()),
             Err(_) => return Err("timeout".into()),
         };
-        serde_json::from_slice(&answer).map_err(|_| "bad_door_reply".into())
+        parse_reply(&answer)
     }
+}
+
+/// Reads the app's reply line. A pipe closed without one is an app quitting or starting (as
+/// during a restart onto a new build), so it is `door_unavailable`, not an unusable answer.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_reply(answer: &[u8]) -> Result<Reply, String> {
+    if answer.iter().all(u8::is_ascii_whitespace) {
+        return Err("door_unavailable".into());
+    }
+    serde_json::from_slice(answer).map_err(|_| "bad_door_reply".into())
 }
 
 /// Waits (up to `limit`) for process `pid` to exit; used by a restarted app so the single-instance
@@ -666,6 +676,15 @@ mod vet_tests {
                     dir.0.join("sub").join("SlopBar-Diagnostics-1.json"), PathBuf::from(r"C:\Windows\win.ini")] {
             assert_eq!(vet(&bad).unwrap_err(), "bad_door_reply", "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_pipe_closed_without_a_reply_is_a_restart_not_a_bad_answer() {
+        assert_eq!(parse_reply(b"").unwrap_err(), "door_unavailable");
+        assert_eq!(parse_reply(b"\n").unwrap_err(), "door_unavailable");
+        assert_eq!(parse_reply(b"{\"door\":1,\"res").unwrap_err(), "bad_door_reply");
+        let reply = parse_reply(b"{\"door\":1,\"result\":{\"machine\":{\"id\":\"x\",\"name\":\"y\"}},\"error\":null}\n").unwrap();
+        assert_eq!(reply.result.unwrap()["machine"]["name"], "y");
     }
 
     #[test]
