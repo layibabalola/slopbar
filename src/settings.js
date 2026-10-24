@@ -205,6 +205,9 @@ function renderAccounts() {
 $("accounts").addEventListener("click", async (e) => {
   const disconnect = e.target.closest("[data-disconnect]");
   if (disconnect) {
+    // Reconnecting means a whole browser sign-in, so a stray click must not do this.
+    const a = snapshot.accounts.find((x) => x.provider === disconnect.dataset.disconnect && x.id === disconnect.dataset.id);
+    if (!confirm(t("monitorDisconnectConfirm", { account: a?.alias || a?.email || t("unknownAccount") }))) return;
     disconnect.disabled = true;
     try {
       const result = await invoke("disconnect_monitoring", { provider: disconnect.dataset.disconnect, id: disconnect.dataset.id });
