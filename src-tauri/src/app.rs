@@ -639,6 +639,12 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::GetHealth => value(health_report(&app).await),
         R::GetRoster { sync } => Ok(roster_status(&app, sync).await),
         R::SyncRoster => Ok(roster_status(&app, true).await),
+        R::StopSignIns => {
+            let state = app.state::<AppState>();
+            let running = state.bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished);
+            stop_running_sign_ins(&state);
+            Ok(serde_json::json!({ "stopped": running }))
+        }
         R::GetReadiness { wait_seconds, since } => {
             if let Some(wait) = wait_seconds {
                 let since = since.unwrap_or_else(|| app.state::<AppState>().bulk_revision.load(std::sync::atomic::Ordering::SeqCst));
