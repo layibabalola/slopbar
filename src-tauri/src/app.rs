@@ -1025,13 +1025,22 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Re
                 if let Some(s) = session.as_deref() {
                     s.rearm();
                 }
+                // Whoever sits at this desktop (often brought here by an agent on another
+                // computer) is told which account and which page comes next.
+                if by_email {
+                    let (g, e, i, n) = ((index + 1).to_string(), groups.len().to_string(), done.to_string(), total.to_string());
+                    let account = target.account.clone().unwrap_or_default();
+                    let key = if step.kind == bulk::Kind::Add { "signInAllAdding" } else { "signInAllConnecting" };
+                    sign_in_notice(&h, key, &[("g", &g), ("e", &e), ("i", &i), ("n", &n), ("account", &account)]);
+                }
                 let mut run = Box::pin(run);
                 let outcome = tokio::select! {
                     outcome = &mut run => outcome,
                     _ = stop.notified() => Err("signin_stopped".into()),
                     // Closing the window once the provider's page says "done" is fine: the
-                    // sign-in may still be saving, so it gets a moment to finish.
-                    _ = browser_closed(session.as_deref()) => tokio::time::timeout(Duration::from_secs(15), &mut run).await
+                    // sign-in may still be saving (Codex's CLI can take a while), so it gets up to
+                    // two minutes to finish before the queue stops.
+                    _ = browser_closed(session.as_deref()) => tokio::time::timeout(SIGN_IN_GRACE, &mut run).await
                         .unwrap_or_else(|_| Err("signin_window_closed".into())),
                 };
                 if let Err(e) = outcome {
@@ -1046,6 +1055,17 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Re
             // The last handle: closes the browser and deletes the profile (see `signin::Session`).
             drop(group_session);
         }
+        if by_email && total > 0 {
+            match &error {
+                Some(e) => {
+                    let lang = crate::i18n::resolve(&h.state::<AppState>().settings.lock().unwrap().language);
+                    let known = e.starts_with("signin_") || e.starts_with("monitor_") || e.starts_with("desktop_");
+                    let reason = if known { crate::i18n::t(&lang, e, &[]) } else { e.clone() };
+                    sign_in_notice(&h, "bulkConnectStopped", &[("done", &done.to_string()), ("n", &total.to_string()), ("error", &reason)]);
+                }
+                None => sign_in_notice(&h, "signInAllDone", &[("n", &total.to_string())]),
+            }
+        }
         publish_bulk(&h, |b| {
             b.done = done;
             b.current = None;
@@ -1055,6 +1075,21 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Re
         });
     });
     Ok(())
+}
+
+/// How long a sign-in may go on finishing after its browser window was closed.
+const SIGN_IN_GRACE: Duration = Duration::from_secs(120);
+
+/// A notification for the person at this desktop during "Sign in all accounts", in the words
+/// Settings > Accounts uses; clicking it opens that page.
+fn sign_in_notice(app: &AppHandle, key: &str, vars: &[(&str, &str)]) {
+    let settings = app.state::<AppState>().settings.lock().unwrap().clone();
+    let lang = crate::i18n::resolve(&settings.language);
+    let place = if settings.signin_window == signin::Window::System { "signInWhereTerminal" } else { "signInWhereBrowser" };
+    let place = crate::i18n::t(&lang, place, &[]);
+    let mut vars = vars.to_vec();
+    vars.push(("where", &place));
+    let _ = notify::notify(app.clone(), crate::i18n::t(&lang, "signInAll", &[]), crate::i18n::t(&lang, key, &vars), Some("accounts".into()), None);
 }
 
 #[tauri::command]
@@ -2223,6 +2258,9 @@ async fn readiness(app: &AppHandle) -> serde_json::Value {
         "desktop": desktop, "idle_seconds": desktop::idle_seconds(), "browser": browser, "signin_window": signin_window,
         "accounts": { "here": snapshot.accounts.len(), "unmonitored": bulk::unmonitored(&snapshot).len() },
         "roster": summary, "waiting": waiting,
+        // Sign in all accounts as it runs: email g of emails, done of total, who is signing in
+        // now and for what (add or connect), and why it stopped.
+        "sign_in": state.bulk_connect.lock().unwrap().clone(),
         "ready_for_sign_in": ready, "problems": problems, "next": next,
     })
 }
