@@ -217,6 +217,8 @@ pub enum Request {
     },
     /// `get_roster` with `sync`, for the MCP tool `sync_roster`.
     SyncRoster,
+    /// Stops a running "Sign in all accounts" or "Connect monitoring for all", as Settings' Stop does.
+    StopSignIns,
     /// Saves the roster passphrase on this machine (null deletes it), then syncs with it.
     SetRosterPassphrase { passphrase: Option<crate::backup::Passphrase> },
     /// Where in-use status can be shared: detected sync folders and rclone remotes.
