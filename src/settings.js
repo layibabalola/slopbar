@@ -7,6 +7,8 @@ import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetText, er
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 observeFrontend("settings");
+// Set until the first loads below have settled, so a capture (inspect_window) waits for them.
+document.documentElement.dataset.loading = "1";
 
 const REFRESH_OPTIONS = [1, 5, 15, 30];
 const PROVIDERS = [["claude", "Claude"], ["codex", "Codex"]];
@@ -1529,7 +1531,7 @@ async function loadPeerRuns() {
 }
 document.addEventListener("visibilitychange", () => { if (!document.hidden) loadPeerRuns(); });
 document.querySelectorAll(".nav").forEach((b) => b.addEventListener("click", () => { if (b.dataset.page === "accounts") loadPeerRuns(); }));
-loadPeerRuns();
+const firstPeerRuns = loadPeerRuns();
 
 // ---------------------------------------------------------------------------------------------
 // An account per project (Accounts): pinned folders, and the lines that use them.
@@ -1627,3 +1629,6 @@ try { page = localStorage.getItem("settings-page") || page; } catch {}
 page = (await invoke("take_settings_page").catch(() => null)) || page;
 showPage(page);
 if (page === "usage") loadUsage();
+// Another computer's sign-ins are read from its roster, which can be slow: waited for briefly.
+await Promise.race([firstPeerRuns, new Promise((done) => setTimeout(done, 4000))]);
+delete document.documentElement.dataset.loading;
