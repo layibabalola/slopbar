@@ -1,4 +1,4 @@
-import { t, windowResetText, windowLabel, errorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, duration, resetText, groupResets, visibleResetWindows, placesText, overlapText } from "./i18n.js";
+import { t, windowResetText, windowLabel, errorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, duration, resetText, groupResets, visibleResetWindows, placesText, overlapText, seatsText } from "./i18n.js";
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { creditAdviceText } from "./alerts.js";
@@ -112,6 +112,12 @@ function overlapLine(a) {
 }
 
 /** The compact row's amber mark for the same; its tooltip (the row's) says it in full. */
+// The CLI and the desktop app here on different accounts, on the full card.
+function seatsLine(a) {
+  const s = seatsText(a);
+  return s.line ? `<div class="overlap seats" role="note" title="${esc(s.line)}"><span class="overlap-icon" aria-hidden="true"></span><span>${esc(s.line)}</span></div>` : "";
+}
+
 function overlapBadge(a) {
   const o = overlapText(a);
   return o.chip ? `<span class="overlap-badge" role="img" aria-label="${esc(o.lines.join(" "))}" title="${esc(o.lines.join("\n"))}"><span class="overlap-icon" aria-hidden="true">\uE772</span>${(a.overlap ?? []).length}</span>` : "";
@@ -174,6 +180,7 @@ function renderDetails(snap) {
               ? `<span class="in-use ${a.pending ? "pending" : ""}">${t("inUse")}</span>`
               : `<button class="use" data-provider="${provider}" data-id="${esc(a.id)}">${t("use")}</button>`}
           </div>
+          ${seatsLine(a)}
           ${overlapLine(a)}
           <div class="acc-meta" title="${esc([meta, a.leased ? t("leasedHint") : "", a.used_outside ? t("usedOutsideHint") : ""].filter(Boolean).join("\n"))}">${esc(meta)}</div>
           ${a.error || a.monitor_error ? `<div class="error">${esc(errorText(PROVIDER_NAME[provider], a.error ?? a.monitor_error))}</div>` : ""}

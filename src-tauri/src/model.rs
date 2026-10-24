@@ -77,6 +77,25 @@ pub struct AccountUsage {
     /// snapshot the app publishes.
     #[serde(default)]
     pub leased: Option<String>,
+    /// This machine's desktop app for the provider (Claude Desktop, or the Codex app, which
+    /// shares the CLI's sign-in) is signed in to this account (see `desktop_apps`). `active`
+    /// stays about the CLI.
+    #[serde(default)]
+    pub desktop: bool,
+    /// Set on the CLI's account and the desktop app's account when they differ on this machine.
+    #[serde(default)]
+    pub seats: Option<SeatDrift>,
+}
+
+/// The CLI and the desktop app on this machine are signed in to different accounts.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SeatDrift {
+    /// "Claude Desktop" or "Codex app".
+    pub app: String,
+    /// The CLI's account (alias or email).
+    pub cli: Option<String>,
+    /// The desktop app's account; None when it is one SlopBar does not have.
+    pub desktop: Option<String>,
 }
 
 /// Claude's extra usage: what the account may spend beyond its plan each month, and what it has.

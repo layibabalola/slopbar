@@ -2,7 +2,7 @@ import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { sparkline } from "./sparkline.js";
 import { money, pct, amount, renewalText, adviceText, creditsLine, extraUsageLine } from "./accounttext.js";
-import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetText, errorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText, overlapText } from "./i18n.js";
+import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetText, errorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText, overlapText, seatsText } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -98,14 +98,16 @@ function accountRow(p, a) {
           placeholder="${esc(a.email ?? t("unknownAccount"))}" aria-label="${t("alias")}" title="${t("alias")}" />
         <small>
           ${a.active ? `<em class="chip live" title="${esc(places.inUse)}">${t("inUse")}</em>`
+            : a.desktop ? `<em class="chip live" title="${esc(places.inUse)}">${t("desktopApp")}</em>`
             : places.elsewhere ? `<em class="chip elsewhere" title="${esc(places.inUse)}">${esc(places.inUse)}</em>` : ""}
+          ${seatsChip(a)}
           ${overlapChip(a)}
           ${a.used_outside ? `<em class="chip outside" title="${esc(t("usedOutsideHint"))}">${t("usedOutside")}</em>` : ""}
           ${a.unexpected ? `<em class="chip unexpected" title="${esc(t("unexpectedHint", { t: duration(Math.max(1, Math.round((Date.now() - new Date(a.unexpected.last_seen)) / 60000))) }))}">${esc(t(a.unexpected.seen_week === 1 ? "unexpectedSeenOnce" : "unexpectedSeen", { n: a.unexpected.seen_week }))}</em>` : ""}
           ${a.plan ? `<em class="chip">${esc(a.plan)}</em>` : ""}
           ${signInChips(p, a)}
           ${resets}
-          <span>${esc([a.active && places.elsewhere ? places.inUse : "", ...places.seen, settings.aliases[key] ? a.email ?? "" : a.org ?? ""].filter(Boolean).join(" · "))}</span>
+          <span>${esc([seatsText(a).line, a.active && places.elsewhere ? places.inUse : "", ...places.seen, settings.aliases[key] ? a.email ?? "" : a.org ?? ""].filter(Boolean).join(" · "))}</span>
         </small>
       </div>
       <div class="monitor-state">
@@ -135,6 +137,11 @@ function accountRow(p, a) {
 
 /** Sign-in health: the provider rejected the monitoring sign-in, or the CLI's own saved login. */
 /** Amber when the account is in use on several machines at once; the tooltip names them and says why it matters. */
+function seatsChip(a) {
+  const s = seatsText(a);
+  return s.chip ? `<em class="chip overlap seats" title="${esc(s.line)}"><span class="overlap-icon" aria-hidden="true"></span> ${esc(s.chip)}</em>` : "";
+}
+
 function overlapChip(a) {
   const o = overlapText(a);
   return o.chip ? `<em class="chip overlap" title="${esc(o.lines.join("\n"))}"><span class="overlap-icon" aria-hidden="true">\uE772</span> ${esc(o.chip)}</em>` : "";
@@ -960,6 +967,7 @@ async function render() {
   for (const kind of NOTIFY_KINDS) $(`notify-${kind}`).checked = settings.notifications[kind];
   $("crash-records").checked = settings.crash_records;
   $("auto-monitoring").checked = settings.auto_connect_monitoring;
+  $("switch-desktop").checked = settings.switch_desktop;
   $("compact-flyout").checked = settings.compact_flyout;
   $("compact-flyout-hint").textContent = snapshot.accounts.length > COMPACT_SUGGEST_ABOVE && !settings.compact_flyout
     ? t("compactFlyoutSuggested", { n: snapshot.accounts.length }) : t("compactFlyoutHint");
@@ -1007,6 +1015,7 @@ $("export-diagnostics").addEventListener("click", async () => {
 });
 $("crash-records").addEventListener("change", (e) => update({ crash_records: e.target.checked }));
 $("auto-monitoring").addEventListener("change", (e) => update({ auto_connect_monitoring: e.target.checked }));
+$("switch-desktop").addEventListener("change", (e) => update({ switch_desktop: e.target.checked }));
 $("wsl-accounts").addEventListener("change", (e) => update({ wsl_accounts: e.target.value }));
 $("signin-window").addEventListener("change", (e) => update({ signin_window: e.target.value }));
 // Reads every WSL distro once, starting stopped ones, then refreshes.
