@@ -14,6 +14,9 @@ const SUPPORTED: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const LIST_LIMIT: usize = 20;
 /// Longest string passed back to the agent; provider-set text (organization names) can be long.
 const MAX_TEXT: usize = 512;
+/// inspect_window's `text` is a whole window (Settings runs to about 20k characters), so it gets
+/// a bound of its own, the same as the app's capture.
+const WINDOW_TEXT: usize = 20_000;
 
 const INSTRUCTIONS: &str = "SlopBar shows Claude and Codex account usage and switches accounts. These tools \
 act on the running SlopBar app exactly like its Settings window. Read-only tools (get_usage, get_headroom, get_settings, \
@@ -390,6 +393,22 @@ fn sanitize(value: Value) -> Value {
     }
 }
 
+/// `sanitize` for one request's answer: inspect_window's `text` keeps its line breaks and the
+/// larger `WINDOW_TEXT` bound, and stays plain data; every other string is capped as usual.
+fn sanitize_answer(request: &crate::door::Request, value: Value) -> Value {
+    let Value::Object(mut map) = value else { return sanitize(value) };
+    let text = match request {
+        crate::door::Request::InspectWindow { .. } => map.remove("text"),
+        _ => None,
+    };
+    let mut clean = sanitize(Value::Object(map));
+    if let Some(Value::String(text)) = text {
+        let text: String = text.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).take(WINDOW_TEXT).collect();
+        clean["text"] = Value::String(text);
+    }
+    clean
+}
+
 /// Plain-language text for door and app error codes; anything else is passed on, sanitized.
 fn explain(error: &str) -> String {
     match error {
@@ -435,9 +454,18 @@ fn explain(error: &str) -> String {
 }
 
 fn result(outcome: Result<Value, String>) -> Value {
+    shown(outcome.map(sanitize))
+}
+
+/// `result` for a door call, whose answer is sanitized for its request (see `sanitize_answer`).
+fn call_result(request: &crate::door::Request, outcome: Result<Value, String>) -> Value {
+    shown(outcome.map(|value| sanitize_answer(request, value)))
+}
+
+/// The MCP tool result for an outcome already sanitized.
+fn shown(outcome: Result<Value, String>) -> Value {
     match outcome {
         Ok(value) => {
-            let value = sanitize(value);
             let structured = if value.is_object() { value.clone() } else { json!({ "result": value }) };
             json!({
                 "content": [{ "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() }],
@@ -580,7 +608,7 @@ fn serve<W: Write + Send + 'static>(mut input: impl BufRead, out: W) -> std::io:
                 Step::Call { id, request } => {
                     let (pipe, out, cancelled) = (pipe.clone(), out.clone(), cancelled.clone());
                     calls.push(std::thread::spawn(move || {
-                        let value = reply(id.clone(), Ok(result(crate::door::call(&pipe, &request))));
+                        let value = reply(id.clone(), Ok(call_result(&request, crate::door::call(&pipe, &request))));
                         // A cancelled request gets no reply (MCP cancellation).
                         if !cancelled.lock().unwrap().remove(&id.to_string()) {
                             let _ = send(&*out, &value);
@@ -852,6 +880,22 @@ mod tests {
         assert!(!org.chars().any(char::is_control));
         assert_eq!(org.chars().count(), MAX_TEXT);
         assert_eq!(explain("weird\nerror"), "weirderror");
+    }
+
+    #[test]
+    fn a_window_s_text_reaches_the_agent_whole_but_still_plain_and_bounded() {
+        let inspect: crate::door::Request = serde_json::from_value(json!({ "op": "inspect_window", "window": "settings" })).unwrap();
+        let page = format!("Accounts\n\tSigning in on VIRTUAL-TEN\u{1b}[2J\n{}", "y".repeat(30_000));
+        let answer = json!({ "window": "settings", "text": page, "org": "z".repeat(2000) });
+        let clean = sanitize_answer(&inspect, answer.clone());
+        let text = clean["text"].as_str().unwrap();
+        assert!(text.starts_with("Accounts\n\tSigning in on VIRTUAL-TEN[2J\n"), "line breaks kept, escapes dropped");
+        assert_eq!(text.chars().count(), WINDOW_TEXT);
+        assert_eq!(clean["org"].as_str().unwrap().chars().count(), MAX_TEXT, "other strings keep the short cap");
+        // Any other request's `text` is an ordinary string.
+        let clean = sanitize_answer(&crate::door::Request::GetUsage, answer);
+        assert_eq!(clean["text"].as_str().unwrap().chars().count(), MAX_TEXT);
+        assert!(!clean["text"].as_str().unwrap().contains('\n'));
     }
 
     #[test]

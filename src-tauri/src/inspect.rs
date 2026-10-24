@@ -112,12 +112,15 @@ async fn look(window: &tauri::WebviewWindow, target: Target, page: Option<String
         rx.await.map_err(|_| "webview not available")?
     };
     if created {
-        // The page loads its data as it starts (Settings fetches several reports).
+        // The page loads its data as it starts (Settings fetches several reports and marks
+        // `data-loading` on its root until they have settled; see settings.js).
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while script(&window, &controller, "document.readyState").await.as_deref() != Ok("\"complete\"") && std::time::Instant::now() < deadline {
+        let settled = "document.readyState === 'complete' && document.documentElement.dataset.loading !== '1'";
+        while script(&window, &controller, settled).await.as_deref() != Ok("true") && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        // Then a moment to paint (longer for windows that do not mark their loads).
+        tokio::time::sleep(Duration::from_millis(if target == Target::Settings { 300 } else { 800 })).await;
     }
     let was_visible = unsafe { wm::IsWindowVisible(hwnd as windows_sys::Win32::Foundation::HWND) } != 0;
     let mut restore = None;
