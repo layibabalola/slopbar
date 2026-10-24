@@ -71,6 +71,28 @@ pub fn notify_unexpected(app: AppHandle, provider: crate::accounts::Provider, ti
     }
 }
 
+/// A notification with buttons (label, action): `on` gets the button's action, or None for a
+/// click on the notification itself.
+pub fn notify_choice(app: AppHandle, title: String, body: String, buttons: Vec<(String, &'static str)>, on: impl Fn(Option<&str>) + Send + Sync + 'static) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let identifier = app.config().identifier.clone();
+        let mut toast = tauri_winrt_notification::Toast::new(&identifier).title(&title).text1(&body);
+        for (label, action) in &buttons {
+            toast = toast.add_button(label, action);
+        }
+        toast.on_activated(move |action| {
+            on(action.as_deref().filter(|a| !a.is_empty()));
+            Ok(())
+        }).show().map_err(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (buttons, on);
+        notify(app, title, body, Some("accounts".into()), None)
+    }
+}
+
 /// The notification plugin cannot react to a click on Windows, so this one is shown directly,
 /// under the same app id. The click reaches SlopBar while it runs, which it always does.
 #[cfg(windows)]
