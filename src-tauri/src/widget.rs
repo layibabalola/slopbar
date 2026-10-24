@@ -213,12 +213,16 @@ pub fn account_detail(texts: &dyn Texts, a: &AccountUsage, now: chrono::DateTime
     let lang = texts.lang();
     let provider = provider_name(a.provider);
     let name = a.alias.clone().or_else(|| a.email.clone()).unwrap_or_else(|| texts.t("unknownAccount", &[]));
+    let desktop_app = texts.t("desktopApp", &[]);
+    let place = |w: &String| if w == crate::desktop_apps::PLACE { desktop_app.clone() } else { w.clone() };
     let machine = |r: &crate::model::RemoteSeat| {
-        if r.where_.is_empty() || (r.where_.len() == 1 && r.where_[0] == "Windows") { r.machine.clone() } else { format!("{} ({})", r.machine, r.where_.join(", ")) }
+        if r.where_.is_empty() || (r.where_.len() == 1 && r.where_[0] == "Windows") { r.machine.clone() } else { format!("{} ({})", r.machine, r.where_.iter().map(place).collect::<Vec<_>>().join(", ")) }
     };
     let live: Vec<String> = a.remote.iter().filter(|r| r.live).map(machine).collect();
-    let in_use = if a.active && !a.sources.is_empty() {
-        format!("{}: {}", texts.t("inUse", &[]), [a.sources.clone(), live.clone()].concat().join(", "))
+    let mut here = if a.active { a.sources.clone() } else { vec![] };
+    if a.desktop { here.push(desktop_app.clone()); }
+    let in_use = if !here.is_empty() {
+        format!("{}: {}", texts.t("inUse", &[]), [here, live.clone()].concat().join(", "))
     } else if !live.is_empty() {
         texts.t("inUseOn", &[("list", &live.join(", "))])
     } else {
@@ -230,6 +234,10 @@ pub fn account_detail(texts: &dyn Texts, a: &AccountUsage, now: chrono::DateTime
         [Some(provider.to_string()), a.plan.clone(), a.org.clone()].into_iter().flatten().collect::<Vec<_>>().join(" · "),
         in_use,
     ];
+    if let Some(d) = &a.seats {
+        let unknown = texts.t("seatsUnknown", &[]);
+        who.push(texts.t("seatsDrift", &[("cli", d.cli.as_deref().unwrap_or("-")), ("desktop", d.desktop.as_deref().unwrap_or(&unknown))]));
+    }
     if a.overlap.len() > 1 {
         let n = a.overlap.len().to_string();
         who.push(texts.t("overlapOn", &[("n", &n), ("list", &a.overlap.join(", "))]));
