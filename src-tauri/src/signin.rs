@@ -108,6 +108,10 @@ pub struct Session {
     dir: PathBuf,
     /// Its browser has been seen running (see [`Session::browser_closed`]).
     opened: std::sync::atomic::AtomicBool,
+    /// The account and language its page was labelled with, and how many times the page's
+    /// progress was written (see [`Session::show`]).
+    page: Mutex<Option<(String, String)>>,
+    revision: std::sync::atomic::AtomicU64,
 }
 
 impl Session {
@@ -121,7 +125,7 @@ impl Session {
             set_active(&dir, false);
             return Err(e);
         }
-        Ok(Self { dir, opened: Default::default() })
+        Ok(Self { dir, opened: Default::default(), page: Default::default(), revision: Default::default() })
     }
 
     /// Names the window after the email it signs in, before its browser first starts: the
@@ -133,7 +137,8 @@ impl Session {
         if name.is_empty() {
             return;
         }
-        let _ = std::fs::write(self.dir.join(LABEL_PAGE), label_page(&name, lang));
+        let _ = std::fs::write(self.dir.join(LABEL_PAGE), label_page(&name, lang, None, 0));
+        *self.page.lock().unwrap_or_else(|e| e.into_inner()) = Some((name.clone(), lang.to_owned()));
         let state = self.dir.join("Local State");
         if state.exists() {
             return;
@@ -141,6 +146,19 @@ impl Session {
         let info = serde_json::json!({ "name": name, "is_using_default_name": false, "shortcut_name": name });
         let local = serde_json::json!({ "profile": { "info_cache": { "Default": info } } });
         let _ = std::fs::write(&state, local.to_string());
+    }
+
+    /// Shows on the labelled page how the email's turn is going: the page rewritten (for a
+    /// reload) and its sidecar script, which the open page loads every second and redraws from,
+    /// so the person sees each sign-in finish and the next one starting. Best effort; nothing
+    /// before [`label`](Session::label).
+    pub fn show(&self, progress: &Progress) {
+        let Some((account, lang)) = self.page.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
+        let revision = self.revision.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let (title, html) = (page_title(&account, &lang, Some(progress)), progress_html(&account, &lang, progress));
+        let script = format!("slopbarProgress({});\n", serde_json::json!({ "revision": revision, "title": title, "html": html }));
+        write_replacing(&self.dir.join(PROGRESS_SCRIPT), &script);
+        write_replacing(&self.dir.join(LABEL_PAGE), &label_page(&account, &lang, Some(progress), revision));
     }
 
     /// Whether a sign-in page was opened in this profile at or after `since` (see [`open`]).
@@ -384,6 +402,74 @@ pub fn prefill_email(email: Option<&str>) -> Option<&str> {
 
 /// The page in a labelled profile (see [`Session::label`]) that names its account.
 const LABEL_PAGE: &str = "slopbar-account.html";
+/// Beside it, the progress the open page redraws from (see [`Session::show`]).
+const PROGRESS_SCRIPT: &str = "slopbar-progress.js";
+
+/// How one sign-in of an email's turn is going, as its page shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageStep {
+    Pending,
+    /// Its CLI is starting; its page opens in a new tab once it is up.
+    Opening,
+    /// Its page is open: the person signs in there.
+    Open,
+    Done,
+    /// Already done when its turn came.
+    Skipped,
+}
+
+/// An email's turn, for its page (see [`Session::show`]).
+pub struct Progress {
+    /// Each of the email's sign-ins: what it is ("Claude", "Codex monitoring") and how it is going.
+    pub steps: Vec<(String, PageStep)>,
+    /// The sign-in of the whole run that is open now (1-based), of how many.
+    pub at: usize,
+    pub total: usize,
+}
+
+/// Replaces `path`'s contents so a reader never sees half of them, else just writes it.
+fn write_replacing(path: &Path, contents: &str) {
+    let part = path.with_extension("part");
+    if std::fs::write(&part, contents).and_then(|_| std::fs::rename(&part, path)).is_err() {
+        let _ = std::fs::remove_file(&part);
+        let _ = std::fs::write(path, contents);
+    }
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// The tab's title; with progress it starts with how many of the email's sign-ins are done.
+fn page_title(account: &str, lang: &str, progress: Option<&Progress>) -> String {
+    let title = crate::i18n::t(lang, "signinPageTitle", &[("account", account)]);
+    match progress {
+        Some(p) => {
+            let done = p.steps.iter().filter(|(_, s)| matches!(s, PageStep::Done | PageStep::Skipped)).count();
+            format!("{done}/{} \u{b7} {title}", p.steps.len())
+        }
+        None => title,
+    }
+}
+
+/// The page's progress section: where the run is, then each of the email's sign-ins.
+fn progress_html(account: &str, lang: &str, progress: &Progress) -> String {
+    let t = |key: &str, vars: &[(&str, &str)]| esc(&crate::i18n::t(lang, key, vars));
+    let (at, total) = (progress.at.to_string(), progress.total.to_string());
+    let mut html = format!("<p class=\"overall\">{}</p><ol>", t("signinPageOverall", &[("i", &at), ("n", &total)]));
+    for (name, state) in &progress.steps {
+        let (class, mark, note) = match state {
+            PageStep::Pending => ("pending", "", String::new()),
+            PageStep::Opening => ("opening", "<i class=\"spin\"></i>", t("signinPageOpening", &[])),
+            PageStep::Open => ("open", "&#10140;", t("signinPageOpen", &[("account", account)])),
+            PageStep::Done => ("done", "&#10003;", t("signinPageDone", &[])),
+            PageStep::Skipped => ("done", "&#10003;", t("signinPageSkipped", &[])),
+        };
+        html += &format!("<li class=\"{class}\"><span class=\"mark\">{mark}</span><span class=\"name\">{}</span><span class=\"note\">{note}</span></li>", esc(name));
+    }
+    html + "</ol>"
+}
+
 /// Touched in a profile each time a sign-in page is opened in it, by whichever process opened it
 /// (Claude's opens through `BROWSER`, in a process of its own): see [`Session::page_opened_since`].
 const OPENED: &str = "slopbar-page-opened";
@@ -392,16 +478,30 @@ fn millis(t: std::time::SystemTime) -> u128 {
     t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis())
 }
 
-/// The label page: its title (what the tab shows) and heading name the account.
-fn label_page(account: &str, lang: &str) -> String {
-    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+/// The label page: its title (what the tab shows) and heading name the account, it asks the person
+/// to keep the window open, and with `progress` (from [`Session::show`], its `revision`th) it
+/// shows how the email's sign-ins are going, redrawing itself as [`PROGRESS_SCRIPT`] changes.
+fn label_page(account: &str, lang: &str, progress: Option<&Progress>, revision: u64) -> String {
     let t = |key: &str| esc(&crate::i18n::t(lang, key, &[("account", account)]));
+    let section = progress.map(|p| progress_html(account, lang, p)).unwrap_or_default();
     format!(
         "<!doctype html><html lang=\"{lang}\"><head><meta charset=\"utf-8\"><title>{title}</title><style>\
-         :root{{color-scheme:light dark;font-family:'Segoe UI',system-ui,sans-serif}}\
-         body{{max-width:40em;margin:12vh auto;padding:0 24px;line-height:1.5}}h1{{font-size:1.6em;overflow-wrap:anywhere}}\
-         </style></head><body><h1>{heading}</h1><p>{body}</p><p>{codex}</p></body></html>",
-        lang = esc(lang), title = t("signinPageTitle"), heading = t("signinPageHeading"), body = t("signinPageBody"), codex = t("signinPageCodex"),
+         :root{{color-scheme:light dark;font-family:'Segoe UI',system-ui,sans-serif;--ok:#15803d;--warn:#b45309}}\
+         @media (prefers-color-scheme:dark){{:root{{--ok:#4ade80;--warn:#fbbf24}}}}\
+         body{{max-width:40em;margin:10vh auto;padding:0 24px;line-height:1.5}}h1{{font-size:1.6em;overflow-wrap:anywhere}}\
+         .keep{{font-weight:600;padding:10px 14px;border-left:4px solid var(--warn);background:color-mix(in srgb,var(--warn) 12%,transparent)}}\
+         .overall{{margin-bottom:.3em;opacity:.75}}ol{{list-style:none;padding:0;margin-top:0}}\
+         li{{display:flex;gap:.6em;align-items:baseline;padding:.3em 0}}.mark{{width:1.2em;text-align:center;flex:none}}\
+         .name{{font-weight:600}}.note{{opacity:.8}}.pending{{opacity:.55}}.done .mark{{color:var(--ok)}}\
+         .spin{{display:inline-block;width:.8em;height:.8em;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-.1em}}\
+         @keyframes spin{{to{{transform:rotate(1turn)}}}}@media (prefers-reduced-motion:reduce){{.spin{{animation-duration:2.4s}}}}\
+         </style></head><body><h1>{heading}</h1><p class=\"keep\">{keep}</p><div id=\"progress\" aria-live=\"polite\">{section}</div>\
+         <p>{body}</p><p>{codex}</p><script>(function(){{var seen={revision},n=0,box=document.getElementById('progress');\
+         window.slopbarProgress=function(p){{if(p.revision>seen){{seen=p.revision;box.innerHTML=p.html;document.title=p.title;}}}};\
+         function poll(){{var s=document.createElement('script');s.src='{script}?'+(++n);s.onload=s.onerror=function(){{s.remove();}};document.head.appendChild(s);}}\
+         setInterval(poll,1000);document.addEventListener('visibilitychange',poll);}})();</script></body></html>",
+        lang = esc(lang), title = esc(&page_title(account, lang, progress)), heading = t("signinPageHeading"), keep = t("signinPageKeepOpen"),
+        body = t("signinPageBody"), codex = t("signinPageCodex"), script = PROGRESS_SCRIPT,
     )
 }
 
@@ -728,7 +828,7 @@ mod tests {
     #[test]
     fn the_label_page_names_the_account_in_every_language_and_escapes_it() {
         for lang in crate::i18n::languages() {
-            let page = label_page("a<b>&\"c\"@example.invalid", lang);
+            let page = label_page("a<b>&\"c\"@example.invalid", lang, None, 0);
             assert!(page.contains("a&lt;b&gt;&amp;&quot;c&quot;@example.invalid"), "{lang}: {page}");
             assert!(!page.contains("<b>") && !page.contains("{account}"), "{lang}");
             assert!(page.contains(&format!("lang=\"{lang}\"")));
@@ -740,6 +840,60 @@ mod tests {
         std::fs::write(session.dir().join(OPENED), millis(std::time::SystemTime::now()).to_string()).unwrap();
         assert!(session.page_opened_since(before));
         assert!(!session.page_opened_since(std::time::SystemTime::now() + Duration::from_secs(60)), "an earlier step's page is not this one's");
+    }
+
+    #[test]
+    fn the_label_page_shows_the_email_s_turn_as_it_goes() {
+        let root = TempDir::new();
+        let session = Session::create_in(&root.0).unwrap();
+        let mut progress = Progress { steps: vec![("Claude".into(), PageStep::Done), ("Claude <monitoring>".into(), PageStep::Opening),
+            ("Codex".into(), PageStep::Pending)], at: 5, total: 27 };
+        session.show(&progress);
+        assert!(!session.dir().join(PROGRESS_SCRIPT).exists(), "nothing before the page is labelled");
+        session.label("synthetic@example.invalid", "en");
+        let page = std::fs::read_to_string(session.dir().join(LABEL_PAGE)).unwrap();
+        assert!(page.contains("Keep this window open") && !page.contains("<ol>"), "labelled, before any progress: {page}");
+        session.show(&progress);
+        let page = std::fs::read_to_string(session.dir().join(LABEL_PAGE)).unwrap();
+        assert!(page.contains("<title>1/3 \u{b7} synthetic@example.invalid: SlopBar sign-in</title>"), "{page}");
+        assert!(page.contains("Sign-in 5 of 27") && page.contains("var seen=1,"), "{page}");
+        assert!(page.contains("<li class=\"done\"><span class=\"mark\">&#10003;</span><span class=\"name\">Claude</span><span class=\"note\">done</span></li>"), "{page}");
+        assert!(page.contains("<i class=\"spin\"></i></span><span class=\"name\">Claude &lt;monitoring&gt;</span><span class=\"note\">opening…</span>"), "{page}");
+        progress.steps[1].1 = PageStep::Open;
+        session.show(&progress);
+        let script = std::fs::read_to_string(session.dir().join(PROGRESS_SCRIPT)).unwrap();
+        let json: serde_json::Value = serde_json::from_str(script.trim().strip_prefix("slopbarProgress(").unwrap().strip_suffix(");").unwrap()).unwrap();
+        assert_eq!(json["revision"], 2);
+        assert_eq!(json["title"], "1/3 \u{b7} synthetic@example.invalid: SlopBar sign-in");
+        assert!(json["html"].as_str().unwrap().contains("sign in as synthetic@example.invalid in the tab that opened"), "{json}");
+        assert!(!session.dir().join("slopbar-progress.part").exists());
+        for lang in crate::i18n::languages() {
+            let page = label_page("a@example.invalid", lang, Some(&progress), 3);
+            assert!(!page.contains("{account}") && !page.contains("{i}") && !page.contains("signinPage"), "{lang}: {page}");
+        }
+    }
+
+    /// For rendering it headless: `SLOPBAR_PAGE_OUT=<dir> cargo test --lib write_a_progress_page -- --ignored`
+    /// leaves a page drawn at "Claude done, Claude monitoring opening" whose sidecar has moved on
+    /// to "Claude monitoring open", so a render a few seconds in shows the page redrew itself.
+    #[test]
+    #[ignore]
+    fn write_a_progress_page() {
+        let out = PathBuf::from(std::env::var_os("SLOPBAR_PAGE_OUT").expect("SLOPBAR_PAGE_OUT"));
+        let lang = std::env::var("SLOPBAR_PAGE_LANG").unwrap_or_else(|_| "en".into());
+        let session = Session::create_in(&out).unwrap();
+        session.label("visual.one@example.invalid", &lang);
+        let mut progress = Progress { steps: vec![("Claude".into(), PageStep::Done), ("Claude monitoring".into(), PageStep::Opening),
+            ("Codex".into(), PageStep::Pending), ("Codex monitoring".into(), PageStep::Pending)], at: 6, total: 27 };
+        session.show(&progress);
+        let first = std::fs::read(session.dir().join(LABEL_PAGE)).unwrap();
+        progress.steps[1].1 = PageStep::Open;
+        session.show(&progress);
+        std::fs::write(session.dir().join(LABEL_PAGE), first).unwrap();
+        let page = session.dir().join(LABEL_PAGE);
+        std::fs::write(out.join("page-path.txt"), page.to_string_lossy().as_bytes()).unwrap();
+        // Kept for the render: not deleted as the session ends.
+        std::mem::forget(session);
     }
 
     #[test]
