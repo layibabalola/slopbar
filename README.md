@@ -32,6 +32,10 @@ Add accounts in **Settings → Accounts**: SlopBar opens the CLI's own sign-in (
 > [!NOTE]
 > A running Codex session keeps its account until you restart it.
 
+### One account on two computers
+
+With in-use sharing on (Settings → Data → Other computers), SlopBar flags an account that is in use on more than one of your computers at the same time: an amber "In use on 2 machines" line in the flyout and in Settings → Accounts, an amber badge on that provider's ring in the taskbar widget, a Health warning, and one notification per overlap (Settings → Notifications). Its limits drain that many times as fast, and the provider may sign sessions out. A computer counts only while it keeps writing its status, so one that was shut down drops out within about 15 minutes.
+
 ### A new computer
 
 Turn on **Share account list with my other computers** (Settings → Data → Other computers) on each computer, with the same roster passphrase on each. Every SlopBar then adds its accounts' provider, id, email and plan (never sign-ins) to the sharing folder or rclone remote, encrypted. A computer that reads them shows "N accounts from your other machines are waiting to be signed in" in the flyout and Health, and **Sign in all accounts** (Settings → Accounts) queues every one, one email at a time.
