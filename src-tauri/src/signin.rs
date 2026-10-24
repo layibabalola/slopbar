@@ -124,6 +124,20 @@ impl Session {
         Ok(Self { dir, opened: Default::default() })
     }
 
+    /// Names the profile after the email it signs in, before its browser first starts, so the
+    /// browser's profile button says whose sign-ins the window is for (Codex's page cannot be
+    /// prefilled). Best effort: a browser that ignores it still works.
+    pub fn label(&self, email: &str) {
+        let name: String = email.chars().filter(|c| !c.is_control()).take(64).collect();
+        let state = self.dir.join("Local State");
+        if name.is_empty() || state.exists() {
+            return;
+        }
+        let info = serde_json::json!({ "name": name, "is_using_default_name": false, "shortcut_name": name });
+        let local = serde_json::json!({ "profile": { "info_cache": { "Default": info } } });
+        let _ = std::fs::write(&state, local.to_string());
+    }
+
     /// A new profile in [`sessions_root`].
     pub fn create() -> Option<Self> {
         Self::create_in(&sessions_root()?).ok()
@@ -404,9 +418,13 @@ pub fn browser_args(kind: Kind, target: &Target, url: &str) -> Vec<OsString> {
                 args.push(flag.into());
             }
         }
-        Target::Private => args.push(match kind { Kind::Chrome => "--incognito", Kind::Edge => "--inprivate" }.into()),
+        Target::Private => {
+            args.push(match kind { Kind::Chrome => "--incognito", Kind::Edge => "--inprivate" }.into());
+            args.push("--new-window".into());
+        }
     }
-    args.push("--new-window".into());
+    // A profile's later pages open as tabs in its one window (the first opens the window), so an
+    // email's sign-ins stay together instead of stacking windows.
     args.push(url.into());
     args
 }
@@ -637,6 +655,12 @@ mod tests {
         close_browser(&root.0);
         let session = Session::create_in(&root.0).unwrap();
         assert!(!session.browser_closed(), "a browser that never opened was not closed");
+        session.label("synthetic\n@example.invalid");
+        let state: serde_json::Value = serde_json::from_slice(&std::fs::read(session.dir().join("Local State")).unwrap()).unwrap();
+        assert_eq!(state["profile"]["info_cache"]["Default"]["name"], "synthetic@example.invalid");
+        session.label("other@example.invalid");
+        let again: serde_json::Value = serde_json::from_slice(&std::fs::read(session.dir().join("Local State")).unwrap()).unwrap();
+        assert_eq!(again, state, "never rewritten once there (the browser owns it)");
         // Seen open for one sign-in, then closed: closed for that one, not for the next.
         session.opened.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(session.browser_closed());
@@ -691,7 +715,9 @@ mod tests {
         let args = browser_args(Kind::Edge, &Target::Profile(dir), "https://claude.ai/oauth");
         assert_eq!(args.first().unwrap(), r"--user-data-dir=C:\data\signin-sessions\0011223344556677");
         assert_eq!(args.last().unwrap(), "https://claude.ai/oauth");
+        assert!(!args.contains(&"--new-window".into()), "a profile's later pages open as tabs in its window");
         assert!(browser_args(Kind::Edge, &Target::Private, "https://claude.ai/").contains(&"--inprivate".into()));
+        assert!(browser_args(Kind::Edge, &Target::Private, "https://claude.ai/").contains(&"--new-window".into()));
         assert!(browser_args(Kind::Chrome, &Target::Private, "https://claude.ai/").contains(&"--incognito".into()));
     }
 
