@@ -191,6 +191,10 @@ pub struct Settings {
     /// user's other machines through the in-use sharing location, encrypted with a roster
     /// passphrase set on each machine (see `roster`), so a new machine knows every account.
     pub account_roster: bool,
+    /// Use (and switch_account) also moves this machine's desktop app onto the account: guided for
+    /// Claude Desktop (it has no supported way to be signed in from outside), and a reminder to
+    /// restart the Codex app, which shares the CLI's sign-in (see `desktop_apps`). Off until proven.
+    pub switch_desktop: bool,
 }
 
 /// Phone alerts through a push service (ntfy). The access token is not here: it is kept with
@@ -301,6 +305,7 @@ impl Default for Settings {
             wsl_accounts: crate::sources::WslScan::Auto,
             signin_window: crate::signin::Window::Profile,
             account_roster: false,
+            switch_desktop: false,
         }
     }
 }

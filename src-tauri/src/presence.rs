@@ -298,8 +298,16 @@ fn paths_in(bytes: &[u8]) -> Vec<PathBuf> {
 pub fn own(machine_id: &str, machine: &str, interval_s: u64, accounts: &[AccountUsage], now: DateTime<Utc>) -> Presence {
     let mut seats: Vec<Seat> = accounts
         .iter()
-        .filter(|a| a.active && !a.id.starts_with("token:"))
-        .map(|a| Seat { p: a.provider, h: hash(a.provider, &a.id), where_: a.sources.clone() })
+        .filter(|a| (a.active || a.desktop) && !a.id.starts_with("token:"))
+        .map(|a| {
+            // The desktop app is a place like the CLI's sources ("Windows", "WSL: Ubuntu"), so
+            // older SlopBars show it without knowing about it.
+            let mut where_ = if a.active { a.sources.clone() } else { vec![] };
+            if a.desktop {
+                where_.push(crate::desktop_apps::PLACE.into());
+            }
+            Seat { p: a.provider, h: hash(a.provider, &a.id), where_ }
+        })
         .collect();
     seats.sort_by(|a, b| (a.p.key(), &a.h).cmp(&(b.p.key(), &b.h)));
     Presence { v: 1, machine_id: machine_id.into(), machine: machine.into(), written_at: now, interval_s, seats }
@@ -397,7 +405,8 @@ pub fn overlap(accounts: &mut [AccountUsage], me: &str) {
                 names.push(n.to_string());
             }
         };
-        if a.active {
+        // The desktop app here draws on the account like the CLI does.
+        if a.active || a.desktop {
             add(me);
         }
         let mut live: Vec<&str> = a.remote.iter().filter(|r| r.live).map(|r| r.machine.as_str()).collect();
@@ -442,7 +451,7 @@ pub fn infer(tracks: &mut Tracks, accounts: &mut [AccountUsage], hold: Duration,
     tracks.retain(|(p, id), _| accounts.iter().any(|a| a.provider == *p && a.id == *id));
     let mut surged = vec![];
     for a in accounts.iter_mut() {
-        let unclaimed = a.monitor_connected && !a.active && !a.remote.iter().any(|r| r.live);
+        let unclaimed = a.monitor_connected && !a.active && !a.desktop && !a.remote.iter().any(|r| r.live);
         let track = tracks.entry((a.provider, a.id.clone())).or_default();
         let fresh = !a.stale && a.error.is_none() && a.monitor_error.is_none() && a.fetched_at.is_some();
         if fresh && a.fetched_at != track.fetched_at {
@@ -513,7 +522,7 @@ mod tests {
             billing: Default::default(),
             remote: vec![], overlap: vec![],
             used_outside: false,
-            runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None,
+            runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None, desktop: false, seats: None,
         }
     }
 
@@ -634,6 +643,26 @@ mod tests {
         let peers = read(&store, &mine.machine_id, now + Duration::minutes(1));
         attach(&mut idle, &peers, now);
         assert!(idle[0].remote.is_empty());
+    }
+
+    #[test]
+    fn the_desktop_app_is_shared_as_a_place_and_counts_for_overlap() {
+        let now = at(0);
+        let mut desk_only = account("d", false);
+        desk_only.desktop = true;
+        let mut both = account("b", true);
+        both.desktop = true;
+        let mine = own("me", "BACHELOR", 300, &[desk_only.clone(), both, account("n", false)], now);
+        let wheres: Vec<_> = mine.seats.iter().map(|s| (s.h.clone(), s.where_.clone())).collect();
+        assert_eq!(wheres.len(), 2, "the desktop-only account is shared, the unused one is not");
+        assert!(wheres.contains(&(hash(Provider::Claude, "d"), vec![crate::desktop_apps::PLACE.to_string()])));
+        assert!(wheres.contains(&(hash(Provider::Claude, "b"), vec!["Windows".into(), "WSL: Ubuntu".into(), crate::desktop_apps::PLACE.into()])));
+
+        let peers = peers(vec![(file("p1", "LAPTOP-2", now - Duration::minutes(1), vec![seat("d")]), None)], "me", now);
+        let mut list = vec![desk_only];
+        attach(&mut list, &peers, now);
+        overlap(&mut list, "BACHELOR");
+        assert_eq!(list[0].overlap, ["BACHELOR", "LAPTOP-2"], "the desktop app here and the CLI there drain one account");
     }
 
     #[test]
