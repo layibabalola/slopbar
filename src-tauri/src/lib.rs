@@ -61,6 +61,7 @@ mod door;
 mod desktop;
 mod pairing;
 mod instance;
+mod mcp_update;
 pub use instance::claim as claim_instance;
 mod mcp;
 pub use mcp::serve_stdio as serve_mcp;

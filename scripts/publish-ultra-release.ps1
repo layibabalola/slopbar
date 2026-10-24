@@ -86,8 +86,16 @@ Invoke-Checked 'git add Cargo.toml' { git -C $root add src-tauri/Cargo.toml }
 if (git -C $root status --porcelain) { throw 'Cargo.toml differs from HEAD beyond line ends.' }
 Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY, Env:TAURI_SIGNING_PRIVATE_KEY_PATH, Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) { $env:Path = "$env:ProgramFiles\nodejs;$env:Path" }
+# The installer hook sets a running slopbar-mcp.exe aside so the new one is written (agents' servers
+# lock it; a quiet install would skip it).
 $override = Join-Path $stage 'build.conf.json'
-@{ version = $version; bundle = @{ createUpdaterArtifacts = $false } } | ConvertTo-Json | Set-Content $override
+@{
+  version = $version
+  bundle  = @{
+    createUpdaterArtifacts = $false
+    windows                = @{ nsis = @{ installerHooks = (Join-Path $root 'src-tauri/nsis/ultra-hooks.nsh') } }
+  }
+} | ConvertTo-Json -Depth 5 | Set-Content $override
 $pnpm = if (Get-Command pnpm -ErrorAction SilentlyContinue) { @('pnpm') } else { @('corepack', 'pnpm') }
 $pnpmArgs = @($pnpm | Select-Object -Skip 1)
 Push-Location $root
@@ -104,6 +112,12 @@ if ($p.ExitCode -ne 0) { throw 'Build metadata command failed.' }
 $info = Get-Content $infoPath -Raw | ConvertFrom-Json
 if ($info.commit -ne $head -or $info.dirty -or $info.tauri_dev -ne $false -or -not $info.upstream_updates) {
   throw "The built executable is not a clean ultra-updates build of $head."
+}
+# The installer packs agents' MCP server from here, with the hook that sets a running one aside.
+$mcpHash = (Get-FileHash (Join-Path $root 'src-tauri/target/release/slopbar-mcp.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+$nsi = Get-Content (Join-Path $root 'src-tauri/target/release/nsis/x64/installer.nsi') -Raw
+if ($nsi -notmatch '/oname=slopbar-mcp\.exe' -or ($nsi -notmatch 'slopbar-mcp\.old-' -and $nsi -notmatch 'ultra-hooks\.nsh')) {
+  throw 'The installer does not carry slopbar-mcp.exe with the hook that sets a running one aside.'
 }
 $setupName = "SlopBar_${version}_x64-setup.exe"
 $setup = Join-Path $stage $setupName
@@ -144,7 +158,7 @@ $files = @($setup, "$setup.sig", $latest)
 Invoke-Checked 'gh release create' {
   gh release create $tag @files -R $Repo --target $head --latest=false `
     --title "SlopBar Ultra $version" `
-    --notes "SlopBar Ultra $version, built from $head on the ultra branch. Installs update themselves from this fork only."
+    --notes "SlopBar Ultra $version, built from $head on the ultra branch. Installs update themselves from this fork only.`n`nslopbar-mcp.exe SHA-256: $mcpHash"
 }
 $check = Join-Path $stage 'check'
 Invoke-Checked 'Download of the release' { gh release download $tag -R $Repo -D $check }
@@ -170,3 +184,4 @@ Write-Output "Published $version"
 Write-Output "  release: https://github.com/$Repo/releases/tag/$tag"
 Write-Output "  channel: https://github.com/$Repo/releases/download/$channelTag/latest.json"
 Write-Output "  installer: $setup"
+Write-Output "  slopbar-mcp.exe sha256: $mcpHash"

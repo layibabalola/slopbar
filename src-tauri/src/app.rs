@@ -642,6 +642,8 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             "build": diagnostics::build_info(),
             // Which process answers the door (the installer quits exactly this one).
             "pid": std::process::id(),
+            // Agents' server beside it: its hash, and old copies still running agents' servers.
+            "mcp": tauri::async_runtime::spawn_blocking(crate::mcp_update::status).await.unwrap_or_default(),
         })),
         R::InspectWindow { window, page, screenshot } => {
             let target = match window {
@@ -3200,6 +3202,10 @@ pub fn run() {
                 // accounts), and fresh ones a SlopBar that ended mid-sign-in left behind.
                 let _ = signin::cleanup();
             });
+            // Agents' MCP servers an update set aside, once they have ended.
+            if !settings::isolated() {
+                tauri::async_runtime::spawn_blocking(crate::mcp_update::prune_installed);
+            }
             // Before the first refresh reads the vault; a slot that fails stays readable as plaintext.
             let vault = accounts::migrate_vault();
             if !vault.is_empty() {

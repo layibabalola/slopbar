@@ -103,7 +103,7 @@ pub fn count(list: &[(String, u32)], session: u32) -> Processes {
     for (name, _) in list.iter().filter(|(_, s)| *s == session) {
         if name.eq_ignore_ascii_case(APP_EXE) {
             found.instances += 1;
-        } else if name.eq_ignore_ascii_case(MCP_EXE) {
+        } else if name.eq_ignore_ascii_case(MCP_EXE) || crate::mcp_update::is_set_aside(name) {
             found.mcp_servers += 1;
         }
     }
@@ -339,10 +339,11 @@ mod tests {
     #[test]
     fn counts_this_sessions_app_and_servers_by_name() {
         let list: Vec<(String, u32)> = [("slopbar.exe", 1), ("SlopBar.exe", 1), ("slopbar-mcp.exe", 1), ("slopbar-mcp.exe", 1),
-            ("slopbar-mcp.exe", 1), ("slopbar.exe", 2), ("slopbar-mcp.exe", 2), ("explorer.exe", 1)]
+            ("slopbar-mcp.exe", 1), ("slopbar.exe", 2), ("slopbar-mcp.exe", 2), ("explorer.exe", 1),
+            ("slopbar-mcp.old-20261024-120000-42.exe", 1)]
             .iter().map(|(n, s)| (n.to_string(), *s)).collect();
         if cfg!(windows) {
-            assert_eq!(count(&list, 1), Processes { instances: 2, mcp_servers: 3 });
+            assert_eq!(count(&list, 1), Processes { instances: 2, mcp_servers: 4 });
             assert_eq!(count(&list, 2), Processes { instances: 1, mcp_servers: 1 });
         }
         assert_eq!(count(&list, 9), Processes::default());

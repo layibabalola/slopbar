@@ -66,6 +66,21 @@ The script picks the next build number. It then:
 Installed copies pick the release up at their next check: about 20 seconds after SlopBar starts,
 then every 6 hours. A restart through the door (`restart_app`) makes the check happen now.
 
+### Agents' MCP server (`slopbar-mcp.exe`)
+
+The installer carries `slopbar-mcp.exe` beside `slopbar.exe` (Tauri bundles every binary of the
+crate). Agents run it for their whole session, though, and a running executable can't be written,
+so a quiet update used to skip it and leave the old build behind. Windows does allow renaming it.
+The script's `--config` override adds the hook `src-tauri/nsis/ultra-hooks.nsh`, so release
+installers first rename the file to `slopbar-mcp.old-<time>-<n>.exe` and then write the new one.
+Running servers carry on from the old copy, and new agent sessions start the new one. At every
+start the app deletes old copies that nothing runs any more (`src-tauri/src/mcp_update.rs`), and
+the uninstaller removes them with the app. The script refuses to publish an installer without
+the server and the hook.
+
+The release notes give the server's SHA-256. `get_app_info` (door) reports `mcp.sha256` and
+`mcp.set_aside`, the number of old copies still running agents' servers.
+
 **After moving machines to releases, don't run `scripts/install-local-build.ps1` on them.** A
 local build reports version `0.1.0`, which SemVer ranks above every `0.1.0-ultra.<n>`, and it
 can't update itself. So that machine stops taking releases until a release build is installed over
