@@ -2761,6 +2761,8 @@ async fn retry_peer_sign_in(app: AppHandle, machine_id: String) -> Result<(), St
     let arguments = serde_json::json!({ "confirm": true, "monitoring": monitoring, "retry": true });
     tauri::async_runtime::spawn_blocking(move || pairing::remote_call(&pairing::Ssh, &host, "sign_in_all", &arguments))
         .await.map_err(|_| "ssh_failed".to_string())??;
+    // Its new run reaches the roster a few seconds later: read it at the live pace meanwhile.
+    app.state::<AppState>().roster.lock().unwrap().expect_news(&machine_id, chrono::Utc::now());
     Ok(())
 }
 
