@@ -900,7 +900,7 @@ impl LoginJob {
                 self.record_login(LoginStage::Timeout, false, None);
                 break None;
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
             if let Some(rpc) = &self.rpc {
                 // The app server reports the end itself and stays running.
                 match rpc.done.try_recv() {

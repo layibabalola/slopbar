@@ -135,6 +135,14 @@ struct StepRecord {
     state: StepState,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// When it started, when its page opened (in an email's profile, the only place that tells)
+    /// and when it ended, so a run's waits can be measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ended_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -851,8 +859,26 @@ async fn add_expected(app: &AppHandle, expected: &bulk::Step, session: Option<&s
     accounts::store_login(&login).map_err(|_| "monitor_storage".to_string())?;
     forget_pending(provider, &login.id);
     let _ = app.emit("account-added", (login.provider, login.email.clone()));
-    do_refresh(app).await;
+    refresh_soon(app);
     Ok(())
+}
+
+/// A refresh after a sign-in, not waited for: one can take most of a minute (finding sign-ins,
+/// sharing), and "Sign in all accounts" opens its next sign-in meanwhile. Asked for again while
+/// one waits to start, it is that one.
+fn refresh_soon(app: &AppHandle) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WAITING: AtomicBool = AtomicBool::new(false);
+    if WAITING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // After any refresh running now, which may have read before the change.
+        drop(app.state::<AppState>().refresh_lock.lock().await);
+        WAITING.store(false, Ordering::SeqCst);
+        do_refresh(&app).await;
+    });
 }
 
 /// Why a sign-in was not the expected account. A Codex account is one ChatGPT workspace, so the
@@ -928,13 +954,17 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
         app.state::<AppState>().diagnostics.record(Some(provider), Some(&id), diagnostics::Event::Action { action: diagnostics::Action::ConnectFinished,
             code: diagnostics::Code::from_error(outcome.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) });
         let _ = app.emit("monitoring-login", serde_json::json!({ "provider": provider, "id": id, "error": outcome.as_ref().err() }));
-        // Preserve last-known data, but allow the new login to bypass an earlier error's backoff.
-        {
-            let state = app.state::<AppState>();
-            let _refresh = state.refresh_lock.lock().await;
-            providers::retry_now(&mut state.usage_cache.lock().unwrap(), &key);
-        }
-        do_refresh(&app).await;
+        // Preserve last-known data, but allow the new login to bypass an earlier error's backoff,
+        // without holding up whatever waits for this sign-in (see `refresh_soon`).
+        let h = app.clone();
+        tauri::async_runtime::spawn(async move {
+            {
+                let state = h.state::<AppState>();
+                let _refresh = state.refresh_lock.lock().await;
+                providers::retry_now(&mut state.usage_cache.lock().unwrap(), &key);
+            }
+            refresh_soon(&h);
+        });
         outcome
     }))
 }
@@ -1094,6 +1124,21 @@ async fn browser_closed(session: Option<&signin::Session>) {
     }
 }
 
+/// Resolves once a sign-in page opened in `session`'s profile at or after `since`; never without one.
+async fn page_opened(session: Option<&signin::Session>, since: std::time::SystemTime) {
+    let Some(session) = session else { return std::future::pending().await };
+    while !session.page_opened_since(since) {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// What a sign-in is, as an email's page lists it: "Claude", "Codex monitoring".
+fn step_name(lang: &str, step: &bulk::Step) -> String {
+    let provider = match step.target.provider { Provider::Claude => "Claude", Provider::Codex => "Codex" };
+    let key = if step.kind == bulk::Kind::Add { "signinPageStepAdd" } else { "signinPageStepConnect" };
+    crate::i18n::t(lang, key, &[("provider", provider)])
+}
+
 /// How long a sign-in may take to open its page (Codex's app server can be a cold start).
 const NO_PAGE_LIMIT: Duration = Duration::from_secs(40);
 /// How long a sign-in may wait on the person before they are asked whether to retry it.
@@ -1131,7 +1176,7 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
             return Err("monitor_busy".into());
         }
         let steps = groups.iter().flat_map(|g| g.steps.iter())
-            .map(|s| StepRecord { target: s.target.clone(), kind: s.kind, state: StepState::Pending, error: None }).collect();
+            .map(|s| StepRecord { target: s.target.clone(), kind: s.kind, state: StepState::Pending, error: None, started_at: None, page_at: None, ended_at: None }).collect();
         *running = Some(BulkConnect { total, done: 0, current: None, kind: None, emails: if by_email { groups.len() } else { 0 }, email: 0,
             finished: total == 0, error: None, steps, by_email, monitoring, still_waiting: false, revision: 0 });
         *state.bulk_stop.lock().unwrap() = Some(stop.clone());
@@ -1145,14 +1190,29 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
         let mut position = 0;
         let mark = |at: usize, state: StepState, error: Option<String>| publish_bulk(&h, |b| {
             if let Some(step) = b.steps.get_mut(at) {
+                let now = Some(chrono::Utc::now());
+                match state {
+                    StepState::Running => step.started_at = now,
+                    StepState::Pending => {}
+                    _ => step.ended_at = now,
+                }
                 step.state = state;
                 step.error = error;
             }
         });
+        // Accounts this run signed in: one only just added has its monitoring sign-in next, though
+        // the refresh that lists it may still be running.
+        let mut added = std::collections::HashSet::new();
         'groups: for (index, group) in groups.iter().enumerate() {
             // Made at the email's first sign-in that still has to run, ended with its turn.
             let mut group_session: Option<Option<Arc<signin::Session>>> = None;
-            for step in &group.steps {
+            // What the email's page shows of its turn (see `signin::Session::show`).
+            let mut page = signin::Progress {
+                steps: group.steps.iter().map(|s| (step_name(&lang, s), signin::PageStep::Pending)).collect(),
+                at: 0,
+                total,
+            };
+            for (in_group, step) in group.steps.iter().enumerate() {
                 let target = &step.target;
                 let at = position;
                 position += 1;
@@ -1171,11 +1231,12 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     let account = snapshot.accounts.iter().find(|a| a.provider == target.provider && a.id == target.id);
                     match step.kind {
                         bulk::Kind::Add => account.is_none(),
-                        bulk::Kind::Connect => account.is_some_and(|a| !a.monitor_connected),
+                        bulk::Kind::Connect => account.map_or(added.contains(&(target.provider, &target.id)), |a| !a.monitor_connected),
                     }
                 };
                 if !still {
                     mark(at, StepState::Skipped, None);
+                    page.steps[in_group].1 = signin::PageStep::Skipped;
                     continue;
                 }
                 // Locked or left since the queue started: stop rather than open a page nobody sees.
@@ -1189,7 +1250,7 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                 // Another sign-in is open (one the user or automatic monitoring started): wait for it.
                 let free = async {
                     while h.state::<AppState>().account_operations.busy(monitoring::SIGN_IN) {
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        tokio::time::sleep(Duration::from_millis(250)).await;
                     }
                 };
                 let stopped = tokio::select! {
@@ -1203,6 +1264,10 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     }
                     session
                 }).clone();
+                page.at = done;
+                page.steps[in_group].1 = signin::PageStep::Opening;
+                let show = |session: Option<&signin::Session>, page: &signin::Progress| if let Some(s) = session { s.show(page) };
+                show(session.as_deref(), &page);
                 let since = std::time::SystemTime::now();
                 let run = async {
                     match step.kind {
@@ -1235,19 +1300,39 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                 let outcome = if stopped {
                     Err("signin_stopped".into())
                 } else {
-                    tokio::select! {
-                        outcome = &mut run => outcome,
-                        _ = stop.notified() => Err("signin_stopped".into()),
-                        // Closing the window once the provider's page says "done" is fine: the
-                        // sign-in may still be saving (Codex's CLI can take a while), so it gets up to
-                        // two minutes to finish before the queue stops.
-                        _ = browser_closed(session.as_deref()) => tokio::time::timeout(SIGN_IN_GRACE, &mut run).await
-                            .unwrap_or_else(|_| Err("signin_window_closed".into())),
-                        e = watch_step(&h, session.as_deref(), since, &account) => Err(e),
+                    let closed = browser_closed(session.as_deref());
+                    let watch = watch_step(&h, session.as_deref(), since, &account);
+                    let opened = page_opened(session.as_deref(), since);
+                    tokio::pin!(closed, watch, opened);
+                    let mut opening = true;
+                    loop {
+                        tokio::select! {
+                            outcome = &mut run => break outcome,
+                            _ = stop.notified() => break Err("signin_stopped".into()),
+                            // Closing the window once the provider's page says "done" is fine: the
+                            // sign-in may still be saving (Codex's CLI can take a while), so it gets up to
+                            // two minutes to finish before the queue stops.
+                            _ = &mut closed => break tokio::time::timeout(SIGN_IN_GRACE, &mut run).await
+                                .unwrap_or_else(|_| Err("signin_window_closed".into())),
+                            e = &mut watch => break Err(e),
+                            _ = &mut opened, if opening => {
+                                opening = false;
+                                publish_bulk(&h, |b| if let Some(s) = b.steps.get_mut(at) { s.page_at = Some(chrono::Utc::now()) });
+                                page.steps[in_group].1 = signin::PageStep::Open;
+                                show(session.as_deref(), &page);
+                            }
+                        }
                     }
                 };
                 match outcome {
-                    Ok(()) => mark(at, StepState::Done, None),
+                    Ok(()) => {
+                        mark(at, StepState::Done, None);
+                        if step.kind == bulk::Kind::Add {
+                            added.insert((target.provider, &target.id));
+                        }
+                        page.steps[in_group].1 = signin::PageStep::Done;
+                        show(session.as_deref(), &page);
+                    }
                     Err(e) => {
                         done -= 1;
                         mark(at, StepState::Failed, Some(e.clone()));
@@ -2915,7 +3000,7 @@ mod sign_in_tests {
     #[test]
     fn a_run_reports_every_step() {
         let step = StepRecord { target: bulk::Target { provider: Provider::Codex, id: "synthetic-id".into(), account: Some("synthetic@example.invalid".into()), ended: None },
-            kind: bulk::Kind::Connect, state: StepState::Failed, error: Some("signin_no_page".into()) };
+            kind: bulk::Kind::Connect, state: StepState::Failed, error: Some("signin_no_page".into()), started_at: None, page_at: None, ended_at: None };
         let v = serde_json::to_value(&step).unwrap();
         assert_eq!(v["provider"], "codex");
         assert_eq!(v["id"], "synthetic-id");
