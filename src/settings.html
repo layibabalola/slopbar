@@ -50,6 +50,8 @@
     <!-- Accounts -->
     <section class="page active" id="page-accounts">
       <header><h1 data-i18n="sAccounts"></h1><p data-i18n="descAccounts"></p></header>
+      <!-- Another computer signing in: at the top, so the person here sees it without scrolling. -->
+      <div id="peer-sign-ins"></div>
       <section class="guide" id="guide" aria-labelledby="guide-title" hidden></section>
       <div id="accounts"></div>
       <p class="hint notice" id="add-hint" hidden data-i18n="addHint"></p>
@@ -83,7 +85,6 @@
       </div>
       <p class="hint notice" id="bulk-status" role="status" hidden></p>
       <p class="bulk-retry" id="bulk-retry-row" hidden><button class="btn" id="bulk-retry" data-i18n="signInRetry"></button></p>
-      <div id="peer-sign-ins"></div>
 
       <h2 data-i18n="pinsTitle"></h2>
       <p class="hint pins-intro" data-i18n="pinsIntro"></p>
