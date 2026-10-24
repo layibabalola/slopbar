@@ -855,7 +855,8 @@ mod tests {
         assert!(page.contains("Keep this window open") && !page.contains("<ol>"), "labelled, before any progress: {page}");
         session.show(&progress);
         let page = std::fs::read_to_string(session.dir().join(LABEL_PAGE)).unwrap();
-        assert!(page.contains("<title>1/3 \u{b7} synthetic@example.invalid: SlopBar sign-in</title>"), "{page}");
+        let title = format!("1/3 \u{b7} {}", crate::i18n::t("en", "signinPageTitle", &[("account", "synthetic@example.invalid")]));
+        assert!(page.contains(&format!("<title>{title}</title>")), "{page}");
         assert!(page.contains("Sign-in 5 of 27") && page.contains("var seen=1,"), "{page}");
         assert!(page.contains("<li class=\"done\"><span class=\"mark\">&#10003;</span><span class=\"name\">Claude</span><span class=\"note\">done</span></li>"), "{page}");
         assert!(page.contains("<i class=\"spin\"></i></span><span class=\"name\">Claude &lt;monitoring&gt;</span><span class=\"note\">opening…</span>"), "{page}");
@@ -864,7 +865,7 @@ mod tests {
         let script = std::fs::read_to_string(session.dir().join(PROGRESS_SCRIPT)).unwrap();
         let json: serde_json::Value = serde_json::from_str(script.trim().strip_prefix("slopbarProgress(").unwrap().strip_suffix(");").unwrap()).unwrap();
         assert_eq!(json["revision"], 2);
-        assert_eq!(json["title"], "1/3 \u{b7} synthetic@example.invalid: SlopBar sign-in");
+        assert_eq!(json["title"], title.as_str());
         assert!(json["html"].as_str().unwrap().contains("sign in as synthetic@example.invalid in the tab that opened"), "{json}");
         assert!(!session.dir().join("slopbar-progress.part").exists());
         for lang in crate::i18n::languages() {
