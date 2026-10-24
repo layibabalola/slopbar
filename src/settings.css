@@ -364,6 +364,8 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
 .presence-path input:focus { outline: none; border-bottom: 2px solid var(--accent); }
 .chip.elsewhere { background: transparent; border-color: var(--ok); color: var(--ok); }
 .chip.outside { background: transparent; border-color: var(--warn); color: var(--warn); }
+.chip.overlap { background: transparent; border-color: var(--warn); color: var(--warn); font-weight: 600; }
+.overlap-icon { font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets"; font-size: 0.9em; vertical-align: -1px; }
 .chip.unexpected { background: transparent; border-color: var(--bad); color: var(--bad); }
 .web-use { display: inline-flex; align-items: center; gap: 4px; align-self: flex-start; cursor: pointer; }
 

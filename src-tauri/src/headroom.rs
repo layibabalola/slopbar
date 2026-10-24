@@ -265,6 +265,10 @@ pub struct Recommendation {
     pub recommended: Option<String>,
     pub recommended_label: Option<String>,
     pub summary: String,
+    /// Every machine this provider's account in use here is in use on at once (this one first),
+    /// when that is more than one: a conflict to resolve by switching one of them (see
+    /// `AccountUsage::overlap`). Empty otherwise.
+    pub overlap: Vec<String>,
 }
 
 fn name(label: &Option<String>, id: &str) -> String {
@@ -276,6 +280,10 @@ fn exclusion(acc: &AccountUsage, settings: &Settings, now: DateTime<Utc>) -> Opt
     if acc.error.is_some() { return Some("its last reading failed".into()); }
     if stale(acc, settings, now) { return Some("its reading is stale".into()); }
     if acc.windows.is_empty() { return Some("no usage measured yet".into()); }
+    if acc.overlap.len() > 1 {
+        return Some(format!("in use on {} machines at once ({}): its limits drain about {}x as fast and sessions may be signed out",
+            acc.overlap.len(), acc.overlap.join(", "), acc.overlap.len()));
+    }
     if let Some(seat) = acc.remote.iter().find(|r| r.live) {
         return Some(format!("in use on another machine ({})", seat.machine));
     }
@@ -345,7 +353,18 @@ pub fn recommend(accounts: &[AccountUsage], settings: &Settings, provider: Provi
         .then_with(|| if a.fits { a.use_before.unwrap_or(DateTime::<Utc>::MAX_UTC).cmp(&b.use_before.unwrap_or(DateTime::<Utc>::MAX_UTC)) } else { std::cmp::Ordering::Equal })
         .then_with(|| b.weekly_left_percent.unwrap_or(0.0).total_cmp(&a.weekly_left_percent.unwrap_or(0.0)))
         .then_with(|| b.active.cmp(&a.active)));
-    finish(provider, expected_percent, hours, ranking, excluded)
+    let overlap = accounts.iter().find(|a| a.provider == provider && a.active).map(|a| a.overlap.clone()).unwrap_or_default();
+    with_overlap(finish(provider, expected_percent, hours, ranking, excluded), overlap)
+}
+
+/// Says the account in use here is also in use elsewhere, ahead of what to do about it.
+fn with_overlap(mut rec: Recommendation, overlap: Vec<String>) -> Recommendation {
+    if overlap.len() > 1 {
+        rec.summary = format!("The account in use is in use on {} machines at once ({}), so its limits drain faster and sessions may be signed out. {}",
+            overlap.len(), overlap.join(", "), rec.summary);
+    }
+    rec.overlap = overlap;
+    rec
 }
 
 /// `rec` without the accounts someone else leased (`(id, purpose)`, see `leases`): they move to
@@ -354,13 +373,13 @@ pub fn without_leased(rec: Recommendation, leased: &[(String, String)]) -> Recom
     if leased.is_empty() {
         return rec;
     }
-    let Recommendation { provider, expected_percent, hours, ranking, mut excluded, .. } = rec;
+    let Recommendation { provider, expected_percent, hours, ranking, mut excluded, overlap, .. } = rec;
     let (taken, ranking): (Vec<_>, Vec<_>) = ranking.into_iter().partition(|c| leased.iter().any(|(id, _)| *id == c.id));
     for c in taken {
         let purpose = leased.iter().find(|(id, _)| *id == c.id).map_or("", |(_, p)| p.as_str());
         excluded.push(Excluded { id: c.id, label: c.label, active: c.active, reason: format!("leased: {purpose}") });
     }
-    finish(provider, expected_percent, hours, ranking, excluded)
+    with_overlap(finish(provider, expected_percent, hours, ranking, excluded), overlap)
 }
 
 fn finish(provider: Provider, expected_percent: Option<f64>, hours: Option<f64>, ranking: Vec<Candidate>, excluded: Vec<Excluded>) -> Recommendation {
@@ -373,7 +392,7 @@ fn finish(provider: Provider, expected_percent: Option<f64>, hours: Option<f64>,
     Recommendation {
         provider, expected_percent, hours,
         recommended: best.map(|c| c.id.clone()), recommended_label: best.and_then(|c| c.label.clone()),
-        action, summary, ranking, excluded,
+        action, summary, ranking, excluded, overlap: vec![],
     }
 }
 
@@ -394,8 +413,25 @@ mod tests {
             id: id.into(), provider: Provider::Claude, email: Some(format!("{id}@example.invalid")), alias: None, plan: Some("max".into()), org: None,
             active, sources: vec![], windows: vec![window("session", 10.0, 3), window("weekly", weekly, weekly_resets_in_hours)],
             credits: None, resets: vec![], error: None, monitor_error: None, stale: false,
-            fetched_at: Some(at(NOW) - Duration::minutes(2)), monitor_connected: true, billing: Default::default(), remote: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None,
+            fetched_at: Some(at(NOW) - Duration::minutes(2)), monitor_connected: true, billing: Default::default(), remote: vec![], overlap: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None,
         }
+    }
+
+    #[test]
+    fn an_account_on_two_machines_is_flagged_and_a_free_one_recommended() {
+        let now = at(NOW);
+        let settings = Settings::default();
+        let mut current = account("current", true, 20.0, 100);
+        current.overlap = vec!["DESK-1".into(), "LAPTOP-2".into()];
+        let free = account("free", false, 30.0, 50);
+        let rec = recommend(&[current, free], &settings, Provider::Claude, None, None, now);
+        assert_eq!(rec.overlap, ["DESK-1", "LAPTOP-2"]);
+        assert!(rec.excluded[0].reason.starts_with("in use on 2 machines at once (DESK-1, LAPTOP-2)"), "{}", rec.excluded[0].reason);
+        assert_eq!((rec.action, rec.recommended.as_deref()), (Action::Switch, Some("free")));
+        assert!(rec.summary.starts_with("The account in use is in use on 2 machines at once"), "{}", rec.summary);
+        // Kept when leases are taken out.
+        let rec = without_leased(rec, &[("nobody".into(), "x".into())]);
+        assert_eq!(rec.overlap.len(), 2);
     }
 
     #[test]
