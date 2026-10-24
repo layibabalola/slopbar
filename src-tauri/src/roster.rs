@@ -57,6 +57,9 @@ const RUN_HEARTBEAT_MINUTES: i64 = 3;
 /// (`soon`), at least this often.
 const READ_LIVE_SECONDS: i64 = 15;
 const READ_SOON_SECONDS: i64 = 30;
+/// After a Retry sent to another machine, its roster is read at the live pace for this long, or
+/// until its run changes (see `Syncer::expect_news`).
+const EXPECT_MINUTES: i64 = 2;
 /// A run's steps beyond this many are not kept (they come from other machines).
 const MAX_STEPS: usize = 200;
 const PASSPHRASE_FILE: &str = "roster-passphrase.bin";
@@ -332,6 +335,13 @@ pub struct Syncer {
     /// This machine's run, newest revision (see `offer_run`), and the one last written.
     run: Option<Run>,
     written_run: Option<Run>,
+    /// `run` was taken back from this machine's own roster after a restart; any new run replaces
+    /// it, whatever its revision (revisions start again with the app).
+    adopted: bool,
+    /// Whether the first sync since the app started has run.
+    started: bool,
+    /// Machines sent a Retry: until when their news is expected, and their run's time then.
+    expecting: HashMap<String, (DateTime<Utc>, Option<DateTime<Utc>>)>,
     pub seen: Seen,
 }
 
@@ -345,9 +355,17 @@ impl Syncer {
     /// Takes this machine's run as it is now, unless a newer revision is already in hand (syncs
     /// started one after another can finish in any order).
     pub fn offer_run(&mut self, run: Run) {
-        if self.run.as_ref().is_none_or(|r| r.revision < run.revision) {
+        if self.adopted || self.run.as_ref().is_none_or(|r| r.revision < run.revision) {
             self.run = Some(run);
+            self.adopted = false;
         }
+    }
+
+    /// A Retry was sent to `machine_id`: its roster is read at the live pace until its run changes
+    /// or `EXPECT_MINUTES` pass, so the new run shows within seconds of its upload.
+    pub fn expect_news(&mut self, machine_id: &str, now: DateTime<Utc>) {
+        let at = self.seen.peers.iter().find(|p| p.machine_id == machine_id).and_then(|p| p.run.as_ref()).map(|r| r.at);
+        self.expecting.insert(machine_id.into(), (now + Duration::minutes(EXPECT_MINUTES), at));
     }
 
     /// One refresh's turn: writes this machine's roster when its accounts or its run changed (or a
@@ -355,9 +373,21 @@ impl Syncer {
     /// at once with `force`. With `soon`, Settings is watching, so rosters are read more often.
     #[allow(clippy::too_many_arguments)]
     pub fn sync(&mut self, store: &dyn RosterStore, passphrase: &Passphrase, me: (&str, &str), accounts: &[AccountUsage], now: DateTime<Utc>, force: bool, soon: bool) {
+        let Some(name) = file_name(me.0) else { return };
+        // After a restart, this machine's last failed run is taken back from its own roster before
+        // the first write would replace it, so the other computers keep its Retry for the hour.
+        let read_first = !self.started && self.run.is_none();
+        self.started = true;
+        if read_first {
+            let recent = |r: &Run| r.finished && r.error.is_some() && now - r.at.min(now) < Duration::minutes(SHOW_FINISHED_MINUTES);
+            if let Some(run) = self.read_all(store, passphrase, me.0, &name, now).filter(recent) {
+                self.written_run = Some(run.clone());
+                self.run = Some(run);
+                self.adopted = true;
+            }
+        }
         let mut mine = own(me.0, me.1, accounts, now);
         mine.run = self.run.clone();
-        let Some(name) = file_name(me.0) else { return };
         let accounts_due = force || self.written.as_ref().is_none_or(|(list, at)| *list != mine.accounts || now - *at >= Duration::hours(REWRITE_AFTER_HOURS));
         let run_due = mine.run != self.written_run
             || mine.run.as_ref().is_some_and(|r| !r.finished) && self.seen.written_at.is_none_or(|at| now - at >= Duration::minutes(RUN_HEARTBEAT_MINUTES));
@@ -376,7 +406,12 @@ impl Syncer {
                 wrote = accounts_due;
             }
         }
-        let every = if self.seen.peers.iter().any(Peer::running) {
+        // A machine sent a Retry stays live until its run changes or the wait runs out.
+        let peers = &self.seen.peers;
+        self.expecting.retain(|id, (until, at)| {
+            now < *until && peers.iter().find(|p| &p.machine_id == id).and_then(|p| p.run.as_ref()).map(|r| r.at) == *at
+        });
+        let every = if self.seen.peers.iter().any(Peer::running) || !self.expecting.is_empty() {
             Duration::seconds(READ_LIVE_SECONDS)
         } else if soon {
             Duration::seconds(READ_SOON_SECONDS)
@@ -384,21 +419,33 @@ impl Syncer {
             Duration::minutes(READ_EVERY_MINUTES)
         };
         let read_due = self.seen.read_at.is_none_or(|t| now - t >= every);
+        // Just read before the write: not again (what was written is what a read-back would find).
+        if read_first {
+            if wrote {
+                self.seen.own_accounts = self.written.as_ref().map(|(list, _)| list.len());
+            }
+            return;
+        }
         if !(force || wrote || read_due) {
             return;
         }
+        self.read_all(store, passphrase, me.0, &name, now);
+    }
+
+    /// Reads every roster; returns the run this machine's own roster carries.
+    fn read_all(&mut self, store: &dyn RosterStore, passphrase: &Passphrase, own_id: &str, own_name: &str, now: DateTime<Utc>) -> Option<Run> {
         self.seen.read_at = Some(now);
         match store.list() {
-            Err(_) => self.seen.read = Some(false),
+            Err(_) => { self.seen.read = Some(false); None }
             Ok(files) => {
                 self.seen.read = Some(true);
-                self.read(files, passphrase, me.0, &name, now);
+                self.read(files, passphrase, own_id, own_name, now)
             }
         }
     }
 
-    fn read(&mut self, files: Vec<(String, Vec<u8>, Option<DateTime<Utc>>)>, passphrase: &Passphrase, own_id: &str, own_name: &str, now: DateTime<Utc>) {
-        let (mut unreadable, mut unsupported, mut own_accounts) = (0, 0, None);
+    fn read(&mut self, files: Vec<(String, Vec<u8>, Option<DateTime<Utc>>)>, passphrase: &Passphrase, own_id: &str, own_name: &str, now: DateTime<Utc>) -> Option<Run> {
+        let (mut unreadable, mut unsupported, mut own_accounts, mut own_run) = (0, 0, None, None);
         let mut peers: HashMap<String, Peer> = HashMap::new();
         for (name, bytes, modified) in files {
             let roster = match open(&bytes, passphrase, &mut self.keys) {
@@ -410,6 +457,7 @@ impl Syncer {
             let written_at = if roster.written_at > now + Duration::minutes(5) { modified.unwrap_or(now).min(now) } else { roster.written_at };
             if roster.machine_id == own_id || name == own_name {
                 own_accounts = Some(roster.accounts.len());
+                own_run = roster.run;
                 continue;
             }
             if now - written_at > Duration::days(IGNORE_AFTER_DAYS) {
@@ -424,6 +472,7 @@ impl Syncer {
         let mut peers: Vec<Peer> = peers.into_values().collect();
         peers.sort_by(|a, b| b.written_at.cmp(&a.written_at).then_with(|| a.machine.cmp(&b.machine)));
         self.seen = Seen { own_accounts, peers, unreadable, unsupported, ..self.seen.clone() };
+        own_run
     }
 }
 
@@ -661,6 +710,81 @@ mod tests {
         // Shown for an hour after it finished, then no more.
         assert_eq!(peer_runs(&pilot.seen, now() + Duration::minutes(5)).len(), 1);
         assert!(peer_runs(&pilot.seen, now() + Duration::minutes(SHOW_FINISHED_MINUTES)).is_empty());
+    }
+
+    #[test]
+    fn after_a_retry_the_machine_is_read_at_the_live_pace_until_its_run_changes() {
+        let shared = TempDir::new();
+        let store = Folder(shared.0.clone());
+        let p = pass("synthetic roster passphrase");
+        let one = [account("claude", "cl-two")];
+        let at = |s: i64| now() + Duration::seconds(s);
+        let mut target = Syncer::default();
+        target.offer_run(run(4, true, "failed"));
+        target.sync(&store, &p, (MACHINE_A, "TARGET"), &one, at(0), false, false);
+        let mut pilot = Syncer::default();
+        pilot.sync(&store, &p, (MACHINE_B, "PILOT"), &one, at(60), false, false);
+        // Nothing going on: the next read waits, even with Settings watching.
+        pilot.sync(&store, &p, (MACHINE_B, "PILOT"), &one, at(60 + READ_LIVE_SECONDS), false, true);
+        assert_eq!(pilot.seen.read_at, Some(at(60)));
+        // Retry sent (the target has not uploaded its new run yet): read again within seconds.
+        pilot.expect_news(MACHINE_A, at(62));
+        pilot.sync(&store, &p, (MACHINE_B, "PILOT"), &one, at(60 + READ_LIVE_SECONDS), false, false);
+        assert_eq!(pilot.seen.read_at, Some(at(60 + READ_LIVE_SECONDS)), "live pace, Settings closed");
+        target.offer_run(Run { at: at(80), ..run(5, false, "running") });
+        target.sync(&store, &p, (MACHINE_A, "TARGET"), &one, at(80), false, false);
+        pilot.sync(&store, &p, (MACHINE_B, "PILOT"), &one, at(60 + 2 * READ_LIVE_SECONDS), false, false);
+        assert_eq!(pilot.seen.peers[0].run.as_ref().map(|r| (r.revision, r.finished)), Some((5, false)));
+        target.offer_run(Run { at: at(95), ..run(6, true, "failed") });
+        target.sync(&store, &p, (MACHINE_A, "TARGET"), &one, at(95), false, false);
+        pilot.sync(&store, &p, (MACHINE_B, "PILOT"), &one, at(60 + 3 * READ_LIVE_SECONDS), false, false);
+        // The news came: back to the slow pace.
+        pilot.sync(&store, &p, (MACHINE_B, "PILOT"), &one, at(60 + 4 * READ_LIVE_SECONDS), false, false);
+        assert_eq!(pilot.seen.read_at, Some(at(60 + 3 * READ_LIVE_SECONDS)));
+        // No news at all: the wait runs out.
+        let mut other = Syncer::default();
+        other.sync(&store, &p, (MACHINE_B, "PILOT"), &one, at(200), false, false);
+        other.expect_news(MACHINE_A, at(200));
+        other.sync(&store, &p, (MACHINE_B, "PILOT"), &one, at(200 + EXPECT_MINUTES * 60), false, false);
+        assert_eq!(other.seen.read_at, Some(at(200)));
+    }
+
+    #[test]
+    fn a_failed_run_outlives_a_restart_of_its_app_for_the_hour() {
+        let p = pass("synthetic roster passphrase");
+        let one = [account("claude", "cl-two")];
+        let after = |m: i64| now() + Duration::minutes(m);
+        let shared = TempDir::new();
+        let store = Folder(shared.0.clone());
+        let mut target = Syncer::default();
+        target.offer_run(run(4, true, "failed"));
+        target.sync(&store, &p, (MACHINE_A, "TARGET"), &one, after(0), false, false);
+        // Restarted: its first write keeps the run, so the pilot keeps its Retry.
+        let mut restarted = Syncer::default();
+        restarted.sync(&store, &p, (MACHINE_A, "TARGET"), &one, after(10), false, false);
+        assert_eq!(restarted.seen.own_accounts, Some(1));
+        let mut pilot = Syncer::default();
+        pilot.sync(&store, &p, (MACHINE_B, "PILOT"), &one, after(11), false, false);
+        let shown = peer_runs(&pilot.seen, after(11));
+        assert_eq!(shown.iter().map(|r| (r.run.revision, r.run.error.as_deref())).collect::<Vec<_>>(), [(4, Some("signin_stopped"))]);
+        // Its next run starts again at revision 1, and replaces it.
+        restarted.offer_run(run(1, false, "running"));
+        restarted.sync(&store, &p, (MACHINE_A, "TARGET"), &one, after(12), false, false);
+        pilot.sync(&store, &p, (MACHINE_B, "PILOT"), &one, after(12), true, false);
+        assert_eq!(pilot.seen.peers[0].run.as_ref().map(|r| r.revision), Some(1));
+        // A run older than the hour, or one that went well, is not taken back.
+        for (old, minutes) in [(run(4, true, "failed"), SHOW_FINISHED_MINUTES), (Run { error: None, ..run(4, true, "done") }, 10)] {
+            let shared = TempDir::new();
+            let store = Folder(shared.0.clone());
+            let mut target = Syncer::default();
+            target.offer_run(old);
+            target.sync(&store, &p, (MACHINE_A, "TARGET"), &one, after(0), false, false);
+            let mut restarted = Syncer::default();
+            restarted.sync(&store, &p, (MACHINE_A, "TARGET"), &one, after(minutes), false, false);
+            let mut pilot = Syncer::default();
+            pilot.sync(&store, &p, (MACHINE_B, "PILOT"), &one, after(minutes), false, false);
+            assert!(pilot.seen.peers[0].run.is_none(), "{minutes}");
+        }
     }
 
     #[test]
