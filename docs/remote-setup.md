@@ -123,5 +123,5 @@ for example `| Out-String`.
 | SSH could not run the command (Permission denied) | The public key is not in the right `authorized_keys` file, or that file's permissions are too open (administrators: the `icacls` line above). |
 | SSH could not run the command (Host key verification failed) | Connect once by hand with `ssh newpc` and accept the host key. |
 | SlopBar is not running on the other computer's desktop | Start it there from the Start menu. |
-| The other computer has no rclone remote named … | Run `rclone config` there and create a remote with the same name. |
+| The other computer has no working rclone remote named … (or readiness lists `rclone_remote_missing`) | Install rclone there (`winget install Rclone.Rclone`) and create a remote with the same name with `rclone config` at its screen: the cloud sign-in opens in its browser. |
 | The other computer answered without a SlopBar result | Update SlopBar there; pairing needs the same version on both. |

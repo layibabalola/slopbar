@@ -209,9 +209,10 @@ impl Remote for Ssh {
             }
         };
         let err = errors.join().unwrap_or_default();
-        // 255 is ssh's own failure (no connection, key refused, unknown host key).
+        // 255 is ssh's own failure (no connection, key refused, unknown host key); "**" lines are
+        // its banners (a key exchange warning), not the reason.
         if status.code() == Some(255) {
-            let first = String::from_utf8_lossy(&err).lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").chars().take(200).collect::<String>();
+            let first = String::from_utf8_lossy(&err).lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("**")).unwrap_or("").chars().take(200).collect::<String>();
             return Err(format!("ssh_failed: {first}"));
         }
         Ok(out)
@@ -261,9 +262,8 @@ pub fn pair(door: &dyn Door, remote: &dyn Remote, host: &str, saved: Option<Pass
     match &presence_remote {
         Some(name) => {
             let places = remote_call(remote, host, "list_sharing_locations", &json!({})).map_err(|e| format!("target: {e}"))?;
-            let here_too = places.pointer("/current/presence_remote").and_then(Value::as_str) == Some(name)
-                || places.pointer("/rclone/remotes").and_then(Value::as_array).is_some_and(|l| l.iter().any(|r| r.get("name").and_then(Value::as_str) == Some(name)));
-            if !here_too {
+            // rclone itself must list the remote there: the setting alone shares nothing.
+            if !lists_remote(&places, name) {
                 return Err(format!("target: remote_missing_here: {name}"));
             }
         }
@@ -328,16 +328,14 @@ pub fn receive(door: &dyn Door, input: &mut dyn Read, saved: Option<Passphrase>)
     let settings = door.call(&Request::GetSettings)?;
     let mut patch = serde_json::Map::new();
     match &offer.presence_remote {
-        Some(name) if settings.get("presence_remote").and_then(Value::as_str) != Some(name) => {
-            let places = door.call(&Request::ListSharingLocations)?;
-            let known = places.pointer("/rclone/remotes").and_then(Value::as_array)
-                .is_some_and(|list| list.iter().any(|r| r.get("name").and_then(Value::as_str) == Some(name)));
-            if !known {
+        Some(name) => {
+            if !lists_remote(&door.call(&Request::ListSharingLocations)?, name) {
                 return Err(format!("remote_missing_here: {name}"));
             }
-            patch.insert("presence_remote".into(), name.clone().into());
+            if settings.get("presence_remote").and_then(Value::as_str) != Some(name) {
+                patch.insert("presence_remote".into(), name.clone().into());
+            }
         }
-        Some(_) => {}
         None if settings.get("presence_remote").is_some_and(Value::is_string) || settings.get("presence_folder").is_some_and(Value::is_string) => {}
         None => return Err("no_sharing_location_here".into()),
     }
@@ -349,6 +347,11 @@ pub fn receive(door: &dyn Door, input: &mut dyn Read, saved: Option<Passphrase>)
     }
     let roster = door.call(&Request::SetRosterPassphrase { passphrase: Some(offer.key) })?;
     Ok(json!({ "paired": true, "replaced_key": replaced, "from": offer.from.chars().filter(|c| !c.is_control()).take(63).collect::<String>(), "roster": roster_summary(&roster) }))
+}
+
+/// Whether list_sharing_locations' result shows rclone installed with the remote `name`.
+fn lists_remote(places: &Value, name: &str) -> bool {
+    places.pointer("/rclone/remotes").and_then(Value::as_array).is_some_and(|l| l.iter().any(|r| r.get("name").and_then(Value::as_str) == Some(name)))
 }
 
 /// `value` with every occurrence of `secret` in its strings replaced.
@@ -664,6 +667,10 @@ mod tests {
         assert_eq!(err, "target: remote_missing_here: dropbox");
         assert!(bare.key_set().is_none() && bare.patches().is_empty());
         assert!(source.key_set().is_none() && source.patches().is_empty(), "checked before anything changed here");
+        // The setting names the remote but rclone there does not have it (or is not installed).
+        let mut unset = FakeApp::new(json!({ "presence_remote": "dropbox", "presence_folder": null }));
+        unset.remotes = vec![];
+        assert_eq!(pair(&source, &ssh(&unset, true), "virtualten", None, "A", false).unwrap_err(), "target: remote_missing_here: dropbox");
         // A folder-sharing source and a target with no location at all.
         let folder = FakeApp::new(json!({ "presence_remote": null, "presence_folder": "C:/Dropbox", "account_roster": true }));
         assert_eq!(pair(&folder, &ssh(&bare, true), "virtualten", None, "A", false).unwrap_err(), "no_sharing_location_here");
