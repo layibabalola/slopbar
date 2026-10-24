@@ -204,8 +204,14 @@ pub enum Request {
         sync: bool,
     },
     /// Whether sign-ins can run here (see `pairing::assess`): build, desktop session, browser,
-    /// roster and the accounts waiting.
-    GetReadiness,
+    /// roster and the accounts waiting. With `wait_seconds`, first waits (up to 45 s) for "Sign in
+    /// all accounts" to change from `since` (the `sign_in_revision` of an earlier answer).
+    GetReadiness {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_seconds: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
+    },
     /// `get_roster` with `sync`, for the MCP tool `sync_roster`.
     SyncRoster,
     /// Saves the roster passphrase on this machine (null deletes it), then syncs with it.

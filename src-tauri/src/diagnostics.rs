@@ -43,7 +43,7 @@ impl Code {
             Some("monitor_reconnect") => Self::Reconnect,
             Some("monitor_storage" | "cache_storage") => Self::Storage,
             Some("monitor_network") => Self::Network,
-            Some("monitor_wrong_account") => Self::WrongAccount,
+            Some("monitor_wrong_account" | "monitor_wrong_workspace") => Self::WrongAccount,
             Some("monitor_shared_login") => Self::SharedLogin,
             Some("monitor_login_failed") => Self::LoginFailed,
             Some("monitor_busy") => Self::Busy,

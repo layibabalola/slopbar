@@ -124,18 +124,30 @@ impl Session {
         Ok(Self { dir, opened: Default::default() })
     }
 
-    /// Names the profile after the email it signs in, before its browser first starts, so the
-    /// browser's profile button says whose sign-ins the window is for (Codex's page cannot be
-    /// prefilled). Best effort: a browser that ignores it still works.
-    pub fn label(&self, email: &str) {
+    /// Names the window after the email it signs in, before its browser first starts: the
+    /// profile is named after it (the profile button, where the browser honours that) and the
+    /// window's first tab is a page in `lang` saying whose sign-ins these are (see [`open`]), since
+    /// Codex's page cannot be prefilled and nothing else on it names the account. Best effort.
+    pub fn label(&self, email: &str, lang: &str) {
         let name: String = email.chars().filter(|c| !c.is_control()).take(64).collect();
+        if name.is_empty() {
+            return;
+        }
+        let _ = std::fs::write(self.dir.join(LABEL_PAGE), label_page(&name, lang));
         let state = self.dir.join("Local State");
-        if name.is_empty() || state.exists() {
+        if state.exists() {
             return;
         }
         let info = serde_json::json!({ "name": name, "is_using_default_name": false, "shortcut_name": name });
         let local = serde_json::json!({ "profile": { "info_cache": { "Default": info } } });
         let _ = std::fs::write(&state, local.to_string());
+    }
+
+    /// Whether a sign-in page was opened in this profile at or after `since` (see [`open`]).
+    pub fn page_opened_since(&self, since: std::time::SystemTime) -> bool {
+        // The time is written in the file: a file's own time on Windows is coarser than the clock.
+        let opened = std::fs::read_to_string(self.dir.join(OPENED)).ok().and_then(|s| s.trim().parse::<u128>().ok());
+        opened.is_some_and(|ms| ms >= millis(since))
     }
 
     /// A new profile in [`sessions_root`].
@@ -370,6 +382,29 @@ pub fn prefill_email(email: Option<&str>) -> Option<&str> {
         .then_some(email)
 }
 
+/// The page in a labelled profile (see [`Session::label`]) that names its account.
+const LABEL_PAGE: &str = "slopbar-account.html";
+/// Touched in a profile each time a sign-in page is opened in it, by whichever process opened it
+/// (Claude's opens through `BROWSER`, in a process of its own): see [`Session::page_opened_since`].
+const OPENED: &str = "slopbar-page-opened";
+
+fn millis(t: std::time::SystemTime) -> u128 {
+    t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis())
+}
+
+/// The label page: its title (what the tab shows) and heading name the account.
+fn label_page(account: &str, lang: &str) -> String {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+    let t = |key: &str| esc(&crate::i18n::t(lang, key, &[("account", account)]));
+    format!(
+        "<!doctype html><html lang=\"{lang}\"><head><meta charset=\"utf-8\"><title>{title}</title><style>\
+         :root{{color-scheme:light dark;font-family:'Segoe UI',system-ui,sans-serif}}\
+         body{{max-width:40em;margin:12vh auto;padding:0 24px;line-height:1.5}}h1{{font-size:1.6em;overflow-wrap:anywhere}}\
+         </style></head><body><h1>{heading}</h1><p>{body}</p><p>{codex}</p></body></html>",
+        lang = esc(lang), title = t("signinPageTitle"), heading = t("signinPageHeading"), body = t("signinPageBody"), codex = t("signinPageCodex"),
+    )
+}
+
 /// Only the providers' own sign-in pages are opened, over HTTPS.
 pub fn allowed_url(url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(url) else { return false };
@@ -403,8 +438,8 @@ pub fn find_browser() -> Option<(Kind, PathBuf)> {
     candidates.into_iter().find(|(_, p)| p.is_file())
 }
 
-/// The browser's arguments for one page. The URL goes last and is an https URL, so it can never
-/// be read as a switch.
+/// The browser's arguments for one page. The URL goes last and is an https URL (or the label
+/// page's file URL), so it can never be read as a switch.
 pub fn browser_args(kind: Kind, target: &Target, url: &str) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
     match target {
@@ -440,7 +475,7 @@ pub fn open(url: &str, target: &Target) -> Result<(), String> {
         }
     }
     let (kind, exe) = find_browser().ok_or("signin_browser_missing")?;
-    let spawn = |breakaway: bool| {
+    let spawn_page = |url: &str, breakaway: bool| {
         let mut c = std::process::Command::new(&exe);
         c.args(browser_args(kind, target, url))
             .stdin(std::process::Stdio::null())
@@ -458,7 +493,27 @@ pub fn open(url: &str, target: &Target) -> Result<(), String> {
         let _ = breakaway;
         c.spawn().map(|_| ())
     };
-    spawn(true).or_else(|_| spawn(false)).map_err(|_| "signin_browser_missing".into())
+    let spawn = |url: &str| spawn_page(url, true).or_else(|_| spawn_page(url, false)).map_err(|_| "signin_browser_missing".to_string());
+    if let Target::Profile(dir) = target {
+        // A labelled profile's browser starts on the page naming the account; the sign-in page
+        // then opens as the next tab, in front, once the browser is up to take it.
+        let label = dir.join(LABEL_PAGE);
+        if label.is_file() && !browser_open(dir) {
+            if let Ok(page) = reqwest::Url::from_file_path(&label) {
+                spawn(page.as_str())?;
+                let until = std::time::Instant::now() + Duration::from_secs(15);
+                while !browser_open(dir) && std::time::Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                std::thread::sleep(Duration::from_millis(750));
+            }
+        }
+    }
+    spawn(url)?;
+    if let Target::Profile(dir) = target {
+        let _ = std::fs::write(dir.join(OPENED), millis(std::time::SystemTime::now()).to_string());
+    }
+    Ok(())
 }
 
 /// The environment that makes a Claude sign-in open its page in `target`: `BROWSER` names this
@@ -655,10 +710,12 @@ mod tests {
         close_browser(&root.0);
         let session = Session::create_in(&root.0).unwrap();
         assert!(!session.browser_closed(), "a browser that never opened was not closed");
-        session.label("synthetic\n@example.invalid");
+        session.label("synthetic\n@example.invalid", "en");
         let state: serde_json::Value = serde_json::from_slice(&std::fs::read(session.dir().join("Local State")).unwrap()).unwrap();
         assert_eq!(state["profile"]["info_cache"]["Default"]["name"], "synthetic@example.invalid");
-        session.label("other@example.invalid");
+        let page = std::fs::read_to_string(session.dir().join(LABEL_PAGE)).unwrap();
+        assert!(page.contains("<title>synthetic@example.invalid"), "the tab names the account: {page}");
+        session.label("other@example.invalid", "en");
         let again: serde_json::Value = serde_json::from_slice(&std::fs::read(session.dir().join("Local State")).unwrap()).unwrap();
         assert_eq!(again, state, "never rewritten once there (the browser owns it)");
         // Seen open for one sign-in, then closed: closed for that one, not for the next.
@@ -666,6 +723,23 @@ mod tests {
         assert!(session.browser_closed());
         session.rearm();
         assert!(!session.browser_closed(), "the next sign-in opens the browser again");
+    }
+
+    #[test]
+    fn the_label_page_names_the_account_in_every_language_and_escapes_it() {
+        for lang in crate::i18n::languages() {
+            let page = label_page("a<b>&\"c\"@example.invalid", lang);
+            assert!(page.contains("a&lt;b&gt;&amp;&quot;c&quot;@example.invalid"), "{lang}: {page}");
+            assert!(!page.contains("<b>") && !page.contains("{account}"), "{lang}");
+            assert!(page.contains(&format!("lang=\"{lang}\"")));
+        }
+        let root = TempDir::new();
+        let session = Session::create_in(&root.0).unwrap();
+        let before = std::time::SystemTime::now();
+        assert!(!session.page_opened_since(before), "no page yet");
+        std::fs::write(session.dir().join(OPENED), millis(std::time::SystemTime::now()).to_string()).unwrap();
+        assert!(session.page_opened_since(before));
+        assert!(!session.page_opened_since(std::time::SystemTime::now() + Duration::from_secs(60)), "an earlier step's page is not this one's");
     }
 
     #[test]
@@ -788,6 +862,8 @@ mod tests {
         };
 
         let first = Session::create().expect("session");
+        // As Sign in all accounts does: the window starts on a tab naming the account.
+        first.label("visual.one@example.invalid", "en");
         let homes = [TempDir::new(), TempDir::new(), TempDir::new()];
         let claude_one = claude(&first, "visual.one@example.invalid", &homes[0].0);
         let pid = browser(first.dir());

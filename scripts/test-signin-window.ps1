@@ -7,7 +7,8 @@
   Codex sign-in pages for synthetic emails in fresh profiles (Claude's through slopbar.exe as its
   BROWSER, exactly as the app does). At each step this captures the browser window from the
   screen with BitBlt (SRCCOPY|CAPTUREBLT) into -Out, so a person can check that:
-    1-claude  a clean window offers no earlier account, with the email prefilled
+    1-claude  a clean window offers no earlier account, with the email prefilled (its first tab names
+              the account; the sign-in page is the tab in front)
     2-codex   Codex's page opens in the same browser and profile
     3-closed  ending the email's turn closes that browser and deletes its profile
     4-next    the next email gets a different fresh profile

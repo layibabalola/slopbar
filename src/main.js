@@ -248,6 +248,16 @@ $accounts.addEventListener("click", async (e) => {
     try {
       const args = { provider: monitor.dataset.provider, id: monitor.dataset.id };
       if (monitor.dataset.disconnect) {
+        // Reconnecting means a whole browser sign-in, so a stray click must not do this: the
+        // first click asks, a second within a few seconds disconnects. (A dialog would take the
+        // focus, and the flyout closes when it loses it.)
+        if (!monitor.dataset.armed) {
+          monitor.dataset.armed = "true";
+          monitor.textContent = t("monitorDisconnectSure");
+          monitor.classList.add("armed");
+          setTimeout(() => { delete monitor.dataset.armed; monitor.classList.remove("armed"); monitor.textContent = t("monitorDisconnect"); }, 4000);
+          return;
+        }
         const result = await invoke("disconnect_monitoring", args);
         render(result.snapshot); showToast(t(result.revoked ? "monitorDisconnected" : "monitorRevokeFailed"));
       } else { await invoke("connect_monitoring", args); showToast(t("monitorPending")); }
