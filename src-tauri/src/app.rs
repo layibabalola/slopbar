@@ -2383,8 +2383,18 @@ async fn readiness(app: &AppHandle) -> serde_json::Value {
     let roster = roster_status(app, false).await;
     let desktop = desktop::of_process();
     let browser = tauri::async_runtime::spawn_blocking(|| signin::find_browser().map(|(k, _)| pairing::browser_name(k))).await.ok().flatten();
-    let (ready, problems, next) = pairing::assess(true, desktop, browser.is_some(), &roster);
+    let (ready, mut problems, mut next) = pairing::assess(true, desktop, browser.is_some(), &roster);
     let state = app.state::<AppState>();
+    // A remote named in settings shares nothing unless rclone here has it.
+    let remote = state.settings.lock().unwrap().presence_remote.clone();
+    if let Some(name) = remote {
+        if !rclone_remotes().await.remotes.iter().any(|r| r.name == name) {
+            problems.push("rclone_remote_missing");
+            if ready {
+                next = format!("Sharing names the rclone remote {name}, but rclone here is missing or lacks it, so no roster is written or read: install rclone and create that remote (rclone config) at this computer's screen.");
+            }
+        }
+    }
     let snapshot = state.snapshot.lock().unwrap().clone();
     let signin_window = state.settings.lock().unwrap().signin_window;
     let mut summary = roster.clone();
