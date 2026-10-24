@@ -441,6 +441,22 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
             Some(Fix::OpenSettings { page: "accounts" })));
     }
 
+    // The CLI and the desktop app on this machine on different accounts (one check per app).
+    let mut drifted = vec![];
+    for a in inputs.accounts.iter().filter(|a| a.active && !a.desktop) {
+        let Some(d) = &a.seats else { continue };
+        if drifted.contains(&a.provider) {
+            continue;
+        }
+        drifted.push(a.provider);
+        let desktop = d.desktop.clone().unwrap_or_else(|| "an account SlopBar does not have".into());
+        checks.push(check(format!("desktop_drift:{}", a.provider.key()), Status::Warning,
+            format!("{} and the CLI use different accounts", d.app),
+            format!("CLI: {} · Desktop: {desktop}. Sign {} in with the CLI's account from its own account menu, or use another account with \"Use also switches the desktop app\" on to move both.",
+                d.cli.clone().unwrap_or_default(), d.app),
+            Some(Fix::OpenSettings { page: "accounts" })));
+    }
+
     checks.extend(roster_checks(&inputs.roster, place_set(sharing)));
 
     checks.extend(wsl_check(&inputs.wsl));
@@ -781,6 +797,18 @@ mod tests {
         assert_eq!(find(&r, "sharing").status, Status::Problem);
         case.sharing.rclone_installed = true;
         assert_eq!(find(&case.run(), "rclone").status, Status::Ok);
+    }
+
+    #[test]
+    fn desktop_app_on_another_account_is_a_warning() {
+        let mut case = Case::healthy();
+        assert!(case.run().checks.iter().all(|c| !c.id.starts_with("desktop_drift:")));
+        case.accounts[0].active = true;
+        case.accounts[0].seats = Some(crate::model::SeatDrift { app: "Claude Desktop".into(), cli: Some("a".into()), desktop: None });
+        let r = case.run();
+        let c = r.checks.iter().find(|c| c.id.starts_with("desktop_drift:")).unwrap();
+        assert_eq!(c.status, Status::Warning);
+        assert!(c.reason.starts_with("CLI: a · Desktop: an account SlopBar does not have"), "{}", c.reason);
     }
 
     #[test]

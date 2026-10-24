@@ -1249,7 +1249,7 @@ mod tests {
             remote: vec![crate::model::RemoteSeat { machine: canary.into(), where_: vec![canary.into()], seen_at: chrono::Utc::now(), live: true }],
             overlap: vec![canary.into(), canary.into()],
             used_outside: true,
-            runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None,
+            runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None, desktop: false, seats: None,
         };
         let snapshot = Snapshot {
             accounts: vec![a],

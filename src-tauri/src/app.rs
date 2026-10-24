@@ -1,4 +1,4 @@
-use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, desktop, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, pairing, panel, phone, pins, plan_alerts, presence, providers, reset_credits, roster, settings, signin, sources, subscriptions, unexpected, updates, usage_index, wind_down};
+use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, desktop, desktop_apps, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, pairing, panel, phone, pins, plan_alerts, presence, providers, reset_credits, roster, settings, signin, sources, subscriptions, unexpected, updates, usage_index, wind_down};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -428,11 +428,64 @@ async fn export_diagnostics(app: AppHandle) -> Result<String, String> {
 async fn agent_switch(app: &AppHandle, provider: Provider, id: String) -> Result<serde_json::Value, String> {
     switch_to(app, provider, id.clone(), false).await?;
     app.state::<AppState>().last_switch.lock().unwrap().insert(provider, Instant::now());
+    let desktop = switch_desktop(app, provider, &id).await;
     let snapshot = do_refresh(app).await;
     let active = snapshot.accounts.iter().find(|a| a.provider == provider && a.active).map(|a| a.id.clone());
     let mut result = serde_json::to_value(snapshot).map_err(|e| e.to_string())?;
     result["switched_to_requested"] = (active.as_deref() == Some(id.as_str())).into();
+    result["desktop"] = serde_json::to_value(desktop).map_err(|e| e.to_string())?;
     Ok(result)
+}
+
+/// Bumped by every guided desktop switch, so an older one stops watching.
+static DESKTOP_GUIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// After a manual switch to `id`: moves this machine's desktop app onto it too, when the user
+/// turned that on, by the only supported means (see `desktop_apps`). Claude Desktop is opened for
+/// the user to sign in with the named account and watched until it reports it; the Codex app
+/// already shares the switched sign-in and only needs a restart, which is left to the user.
+async fn switch_desktop(app: &AppHandle, provider: Provider, id: &str) -> desktop_apps::DesktopSwitch {
+    use desktop_apps::{DesktopSwitch, Signed};
+    let settings = app.state::<AppState>().settings.lock().unwrap().clone();
+    if !settings.switch_desktop {
+        return DesktopSwitch::Off;
+    }
+    // Whatever this switch does, an older guided one stops watching.
+    let generation = DESKTOP_GUIDE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let apps = tauri::async_runtime::spawn_blocking(desktop_apps::read).await.unwrap_or_default();
+    let lang = crate::i18n::resolve(&settings.language);
+    let name = account_label(app, provider, id).unwrap_or_else(|| crate::i18n::t(&lang, "unknownAccount", &[]));
+    match apps.get(provider) {
+        None => DesktopSwitch::NotInstalled,
+        Some(Signed::SharesCli) => {
+            let _ = crate::notify::notify(app.clone(), crate::i18n::t(&lang, "codexRestartTitle", &[("name", &name)]),
+                crate::i18n::t(&lang, "codexRestartBody", &[("name", &name)]), None, None);
+            DesktopSwitch::Shared
+        }
+        Some(Signed::ClaudeAccount(current)) => {
+            let Some(uuid) = id.split(':').next().filter(|u| !id.starts_with("token:") && !u.is_empty()).map(String::from) else {
+                return DesktopSwitch::NotInstalled;
+            };
+            if *current == uuid {
+                return DesktopSwitch::Already;
+            }
+            let _ = desktop_apps::open_claude();
+            let _ = crate::notify::notify(app.clone(), crate::i18n::t(&lang, "desktopGuideTitle", &[("name", &name)]),
+                crate::i18n::t(&lang, "desktopGuideBody", &[("name", &name)]), None, None);
+            let (watcher, done_name) = (app.clone(), name.clone());
+            tauri::async_runtime::spawn(async move {
+                let cancelled = move || DESKTOP_GUIDE.load(std::sync::atomic::Ordering::SeqCst) != generation;
+                let signed = tauri::async_runtime::spawn_blocking(move || desktop_apps::wait_for_claude(&uuid, &cancelled))
+                    .await.unwrap_or(false);
+                if signed {
+                    let lang = crate::i18n::resolve(&watcher.state::<AppState>().settings.lock().unwrap().language);
+                    let _ = crate::notify::notify(watcher.clone(), crate::i18n::t(&lang, "desktopGuideDone", &[("name", &done_name)]), String::new(), None, None);
+                    do_refresh(&watcher).await;
+                }
+            });
+            DesktopSwitch::Guided { expected: name }
+        }
+    }
 }
 
 /// One operation for an agent, through the door (see `door` and `mcp`). Each runs the same code as
@@ -775,7 +828,8 @@ async fn switch_to(app: &AppHandle, provider: Provider, id: String, auto: bool) 
 
 #[tauri::command]
 async fn switch_account(app: AppHandle, provider: Provider, id: String) -> Result<Snapshot, String> {
-    switch_to(&app, provider, id, false).await?;
+    switch_to(&app, provider, id.clone(), false).await?;
+    switch_desktop(&app, provider, &id).await;
     Ok(do_refresh(&app).await)
 }
 
@@ -2398,6 +2452,9 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
         }
     }
     phases.end(P::Balance);
+    // Beside the CLI: which account each desktop app here is signed in to.
+    let apps = tauri::async_runtime::spawn_blocking(crate::desktop_apps::read).await.unwrap_or_default();
+    crate::desktop_apps::apply(&mut list, &apps);
 
     // The widget redraws now: what sharing and forecasts add is carried over from the last
     // refresh until they are worked out below.

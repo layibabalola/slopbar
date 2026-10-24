@@ -59,6 +59,7 @@ pub use statusline::run as statusline;
 pub use diagnostics::write_build_info;
 mod door;
 mod desktop;
+mod desktop_apps;
 mod pairing;
 mod instance;
 mod mcp_update;
