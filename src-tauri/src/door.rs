@@ -166,6 +166,9 @@ pub enum Request {
         confirm: bool,
         #[serde(default = "yes")]
         monitoring: bool,
+        /// Stop a run still going first (Retry from another computer).
+        #[serde(default)]
+        retry: bool,
     },
     /// Remove every account whose plan has ended (see `bulk::lapsed`). Without `confirm` only
     /// says which accounts that would be.
