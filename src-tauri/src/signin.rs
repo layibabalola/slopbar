@@ -137,8 +137,8 @@ impl Session {
         Target::Profile(self.dir.clone())
     }
 
-    /// Whether the browser, having opened for any of the email's sign-ins, is gone: the user
-    /// closed it, so no sign-in can finish there.
+    /// Whether the browser, having opened for the sign-in running now, is gone: the user closed
+    /// it, so that sign-in cannot finish there.
     pub fn browser_closed(&self) -> bool {
         use std::sync::atomic::Ordering;
         if browser_open(&self.dir) {
@@ -146,6 +146,12 @@ impl Session {
             return false;
         }
         self.opened.load(Ordering::Relaxed)
+    }
+
+    /// A new sign-in of the email's starts: a browser closed after the last one finished (the
+    /// user closing a "you're signed in" page) is no reason to stop; this one opens it again.
+    pub fn rearm(&self) {
+        self.opened.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -631,6 +637,11 @@ mod tests {
         close_browser(&root.0);
         let session = Session::create_in(&root.0).unwrap();
         assert!(!session.browser_closed(), "a browser that never opened was not closed");
+        // Seen open for one sign-in, then closed: closed for that one, not for the next.
+        session.opened.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(session.browser_closed());
+        session.rearm();
+        assert!(!session.browser_closed(), "the next sign-in opens the browser again");
     }
 
     #[test]

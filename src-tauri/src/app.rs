@@ -1015,6 +1015,10 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Re
                         }
                     }
                 };
+                // Closing the browser after the email's previous sign-in finished stops nothing.
+                if let Some(s) = session.as_deref() {
+                    s.rearm();
+                }
                 let mut run = Box::pin(run);
                 let outcome = tokio::select! {
                     outcome = &mut run => outcome,
