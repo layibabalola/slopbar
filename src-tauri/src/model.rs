@@ -47,6 +47,12 @@ pub struct AccountUsage {
     /// there. `active` and `sources` stay about this machine only.
     #[serde(default)]
     pub remote: Vec<RemoteSeat>,
+    /// Every machine the account is in use on right now (this one first, then live other
+    /// machines by name), when that is more than one; empty otherwise (see `presence::overlap`).
+    /// Two machines on one account drain its limits twice as fast, and the provider may sign
+    /// one of them out.
+    #[serde(default)]
+    pub overlap: Vec<String>,
     /// Usage kept rising while the account was signed in nowhere SlopBar can see: another
     /// machine, the web or the desktop app.
     #[serde(default)]

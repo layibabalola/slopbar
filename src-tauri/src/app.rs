@@ -195,7 +195,7 @@ pub(crate) async fn health_report(app: &AppHandle) -> health::Report {
         },
         journal: state.diagnostics.health(),
         notifications: health::Notifications { registered: seen.notifications_registered, app_enabled, system_enabled,
-            any_wanted: n.usage || n.resets || n.switches || n.renewals || n.unexpected_use },
+            any_wanted: n.usage || n.resets || n.switches || n.renewals || n.unexpected_use || n.multi_machine },
         auto_connect: settings.auto_connect_monitoring,
         vault_plaintext: accounts::plaintext_slots(),
         processes: tauri::async_runtime::spawn_blocking(crate::instance::processes).await.ok().flatten(),
@@ -2405,7 +2405,7 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
         let early = Snapshot { accounts: early, updated_at: Some(chrono::Utc::now()) };
         *state.snapshot.lock().unwrap() = early.clone();
         let _ = app.emit("usage-updated", &early);
-        crate::alerts::on_snapshot(&app);
+        crate::alerts::on_early_snapshot(&app);
     }
     phases.end(P::Publish);
     if providers::save_cache(&cache).is_err() {
@@ -2430,6 +2430,7 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
         shared = Some(health::SharingResult { at: now, wrote, read });
         covered = wrote || peers.iter().any(|p| p.live);
         presence::attach(&mut list, &peers, now);
+        presence::overlap(&mut list, presence::identity().map_or("", |(_, name)| name.as_str()));
     }
     // Two refresh intervals without a rise (readings are at least a minute apart), plus slack.
     let hold = chrono::Duration::seconds(2 * interval.max(60) as i64 + 30);
@@ -2505,6 +2506,8 @@ fn carry_over(list: &mut [crate::model::AccountUsage], previous: &[crate::model:
             a.unexpected = p.unexpected.clone();
         }
     }
+    // A switch may have changed which account is in use here since the last refresh.
+    presence::overlap(list, presence::identity().map_or("", |(_, name)| name.as_str()));
 }
 
 /// Records which account each CLI has signed in, seeding the log once from the diagnostics

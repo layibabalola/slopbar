@@ -169,6 +169,11 @@ body.panel #accounts { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollba
   font-size: 11px; padding: 0 6px; border-radius: 4px;
   background: var(--control); border: 1px solid var(--control-stroke); color: var(--text-2);
 }
+/* An account in use on several machines at once: amber (SystemFillColorCaution), like other cautions. */
+.overlap { display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; color: var(--warn); margin: 1px 0 2px; min-width: 0; }
+.overlap > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.overlap-icon { font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets"; font-size: 12px; font-weight: 400; flex: none; }
+.acct.line .overlap-badge { flex: none; display: inline-flex; align-items: center; gap: 2px; color: var(--warn); font-size: 11px; font-weight: 700; padding: 0 2px; }
 .acc-meta { font-size: 11px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 1px 0 2px; }
 .win { margin-top: 8px; }
 .acct .win:first-of-type { margin-top: 6px; }

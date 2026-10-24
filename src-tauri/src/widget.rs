@@ -25,6 +25,8 @@ pub const FONT_SIZE: f32 = 12.0;
 pub const UNKNOWN_FONT_SIZE: f32 = 11.0;
 /// The health warning dot, in the box's top-right corner.
 pub const DOT_SIZE: f32 = 6.0;
+/// The overlap badge's diameter; drawn with a knock-out edge so it reads over the ring.
+pub const BADGE_SIZE: f32 = 8.0;
 pub const CORNER: f32 = 4.0;
 
 /// An RGBA color, components 0..=1 (straight alpha).
@@ -75,6 +77,8 @@ pub struct Palette {
     pub hover_border: Color,
     pub hover_border_bottom: Color,
     pub press: Color,
+    /// Around small badges drawn over a ring: the taskbar's own tone.
+    pub badge_edge: Color,
 }
 
 pub fn palette(theme: Theme) -> Palette {
@@ -91,6 +95,7 @@ pub fn palette(theme: Theme) -> Palette {
             hover_border: rgba(0xffffff, 0.0605),
             hover_border_bottom: rgba(0xffffff, 0.0605),
             press: rgba(0xffffff, 0.0419),
+            badge_edge: rgb(0x1c1c1c),
         },
         Theme::Light => Palette {
             text: rgba(0x000000, 0.896),
@@ -104,6 +109,7 @@ pub fn palette(theme: Theme) -> Palette {
             hover_border: rgba(0x000000, 0.02),
             hover_border_bottom: rgba(0x000000, 0.06),
             press: rgba(0xffffff, 0.3),
+            badge_edge: rgb(0xeeeeee),
         },
     }
 }
@@ -152,6 +158,9 @@ pub struct View {
     /// What each item's tooltip says below its headline (`account_detail`), one per item; empty
     /// for text items.
     pub details: Vec<String>,
+    /// Per item, whether its account is in use on several machines at once (`overlap`): an amber
+    /// badge on the ring. Missing entries are false.
+    pub overlap: Vec<bool>,
 }
 
 /// Strings the view needs, already translated (see `crate::i18n`).
@@ -221,6 +230,11 @@ pub fn account_detail(texts: &dyn Texts, a: &AccountUsage, now: chrono::DateTime
         [Some(provider.to_string()), a.plan.clone(), a.org.clone()].into_iter().flatten().collect::<Vec<_>>().join(" · "),
         in_use,
     ];
+    if a.overlap.len() > 1 {
+        let n = a.overlap.len().to_string();
+        who.push(texts.t("overlapOn", &[("n", &n), ("list", &a.overlap.join(", "))]));
+        who.push(texts.t("overlapWhy", &[("n", &n)]));
+    }
     who.extend(a.remote.iter().filter(|r| !r.live).map(|r| texts.t("seenOn", &[("machine", &machine(r)), ("t", &ago(r.seen_at))])));
     if a.used_outside { who.push(texts.t("usedOutside", &[])); }
     if let Some(purpose) = &a.leased { who.push(texts.t("leased", &[("purpose", purpose)])); }
@@ -288,6 +302,7 @@ pub fn health_tip(texts: &dyn Texts, problems: usize) -> String {
 /// while a notice (`toast`) is up.
 pub fn view(snap: &Snapshot, toast: Option<&str>, health_problems: usize, texts: &dyn Texts) -> View {
     let mut details = vec![];
+    let mut overlap = vec![];
     let items = if snap.updated_at.is_none() {
         vec![Item::Text { text: texts.t("loading", &[]), dim: true }]
     } else if snap.accounts.is_empty() {
@@ -306,12 +321,14 @@ pub fn view(snap: &Snapshot, toast: Option<&str>, health_problems: usize, texts:
             .map(|a| {
                 let percent = if a.stale || a.error.is_some() { None } else { peak(a) };
                 details.push(account_detail(texts, a, chrono::Utc::now()));
+                overlap.push(a.overlap.len() > 1);
                 Item::Chip { provider: a.provider, percent, tip: chip_tip(texts, a.provider, percent) }
             })
             .collect()
     };
     details.resize(items.len(), String::new());
-    View { items, health_problems, label: texts.t("title", &[]), details }
+    overlap.resize(items.len(), false);
+    View { items, health_problems, label: texts.t("title", &[]), details, overlap }
 }
 
 /// A box in DIPs.
@@ -407,6 +424,13 @@ pub fn layout_within(view: &View, height: f32, room: f32, measure: &dyn Fn(&str)
         h: DOT_SIZE,
     });
     Layout { width, frame, items: boxes, dot, cut }
+}
+
+/// The amber badge on a ring whose account is in use on several machines at once: a dot at the
+/// ring box's lower right, clear of the health dot (the widget's upper right). Center and radius.
+pub fn overlap_badge(ring: &Box2) -> ((f32, f32), f32) {
+    let r = BADGE_SIZE / 2.0;
+    ((ring.x + ring.w - r, ring.y + ring.h - r), r)
 }
 
 /// DIPs to physical pixels for a monitor at `dpi` (96 = 100%). Window sizes round up so nothing
@@ -740,6 +764,21 @@ mod tests {
         assert_eq!(palette(Theme::Light).bad, rgb(0xc42b1c));
         assert_eq!(palette(Theme::Dark).text, rgb(0xffffff));
         assert!((palette(Theme::Light).text.a - 0.896).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_account_on_several_machines_gets_a_badge_and_says_why() {
+        let mut codex = account(Provider::Codex, "c1", true, &[10.0]);
+        codex.overlap = vec!["DESK-1".into(), "LAPTOP-2".into()];
+        let v = view(&snap(vec![account(Provider::Claude, "a1", true, &[5.0]), codex]), None, 0, &En);
+        assert_eq!(v.overlap, [false, true]);
+        assert!(!v.details[0].contains("machines"));
+        assert!(v.details[1].contains("In use on 2 machines at once: DESK-1, LAPTOP-2"), "{}", v.details[1]);
+        assert!(v.details[1].contains("Limits drain about 2× as fast"), "{}", v.details[1]);
+        // Lower right of the ring, clear of the health dot at the widget's upper right.
+        let l = layout(&v, 48.0, &measure);
+        let ((x, y), r) = overlap_badge(&l.items[1]);
+        assert!(x > l.items[1].x + l.items[1].w / 2.0 && y > l.items[1].y + l.items[1].h / 2.0 && r > 0.0);
     }
 
     #[test]

@@ -247,6 +247,12 @@ impl Renderer {
                     rt.SetTransform(&Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: center.0 - size / 2.0, M32: center.1 - size / 2.0 });
                     rt.FillGeometry(geom, &brush(p.text, o)?, None);
                     rt.SetTransform(&Matrix3x2::identity());
+                    if view.overlap.get(i).copied().unwrap_or(false) {
+                        // Amber with an edge in the taskbar's own tone, so it stands off the ring.
+                        let ((x, y), r) = widget::overlap_badge(b);
+                        rt.FillEllipse(&D2D1_ELLIPSE { point: pt(x, y), radiusX: r + 1.0, radiusY: r + 1.0 }, &brush(p.badge_edge, 1.0)?);
+                        rt.FillEllipse(&D2D1_ELLIPSE { point: pt(x, y), radiusX: r, radiusY: r }, &brush(p.warn, 1.0)?);
+                    }
                 }
                 Item::Text { text, dim } => {
                     let layout = self.text_layout(text, &self.text)?;
@@ -424,7 +430,7 @@ mod tests {
             .into_iter()
             .map(|(provider, percent)| Item::Chip { provider, percent, tip: widget::chip_tip(&En, provider, percent) })
             .collect();
-        View { items, health_problems: problems, label: "SlopBar".into(), details: vec![] }
+        View { items, health_problems: problems, label: "SlopBar".into(), details: vec![], overlap: vec![] }
     }
 
     const LOOK: Look = Look { theme: Theme::Dark, hot: false, pressed: false };
@@ -546,7 +552,7 @@ mod tests {
         let long = r.measure("Loading, loading, loading");
         assert!(short > 20.0 && short < 80.0, "{short}");
         assert!(long > short * 2.5);
-        let view = View { items: vec![Item::Text { text: "Loading".into(), dim: true }], health_problems: 0, label: String::new(), details: vec![] };
+        let view = View { items: vec![Item::Text { text: "Loading".into(), dim: true }], health_problems: 0, label: String::new(), details: vec![], overlap: vec![] };
         let (s, l) = r.draw(&view, LOOK, 96, 48).unwrap();
         assert_eq!(l.width, 1.0 + 8.0 + short.ceil() + 8.0 + 1.0);
         assert!(s.pixels().chunks_exact(4).any(|q| q[3] > 100));
@@ -556,7 +562,7 @@ mod tests {
     fn a_notice_too_long_for_the_room_is_cut_to_it() {
         let r = Renderer::new().unwrap();
         let text = "Monitoring sign-in did not complete. Try connecting again.";
-        let view = View { items: vec![Item::Text { text: text.into(), dim: false }], health_problems: 0, label: String::new(), details: vec![] };
+        let view = View { items: vec![Item::Text { text: text.into(), dim: false }], health_problems: 0, label: String::new(), details: vec![], overlap: vec![] };
         for dpi in [96, 144] {
             let (full, _) = r.draw(&view, LOOK, dpi, 48).unwrap();
             let (s, l) = r.draw_within(&view, LOOK, dpi, 48, Some(150)).unwrap();

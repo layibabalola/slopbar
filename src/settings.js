@@ -2,7 +2,7 @@ import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { sparkline } from "./sparkline.js";
 import { money, pct, amount, renewalText, adviceText, creditsLine, extraUsageLine } from "./accounttext.js";
-import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetText, errorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText } from "./i18n.js";
+import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetText, errorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText, overlapText } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -99,6 +99,7 @@ function accountRow(p, a) {
         <small>
           ${a.active ? `<em class="chip live" title="${esc(places.inUse)}">${t("inUse")}</em>`
             : places.elsewhere ? `<em class="chip elsewhere" title="${esc(places.inUse)}">${esc(places.inUse)}</em>` : ""}
+          ${overlapChip(a)}
           ${a.used_outside ? `<em class="chip outside" title="${esc(t("usedOutsideHint"))}">${t("usedOutside")}</em>` : ""}
           ${a.unexpected ? `<em class="chip unexpected" title="${esc(t("unexpectedHint", { t: duration(Math.max(1, Math.round((Date.now() - new Date(a.unexpected.last_seen)) / 60000))) }))}">${esc(t(a.unexpected.seen_week === 1 ? "unexpectedSeenOnce" : "unexpectedSeen", { n: a.unexpected.seen_week }))}</em>` : ""}
           ${a.plan ? `<em class="chip">${esc(a.plan)}</em>` : ""}
@@ -133,6 +134,12 @@ function accountRow(p, a) {
 }
 
 /** Sign-in health: the provider rejected the monitoring sign-in, or the CLI's own saved login. */
+/** Amber when the account is in use on several machines at once; the tooltip names them and says why it matters. */
+function overlapChip(a) {
+  const o = overlapText(a);
+  return o.chip ? `<em class="chip overlap" title="${esc(o.lines.join("\n"))}"><span class="overlap-icon" aria-hidden="true">\uE772</span> ${esc(o.chip)}</em>` : "";
+}
+
 function signInChips(p, a) {
   const monitoring = a.monitor_connected && ["monitor_reconnect", "monitor_wrong_account", "monitor_uncertain"].includes(a.monitor_error ?? a.error);
   const cli = p === "claude" ? "claude /login" : "codex login";
@@ -332,7 +339,7 @@ listen("account-added", () => { $("add-hint").hidden = true; });
 // The verdicts come from the backend (subscriptions.rs); this page only words them.
 
 let report = null;
-const NOTIFY_KINDS = ["usage", "resets", "switches", "renewals", "extra_usage", "burn", "reset_credits", "unexpected_use", "digest"];
+const NOTIFY_KINDS = ["usage", "resets", "switches", "renewals", "extra_usage", "burn", "reset_credits", "unexpected_use", "multi_machine", "digest"];
 const VERDICT_TONE = { exhausted_weekly: "bad", unused: "warn", underused: "warn", healthy: "ok", insufficient_data: "" };
 
 function verdictLines(e) {
