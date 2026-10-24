@@ -39,9 +39,10 @@ them with `~/.claude/ops/remote-slopbar/README.md`.
 - Feature work goes on a branch cut from `origin/claude/subscription-value`, merged back with a normal
   merge, and pushed.
 - Then merge into `ultra` in `C:\code\slopbar-worktrees\ultra`. On conflict, keep ultra's
-  `tauri.conf.json` `plugins.updater` block and re-brand visible strings. Then run
-  `cargo build --locked --release --features tauri/custom-protocol` in `src-tauri` and
-  `scripts\install-local-build.ps1`.
+  `tauri.conf.json` `plugins.updater` block and re-brand visible strings. Push `ultra`, then publish
+  a release with `scripts/publish-ultra-release.ps1` (`docs/ULTRA-RELEASES.md`, "Publishing a
+  release"): all machines update themselves from it. Don't run `scripts\install-local-build.ps1` on
+  a machine that takes releases, because its `0.1.0` outranks every `0.1.0-ultra.<n>`.
 - Verify on screen before calling anything done: `scripts\test-flyout-click.ps1` must PASS, and you
   look at the PNG. Unit tests alone are not verification.
 - Each feature goes upstream as a PR to thelioo/slopbar, cut as a pinned `pr/<name>` branch and
@@ -53,6 +54,6 @@ them with `~/.claude/ops/remote-slopbar/README.md`.
 ## Known open items (re-derive; don't trust this list)
 
 - Work after the top upstream PR with no PR yet (the derive command above counts it).
-- No Ultra release has been published yet: the GitHub secrets in `docs/ULTRA-RELEASES.md` are an
-  owner-only step. Until then, other machines are updated over SSH.
+- Release channel and each machine's build: `gh release list -R layibabalola/slopbar-ultra`, and
+  `get_app_info` (`version`) on each machine through the door.
 - Leftover worktrees from finished sessions.

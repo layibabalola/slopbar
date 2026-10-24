@@ -9,7 +9,7 @@ itself from them only. This is fork-only: it lives on the `ultra` branch and nev
 | Build | How it is made | Updates |
 | --- | --- | --- |
 | Local build (`scripts/install-local-build.ps1`) | `cargo build --release --features tauri/custom-protocol` | Manual only ("Manual updates only in this build") |
-| Ultra release | `.github/workflows/ultra-release.yml` on a tag `ultra-v*` | Automatic, from this fork only |
+| Ultra release | `scripts/publish-ultra-release.ps1` on the owner's PC (or the workflow on a tag `ultra-v*`, once its secrets are set) | Automatic, from this fork only |
 | Upstream SlopBar | upstream's `release.yml` with `upstream-updates` | From `thelioo/slopbar` |
 
 - **Feature `ultra-updates`** (`src-tauri/Cargo.toml`) turns on automatic updates for Ultra
@@ -39,11 +39,45 @@ release adds a build suffix: version `0.1.0-ultra.<n>`, tag `ultra-v0.1.0-ultra.
 `SlopBar Ultra 0.1.0-ultra.<n>`. `<n>` must go up with every release. The workflow refuses a tag
 whose package part doesn't match `tauri.conf.json`, and a tagged commit that isn't on `ultra`.
 
-## Owner steps
+## Publishing a release (one command)
 
-### 1. Add the two GitHub secrets (once)
+Releases are published from the owner's PC, where the fork key lives. No GitHub secret is needed.
+In a clean checkout whose `HEAD` is the pushed `origin/ultra` (a detached worktree such as
+`C:\code\slopbar-worktrees\ultra-release` keeps the working `ultra` checkout free):
 
-The keypair was generated on 2026-10-22 and lives outside the repository, readable only by your
+```powershell
+git -C C:\code\slopbar-worktrees\ultra-release fetch -q origin
+git -C C:\code\slopbar-worktrees\ultra-release checkout -q --detach origin/ultra
+pwsh C:\code\slopbar-worktrees\ultra-release\scripts\publish-ultra-release.ps1
+```
+
+The script picks the next build number. It then:
+
+1. Builds with `ultra-updates`, with no signing variables in its environment, and checks that the
+   executable reports this commit.
+2. Signs the installer with `tauri signer sign --private-key-path`. Only the signer's process
+   gets the password, through its environment. Neither value is printed or passed as an argument.
+3. Checks that the signature's key id is the one in `tauri.conf.json`, publishes `ultra-v<version>`
+   with exactly the installer, its `.sig` and `latest.json`, and compares them with what it
+   downloads back.
+4. Refuses a version that is not newer than the channel's. It then moves `ultra-latest` and reads
+   it back.
+
+Installed copies pick the release up at their next check: about 20 seconds after SlopBar starts,
+then every 6 hours. A restart through the door (`restart_app`) makes the check happen now.
+
+**After moving machines to releases, don't run `scripts/install-local-build.ps1` on them.** A
+local build reports version `0.1.0`, which SemVer ranks above every `0.1.0-ultra.<n>`, and it
+can't update itself. So that machine stops taking releases until a release build is installed over
+it again.
+
+`.github/workflows/ultra-release.yml` does the same job in GitHub Actions once the owner adds the
+two secrets (below). Until then its tag runs end at the `gate` job, so the tags this script pushes
+don't start a second publisher.
+
+### Optional: add the GitHub secrets
+
+Do this only if releases should come from Actions instead. The keypair was generated on 2026-10-22 and lives outside the repository, readable only by your
 Windows user:
 
 - `%USERPROFILE%\.slopbar-ultra\updater.key`: private key (encrypted with the password)
@@ -66,32 +100,7 @@ The names are `ULTRA_`-prefixed on purpose. Upstream's `release.yml` is also on 
 reads `TAURI_SIGNING_PRIVATE_KEY`. With that name unset, it can never sign a release with the
 fork's key, so it can't produce anything an Ultra install would accept.
 
-### 2. Cut the first release
-
-Make sure Actions are enabled on the fork (Settings → Actions). Then, with `ultra` merged and
-pushed:
-
-```powershell
-git fetch origin
-git tag ultra-v0.1.0-ultra.1 origin/ultra
-git push origin ultra-v0.1.0-ultra.1
-gh run watch -R layibabalola/slopbar-ultra
-```
-
-When the run is green:
-
-- Release `ultra-v0.1.0-ultra.1` has `SlopBar_0.1.0-ultra.1_x64-setup.exe`, its `.sig`, and
-  `latest.json`.
-- Release `ultra-latest` (a pre-release, created on the first run) holds the same
-  `latest.json`.
-
-Check the channel:
-`gh release download ultra-latest -R layibabalola/slopbar-ultra -p latest.json -O -`
-
-For later releases, tag the new `ultra` tip with the next number (`ultra-v0.1.0-ultra.2`, …).
-Never move or reuse a tag.
-
-### 3. Install on another machine
+## Installing on another machine
 
 1. Download `SlopBar_<version>_x64-setup.exe` from the newest `ultra-v…` release:
    `gh release download ultra-v0.1.0-ultra.1 -R layibabalola/slopbar-ultra -p "*-setup.exe"`,
@@ -108,7 +117,7 @@ release over it makes updates possible. The saved settings keep "Update automati
 though, so turn it on under Settings → Updates. Running the local install script again later puts
 back a manual build.
 
-### 4. Optional: Authenticode signing (paid, not purchased)
+## Optional: Authenticode signing (paid, not purchased)
 
 The updater signature above proves that an update came from this fork. It doesn't sign the `.exe`
 for Windows, so SmartScreen warns on first download until the file gains reputation. To remove the
@@ -129,10 +138,17 @@ updater key stays as it is.
 
 ```powershell
 cargo test --locked --no-default-features --lib --manifest-path src-tauri/Cargo.toml ultra_release
-$env:TAURI_SIGNING_PRIVATE_KEY = "$env:USERPROFILE\.slopbar-ultra\updater.key"
-$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = Get-Content -Raw "$env:USERPROFILE\.slopbar-ultra\updater.key.password"
-pnpm tauri build --features ultra-updates --config '{"version":"0.1.0-ultra.0"}'
 ```
 
-This produces a signed `src-tauri/target/release/bundle/nsis/SlopBar_0.1.0-ultra.0_x64-setup.exe`
-and `.sig`. Don't publish local builds. Releases come only from the workflow.
+Don't set the signing variables in a shell by hand: they pass to every process it starts. To sign,
+use `scripts/publish-ultra-release.ps1`, which gives the password to the signer's process alone.
+
+## Rolling back a bad release
+
+Installed copies move only forward, so a bad release is replaced by a newer one, never by
+rewinding the channel:
+
+1. Turn off "Update automatically" on machines that haven't taken it yet (door `update_settings`).
+2. On a machine that took it, put the previous executables back from
+   `%LOCALAPPDATA%\SlopBar-Rollback\<time>` (the remote swap keeps one) and restart through the door.
+3. Revert the fix on `ultra`, push, and publish again. The script gives it the next build number.

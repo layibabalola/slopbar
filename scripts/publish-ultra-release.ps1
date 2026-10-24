@@ -76,6 +76,14 @@ if ($LASTEXITCODE -eq 0) {
 Write-Output "Publishing $version from $head (channel now: $($current ?? 'none'))."
 
 # 2. Build, with no signing key anywhere in this process.
+# `tauri build` rewrites Cargo.toml with LF line ends. A CRLF checkout (core.autocrlf) changes size,
+# so git, and the build's dirty check, would call the clean tree modified. Write it as LF first and
+# restage it (the same blob) so git knows that size.
+$manifestPath = Join-Path $root 'src-tauri/Cargo.toml'
+$text = [IO.File]::ReadAllText($manifestPath)
+if ($text.Contains("`r`n")) { [IO.File]::WriteAllText($manifestPath, $text.Replace("`r`n", "`n")) }
+Invoke-Checked 'git add Cargo.toml' { git -C $root add src-tauri/Cargo.toml }
+if (git -C $root status --porcelain) { throw 'Cargo.toml differs from HEAD beyond line ends.' }
 Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY, Env:TAURI_SIGNING_PRIVATE_KEY_PATH, Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) { $env:Path = "$env:ProgramFiles\nodejs;$env:Path" }
 $override = Join-Path $stage 'build.conf.json'
