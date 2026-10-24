@@ -452,7 +452,7 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         let desktop = d.desktop.clone().unwrap_or_else(|| "an account SlopBar does not have".into());
         checks.push(check(format!("desktop_drift:{}", a.provider.key()), Status::Warning,
             format!("{} and the CLI use different accounts", d.app),
-            format!("CLI: {} · Desktop: {desktop}. Use on the CLI's account with \"Use also switches the desktop app\" on guides {} onto it; or sign it in with that account from its own account menu.",
+            format!("CLI: {} · Desktop: {desktop}. Sign {} in with the CLI's account from its own account menu, or use another account with \"Use also switches the desktop app\" on to move both.",
                 d.cli.clone().unwrap_or_default(), d.app),
             Some(Fix::OpenSettings { page: "accounts" })));
     }

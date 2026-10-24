@@ -450,6 +450,8 @@ async fn switch_desktop(app: &AppHandle, provider: Provider, id: &str) -> deskto
     if !settings.switch_desktop {
         return DesktopSwitch::Off;
     }
+    // Whatever this switch does, an older guided one stops watching.
+    let generation = DESKTOP_GUIDE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let apps = tauri::async_runtime::spawn_blocking(desktop_apps::read).await.unwrap_or_default();
     let lang = crate::i18n::resolve(&settings.language);
     let name = account_label(app, provider, id).unwrap_or_else(|| crate::i18n::t(&lang, "unknownAccount", &[]));
@@ -470,7 +472,6 @@ async fn switch_desktop(app: &AppHandle, provider: Provider, id: &str) -> deskto
             let _ = desktop_apps::open_claude();
             let _ = crate::notify::notify(app.clone(), crate::i18n::t(&lang, "desktopGuideTitle", &[("name", &name)]),
                 crate::i18n::t(&lang, "desktopGuideBody", &[("name", &name)]), None, None);
-            let generation = DESKTOP_GUIDE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             let (watcher, done_name) = (app.clone(), name.clone());
             tauri::async_runtime::spawn(async move {
                 let cancelled = move || DESKTOP_GUIDE.load(std::sync::atomic::Ordering::SeqCst) != generation;

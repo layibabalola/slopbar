@@ -83,10 +83,17 @@ fn claude_configs() -> Vec<PathBuf> {
 }
 
 /// The account uuid Claude Desktop last signed in with, from its `config.json` text. Only the
-/// one key is taken.
+/// one key is taken: every other value (the encrypted token caches among them) is skipped by the
+/// parser, never kept.
 pub fn claude_uuid_in(text: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    let uuid = value.get("lastKnownAccountUuid")?.as_str()?.trim();
+    #[derive(serde::Deserialize)]
+    struct Config {
+        #[serde(rename = "lastKnownAccountUuid")]
+        uuid: Option<String>,
+    }
+    let config: Config = serde_json::from_str(text).ok()?;
+    let uuid = config.uuid?;
+    let uuid = uuid.trim();
     (!uuid.is_empty() && uuid.len() <= 64 && uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-')).then(|| uuid.to_string())
 }
 
@@ -116,7 +123,9 @@ pub fn read() -> Apps {
     if !cfg!(windows) {
         return Apps::default();
     }
-    Apps { claude: read_claude(), codex: codex_installed().then_some(Signed::SharesCli) }
+    // With CODEX_HOME set, the CLI SlopBar sees may not use the home the app does.
+    let shares = std::env::var_os("CODEX_HOME").is_none_or(|h| h.is_empty());
+    Apps { claude: read_claude(), codex: (shares && codex_installed()).then_some(Signed::SharesCli) }
 }
 
 /// The CLI on Windows itself (not WSL): the source the Codex app shares.
@@ -146,8 +155,10 @@ pub fn apply(list: &mut [AccountUsage], apps: &Apps) {
     }
     for provider in Provider::ALL {
         let Some(signed) = apps.get(provider) else { continue };
-        // Several organizations of one Claude account: the CLI's one, if it is among them.
-        let desktop = list.iter().position(|a| a.provider == provider && matches(a, signed) && a.active)
+        // Several organizations of one Claude account: the Windows CLI's one if it is among them,
+        // else one in use in WSL, else any.
+        let desktop = list.iter().position(|a| a.provider == provider && matches(a, signed) && on_windows(a))
+            .or_else(|| list.iter().position(|a| a.provider == provider && matches(a, signed) && a.active))
             .or_else(|| list.iter().position(|a| a.provider == provider && matches(a, signed)));
         let cli = list.iter().position(|a| a.provider == provider && on_windows(a));
         if let Some(d) = desktop {
@@ -276,6 +287,14 @@ mod tests {
         let mut list = vec![account(Provider::Codex, "c1", "a@example.invalid", &["Windows"]), account(Provider::Codex, "c2", "b@example.invalid", &["WSL: Ubuntu"])];
         apply(&mut list, &Apps { claude: None, codex: Some(Signed::SharesCli) });
         assert!(list[0].desktop && !list[1].desktop);
+        assert!(list.iter().all(|a| a.seats.is_none()));
+    }
+
+    #[test]
+    fn a_wsl_organization_does_not_hide_the_windows_one() {
+        let mut list = vec![account(Provider::Claude, "u1:o1", "a@example.invalid", &["WSL: Ubuntu"]), account(Provider::Claude, "u1:o2", "a@example.invalid", &["Windows"])];
+        apply(&mut list, &Apps { claude: Some(Signed::ClaudeAccount("u1".into())), codex: None });
+        assert!(list[1].desktop && !list[0].desktop);
         assert!(list.iter().all(|a| a.seats.is_none()));
     }
 
