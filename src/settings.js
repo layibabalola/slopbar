@@ -1484,6 +1484,8 @@ async function retryPeer(p, button) {
   try {
     await invoke("retry_peer_sign_in", { machineId: p.machine_id });
     peerNotes[p.machine_id] = t("peerSignInRetrySent", { machine: p.machine });
+    // The new run reaches the roster seconds later: followed closely meanwhile.
+    peerExpectUntil = Date.now() + 120000;
   } catch (err) {
     const code = String(err);
     peerNotes[p.machine_id] = code === "peer_not_paired" ? t("peerSignInNotPaired", { machine: p.machine })
@@ -1493,13 +1495,15 @@ async function retryPeer(p, button) {
 }
 
 let peerTimer = null;
+let peerExpectUntil = 0;
 async function loadPeerRuns() {
   clearTimeout(peerTimer);
   // Followed closely while Accounts is in view (and one goes on): the rosters are read sooner.
   const watching = !document.hidden && $("page-accounts").classList.contains("active");
   peerRuns = await invoke("peer_sign_ins", { watching }).catch(() => peerRuns);
   renderPeerRuns();
-  peerTimer = setTimeout(loadPeerRuns, watching && peerRuns.some((p) => !p.run.finished) ? 15000 : 60000);
+  const live = peerRuns.some((p) => !p.run.finished) || Date.now() < peerExpectUntil;
+  peerTimer = setTimeout(loadPeerRuns, watching && live ? 15000 : 60000);
 }
 document.addEventListener("visibilitychange", () => { if (!document.hidden) loadPeerRuns(); });
 document.querySelectorAll(".nav").forEach((b) => b.addEventListener("click", () => { if (b.dataset.page === "accounts") loadPeerRuns(); }));
