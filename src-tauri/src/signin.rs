@@ -225,6 +225,11 @@ fn end(dir: &Path) {
     set_active(dir, false);
 }
 
+/// Whether a sign-in page is open now (an update waits for it rather than closing it).
+pub fn any_active() -> bool {
+    ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| !s.is_empty())
+}
+
 /// Closes every running session's browser and deletes its profile, as SlopBar exits.
 pub fn close_all() {
     let dirs: Vec<PathBuf> = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| s.iter().cloned().collect()).unwrap_or_default();

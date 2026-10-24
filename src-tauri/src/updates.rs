@@ -28,7 +28,8 @@ pub async fn check(app: &AppHandle) -> Result<UpdateInfo, String> {
 /// Ultra release builds pin the fork's channel and key in code, so a merged config change cannot
 /// point them back at upstream, and accept only newer Ultra versions.
 fn updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
-    let builder = app.updater_builder();
+    let h = app.clone();
+    let builder = app.updater_builder().on_before_exit(move || crate::app::on_exit(&h));
     #[cfg(feature = "ultra-updates")]
     let builder = builder
         .endpoints(vec![crate::ultra_release::UPDATE_ENDPOINT.parse::<tauri::Url>().map_err(|e| e.to_string())?])
@@ -46,11 +47,17 @@ pub async fn install(app: &AppHandle) -> Result<(), String> {
     let Some(update) = updater(app)?.check().await.map_err(|e| e.to_string())? else {
         return Ok(());
     };
+    let bytes = update.download(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
+    // On Windows the installer ends this process without an Exit event. Monitoring tokens rotate
+    // only during a refresh or a sign-in, so it waits for both: the refresh lock is held until
+    // the process ends, and an open sign-in page puts the update off to the next check.
+    let state = app.state::<AppState>();
+    let _refresh = state.refresh_lock.lock().await;
+    if crate::signin::any_active() {
+        return Err("A sign-in is open; the update waits for it to finish".into());
+    }
     let _ = app.emit("update-installing", &update.version);
-    update
-        .download_and_install(|_, _| {}, || {})
-        .await
-        .map_err(|e| e.to_string())?;
+    update.install(bytes).map_err(|e| e.to_string())?;
     app.restart();
 }
 

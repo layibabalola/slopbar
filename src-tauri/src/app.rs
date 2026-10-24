@@ -20,7 +20,7 @@ pub(crate) const MENU_COMPACT: &str = "compact_flyout";
 pub struct AppState {
     monitor: monitoring::Monitor,
     diagnostics: std::sync::Arc<diagnostics::Recorder>,
-    refresh_lock: tokio::sync::Mutex<()>,
+    pub(crate) refresh_lock: tokio::sync::Mutex<()>,
     /// Held from reading settings to storing them, so the window and agents never lose a change.
     settings_lock: tokio::sync::Mutex<()>,
     account_operations: monitoring::Operations,
@@ -3283,16 +3283,22 @@ pub fn run() {
             }
             // App::run exits the process directly: code after it cannot flush a journal.
             if matches!(event, tauri::RunEvent::Exit) {
-                // Other machines stop showing this one's accounts as in use.
-                let settings = app.state::<AppState>().settings.lock().unwrap().clone();
-                if let Some(store) = presence::store(&settings) {
-                    presence::withdraw(store.as_ref(), settings.refresh_minutes.max(1) as u64 * 60);
-                }
-                // A sign-in still open loses its browser and fresh profile with SlopBar.
-                signin::close_all();
-                app.state::<AppState>().diagnostics.record(None, None, diagnostics::Event::Shutdown);
+                on_exit(app);
             }
         });
+}
+
+/// What SlopBar does as it exits: on Tauri's Exit, and before an update's installer replaces it
+/// (the updater ends the process itself, so no Exit event comes).
+pub(crate) fn on_exit(app: &AppHandle) {
+    // Other machines stop showing this one's accounts as in use.
+    let settings = app.state::<AppState>().settings.lock().unwrap().clone();
+    if let Some(store) = presence::store(&settings) {
+        presence::withdraw(store.as_ref(), settings.refresh_minutes.max(1) as u64 * 60);
+    }
+    // A sign-in still open loses its browser and fresh profile with SlopBar.
+    signin::close_all();
+    app.state::<AppState>().diagnostics.record(None, None, diagnostics::Event::Shutdown);
 }
 
 #[cfg(test)]

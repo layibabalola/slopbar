@@ -17,7 +17,23 @@ permissions:
   contents: write
 
 jobs:
+  # While the ULTRA_ signing secrets are unset, releases are published from the owner's machine
+  # (scripts/publish-ultra-release.ps1). Its tags must not start a second publisher here.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      signed: ${{ steps.key.outputs.signed }}
+    steps:
+      - id: key
+        env:
+          HAS_KEY: ${{ secrets.ULTRA_TAURI_SIGNING_PRIVATE_KEY != '' }}
+        run: |
+          echo "signed=$HAS_KEY" >> "$GITHUB_OUTPUT"
+          if [ "$HAS_KEY" != true ]; then echo "::notice::No ULTRA_ signing key; this tag was published locally."; fi
+
   release:
+    needs: gate
+    if: needs.gate.outputs.signed == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
