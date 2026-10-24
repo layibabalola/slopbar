@@ -212,17 +212,24 @@ pub fn check_usage(state: &mut State, snap: &Snapshot, prefs: &Notifications, la
 }
 
 /// Accounts that became in use on more than one machine at once (`AccountUsage::overlap`): one
-/// notification per overlap, once it has lasted `OVERLAP_SETTLE_MS`. The same overlap is not said
-/// again while it lasts, nor when it comes back within `OVERLAP_FORGET_MS`, nor when a machine
-/// drops out of it; another machine joining is news. `state` is updated whatever the settings say.
+/// notification per overlap, once it has lasted `OVERLAP_SETTLE_MS` without a break. The same
+/// overlap is not said again while it lasts, nor when it comes back within `OVERLAP_FORGET_MS`,
+/// nor when a machine drops out of it; another machine joining is news. `state` is updated
+/// whatever the settings say. Only snapshots with freshly read presence belong here.
 pub fn check_overlap(state: &mut State, snap: &Snapshot, prefs: &Notifications, lang: &str, now: DateTime<Utc>) -> Vec<Notice> {
     let mut out = Vec::new();
+    // Forgotten first, by when each was last seen (a night asleep makes the next one new).
+    state.overlaps.retain(|_, s| (now - s.seen).num_milliseconds() < OVERLAP_FORGET_MS);
     for a in &snap.accounts {
-        if a.overlap.len() < 2 {
-            continue;
-        }
         let pstr = provider_str(a.provider);
         let key = format!("{pstr}:{}", a.id);
+        if a.overlap.len() < 2 {
+            // A break before it was said: it must settle again from scratch.
+            if state.overlaps.get(&key).is_some_and(|s| !s.notified) {
+                state.overlaps.remove(&key);
+            }
+            continue;
+        }
         let seen = state.overlaps.entry(key).or_insert_with(|| OverlapSeen { machines: a.overlap.clone(), since: now, seen: now, notified: false });
         if !a.overlap.iter().all(|m| seen.machines.contains(m)) {
             // A machine joined: a new overlap.
@@ -242,7 +249,6 @@ pub fn check_overlap(state: &mut State, snap: &Snapshot, prefs: &Notifications, 
             }
         }
     }
-    state.overlaps.retain(|_, s| (now - s.seen).num_milliseconds() < OVERLAP_FORGET_MS);
     out
 }
 
@@ -430,7 +436,7 @@ pub fn monitor_auto_notice(lang: &str, name: Option<&str>) -> Notice {
 }
 
 #[cfg(feature = "desktop")]
-pub use glue::{on_monitor_auto_started, on_snapshot, on_switch, on_wind_down};
+pub use glue::{on_early_snapshot, on_monitor_auto_started, on_snapshot, on_switch, on_wind_down};
 
 #[cfg(feature = "desktop")]
 mod glue {
@@ -470,6 +476,16 @@ mod glue {
     /// After a snapshot is published: usage milestones, plans, the digest and capacity alerts, off
     /// the caller's thread and one run at a time.
     pub fn on_snapshot(app: &AppHandle) {
+        run(app, true);
+    }
+
+    /// The early publish of a refresh: presence there is the last refresh's, so overlaps wait for
+    /// the full snapshot (a machine may have switched away since).
+    pub fn on_early_snapshot(app: &AppHandle) {
+        run(app, false);
+    }
+
+    fn run(app: &AppHandle, presence_fresh: bool) {
         let app = app.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let mut state = store().lock().unwrap_or_else(|e| e.into_inner());
@@ -482,7 +498,9 @@ mod glue {
             let now = Utc::now();
             let before = state.clone();
             let mut notices = check_usage(&mut state, &snapshot, &prefs, &lang, now);
-            notices.extend(check_overlap(&mut state, &snapshot, &prefs, &lang, now));
+            if presence_fresh {
+                notices.extend(check_overlap(&mut state, &snapshot, &prefs, &lang, now));
+            }
             if *state != before {
                 if let Some(p) = path() { let _ = save_to(&p, &state); }
             }
@@ -668,6 +686,16 @@ mod tests {
         assert!(s.overlaps.is_empty());
         check_overlap(&mut s, &both, &prefs, "en", mins(91));
         assert_eq!(check_overlap(&mut s, &both, &prefs, "en", mins(96)).len(), 1);
+
+        // Broken off before it settled: the clock starts again.
+        let mut s = State::default();
+        check_overlap(&mut s, &both, &prefs, "en", mins(0));
+        check_overlap(&mut s, &alone, &prefs, "en", mins(1));
+        assert!(check_overlap(&mut s, &both, &prefs, "en", mins(4)).is_empty());
+        assert_eq!(check_overlap(&mut s, &both, &prefs, "en", mins(8)).len(), 1);
+        // After a long sleep the same machines are a new overlap, which must settle first.
+        assert!(check_overlap(&mut s, &both, &prefs, "en", mins(100)).is_empty());
+        assert_eq!(check_overlap(&mut s, &both, &prefs, "en", mins(105)).len(), 1);
 
         // Turned off: remembered, never said.
         let off = Notifications { multi_machine: false, ..Notifications::default() };

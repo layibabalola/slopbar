@@ -2405,7 +2405,7 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
         let early = Snapshot { accounts: early, updated_at: Some(chrono::Utc::now()) };
         *state.snapshot.lock().unwrap() = early.clone();
         let _ = app.emit("usage-updated", &early);
-        crate::alerts::on_snapshot(&app);
+        crate::alerts::on_early_snapshot(&app);
     }
     phases.end(P::Publish);
     if providers::save_cache(&cache).is_err() {
