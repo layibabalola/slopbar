@@ -79,6 +79,9 @@ pub struct AppState {
     bulk_connect: Mutex<Option<BulkConnect>>,
     /// Stops the running one (Settings' Stop).
     bulk_stop: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// Woken at every change to `bulk_connect` (see `wait_for_sign_in_change`).
+    bulk_changed: tokio::sync::Notify,
+    bulk_revision: std::sync::atomic::AtomicU64,
     /// Why the switcher's shortcut could not be registered (taken by another app, say).
     hotkey_error: Mutex<Option<String>>,
     /// The same for the compact toggle's shortcut.
@@ -108,6 +111,40 @@ struct BulkConnect {
     email: usize,
     finished: bool,
     error: Option<String>,
+    /// Every sign-in of the run and how it went, kept once it ends, so an agent elsewhere can tell
+    /// the person at the desktop exactly what happened.
+    steps: Vec<StepRecord>,
+    /// What Retry runs again: "Sign in all accounts" (`by_email`, with or without `monitoring`),
+    /// else "Connect monitoring for all".
+    by_email: bool,
+    monitoring: bool,
+    /// The open sign-in has waited long enough that the person was asked whether to retry it.
+    still_waiting: bool,
+    /// Bumped at every change, across runs (see `wait_for_sign_in_change`).
+    revision: u64,
+}
+
+/// One sign-in of a run.
+#[derive(Clone, Serialize)]
+struct StepRecord {
+    #[serde(flatten)]
+    target: bulk::Target,
+    kind: bulk::Kind,
+    state: StepState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StepState {
+    /// Not reached: still to come, or the run stopped before it.
+    Pending,
+    Running,
+    Done,
+    /// Already done (or the account removed) by the time the run reached it.
+    Skipped,
+    Failed,
 }
 
 /// Outcomes `health::checks` needs that nothing else keeps.
@@ -605,7 +642,13 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::GetHealth => value(health_report(&app).await),
         R::GetRoster { sync } => Ok(roster_status(&app, sync).await),
         R::SyncRoster => Ok(roster_status(&app, true).await),
-        R::GetReadiness => Ok(readiness(&app).await),
+        R::GetReadiness { wait_seconds, since } => {
+            if let Some(wait) = wait_seconds {
+                let since = since.unwrap_or_else(|| app.state::<AppState>().bulk_revision.load(std::sync::atomic::Ordering::SeqCst));
+                wait_for_sign_in_change(&app, since, Duration::from_secs(u64::from(wait.min(45)))).await;
+            }
+            Ok(readiness(&app).await)
+        }
         R::SetRosterPassphrase { passphrase } => set_roster_passphrase(&app, passphrase).await,
         R::ListSharingLocations => {
             let (folder, remote) = {
@@ -791,13 +834,20 @@ async fn add_expected(app: &AppHandle, expected: &bulk::Step, session: Option<&s
     if login.provider != provider || login.id != expected.target.id {
         // Never a token a stored login or monitor holds; this fresh login holds none of those.
         app.state::<AppState>().monitor.discard_unstored_login(&login, &accounts::load_slots(), &client).await;
-        return Err("monitor_wrong_account".into());
+        return Err(wrong_account(provider, expected.email.as_deref(), login.email.as_deref()));
     }
     accounts::store_login(&login).map_err(|_| "monitor_storage".to_string())?;
     forget_pending(provider, &login.id);
     let _ = app.emit("account-added", (login.provider, login.email.clone()));
     do_refresh(app).await;
     Ok(())
+}
+
+/// Why a sign-in was not the expected account. A Codex account is one ChatGPT workspace, so the
+/// right email with another id means the person picked another workspace on the page.
+fn wrong_account(provider: Provider, expected: Option<&str>, signed_in: Option<&str>) -> String {
+    let same_email = matches!((expected, signed_in), (Some(a), Some(b)) if a.trim().eq_ignore_ascii_case(b.trim()));
+    if provider == Provider::Codex && same_email { "monitor_wrong_workspace" } else { "monitor_wrong_account" }.into()
 }
 
 /// A one-time login owns its own refresh-token chain; it never changes the active CLI.
@@ -846,6 +896,7 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
                 let slots = accounts::load_slots();
                 if slots.iter().any(|s| s.provider == provider && s.id == id) {
                     app.state::<AppState>().monitor.connect_replacing(&expected, &login, &slots, &http_client()).await
+                        .map_err(|e| if e == "monitor_wrong_account" { wrong_account(provider, expected.email.as_deref(), login.email.as_deref()) } else { e })
                 } else {
                     let mut known = slots;
                     known.push(expected.clone());
@@ -882,7 +933,29 @@ fn publish_bulk(app: &AppHandle, change: impl FnOnce(&mut BulkConnect)) {
     let mut running = state.bulk_connect.lock().unwrap();
     if let Some(bulk) = running.as_mut() {
         change(bulk);
+        bulk.revision = state.bulk_revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let _ = app.emit("bulk-monitoring", bulk.clone());
+    }
+    drop(running);
+    state.bulk_changed.notify_waiters();
+}
+
+/// Returns once the run has changed since `revision` (see `BulkConnect::revision`), or after
+/// `wait`: an agent elsewhere follows a run without polling.
+async fn wait_for_sign_in_change(app: &AppHandle, revision: u64, wait: Duration) {
+    let state = app.state::<AppState>();
+    let until = tokio::time::Instant::now() + wait;
+    loop {
+        let changed = state.bulk_changed.notified();
+        tokio::pin!(changed);
+        // Listening before looking, so a change between the two is never missed.
+        changed.as_mut().enable();
+        if state.bulk_revision.load(std::sync::atomic::Ordering::SeqCst) > revision {
+            return;
+        }
+        if tokio::time::timeout_at(until, changed).await.is_err() {
+            return;
+        }
     }
 }
 
@@ -891,7 +964,7 @@ fn publish_bulk(app: &AppHandle, change: impl FnOnce(&mut BulkConnect)) {
 async fn connect_all(app: &AppHandle) -> Result<Vec<bulk::Target>, String> {
     let groups = bulk::sign_in_plan(&app.state::<AppState>().snapshot.lock().unwrap(), &[], true);
     let targets = groups.iter().flat_map(|g| g.steps.iter().map(|s| s.target.clone())).collect();
-    run_sign_ins(app, groups, false)?;
+    run_sign_ins(app, groups, false, true)?;
     Ok(targets)
 }
 
@@ -900,8 +973,30 @@ async fn connect_all(app: &AppHandle) -> Result<Vec<bulk::Target>, String> {
 /// Returns the plan.
 async fn sign_in_all(app: &AppHandle, monitoring: bool) -> Result<Vec<bulk::Group>, String> {
     let groups = sign_in_plan(app, monitoring);
-    run_sign_ins(app, groups.clone(), true)?;
+    run_sign_ins(app, groups.clone(), true, monitoring)?;
     Ok(groups)
+}
+
+/// Retry (the stop and "still waiting" notifications, Settings > Accounts): stops the run if one
+/// is going, then starts the same kind again. Its plan is made afresh from what is still missing,
+/// so what already worked is not asked for again.
+async fn retry_run(app: &AppHandle) -> Result<(), String> {
+    let last = app.state::<AppState>().bulk_connect.lock().unwrap().clone();
+    if last.as_ref().is_some_and(|b| !b.finished) {
+        stop_running_sign_ins(&app.state::<AppState>());
+        let until = Instant::now() + Duration::from_secs(20);
+        while app.state::<AppState>().bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished) {
+            if Instant::now() > until {
+                return Err("monitor_busy".into());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+    match last {
+        Some(b) if !b.by_email => connect_all(app).await.map(|_| ()),
+        Some(b) => sign_in_all(app, b.monitoring).await.map(|_| ()),
+        None => sign_in_all(app, true).await.map(|_| ()),
+    }
 }
 
 fn sign_in_plan(app: &AppHandle, monitoring: bool) -> Vec<bulk::Group> {
@@ -952,12 +1047,34 @@ async fn browser_closed(session: Option<&signin::Session>) {
     }
 }
 
+/// How long a sign-in may take to open its page (Codex's app server can be a cold start).
+const NO_PAGE_LIMIT: Duration = Duration::from_secs(40);
+/// How long a sign-in may wait on the person before they are asked whether to retry it.
+const STILL_WAITING: Duration = Duration::from_secs(5 * 60);
+
+/// Watches the open sign-in: resolves with `signin_no_page` when its page never opened in the
+/// email's profile (only a profile can tell), and, once it has waited long, asks the person at the
+/// desktop whether to retry it (and never resolves after that).
+async fn watch_step(app: &AppHandle, session: Option<&signin::Session>, since: std::time::SystemTime, account: &str) -> String {
+    let started = tokio::time::Instant::now();
+    if let Some(session) = session {
+        tokio::time::sleep(NO_PAGE_LIMIT).await;
+        if !session.page_opened_since(since) {
+            return "signin_no_page".into();
+        }
+    }
+    tokio::time::sleep_until(started + STILL_WAITING).await;
+    publish_bulk(app, |b| b.still_waiting = true);
+    sign_in_choice(app, "signInStillWaiting", &[("account", account)], true);
+    std::future::pending().await
+}
+
 /// Runs the sign-ins one terminal at a time, each started once the previous one finished, an
 /// email's sign-ins back to back in one fresh browser profile so Google is asked once for all of
 /// them; the profile's browser is closed and the profile deleted when the email's turn ends.
 /// Stops at the first that fails (the user closed it, closed the browser, signed in as another
-/// account, or pressed Stop).
-fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Result<(), String> {
+/// account, its page never opened, or Stop was pressed). Every step's outcome stays in `steps`.
+fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monitoring: bool) -> Result<(), String> {
     let state = app.state::<AppState>();
     let total = groups.iter().map(|g| g.steps.len()).sum();
     let stop = Arc::new(tokio::sync::Notify::new());
@@ -966,24 +1083,38 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Re
         if running.as_ref().is_some_and(|b| !b.finished) {
             return Err("monitor_busy".into());
         }
+        let steps = groups.iter().flat_map(|g| g.steps.iter())
+            .map(|s| StepRecord { target: s.target.clone(), kind: s.kind, state: StepState::Pending, error: None }).collect();
         *running = Some(BulkConnect { total, done: 0, current: None, kind: None, emails: if by_email { groups.len() } else { 0 }, email: 0,
-            finished: total == 0, error: None });
+            finished: total == 0, error: None, steps, by_email, monitoring, still_waiting: false, revision: 0 });
         *state.bulk_stop.lock().unwrap() = Some(stop.clone());
     }
+    publish_bulk(app, |_| {});
     let h = app.clone();
     tauri::async_runtime::spawn(async move {
+        let lang = crate::i18n::resolve(&h.state::<AppState>().settings.lock().unwrap().language);
         let mut error = None;
         let mut done = 0;
+        let mut position = 0;
+        let mark = |at: usize, state: StepState, error: Option<String>| publish_bulk(&h, |b| {
+            if let Some(step) = b.steps.get_mut(at) {
+                step.state = state;
+                step.error = error;
+            }
+        });
         'groups: for (index, group) in groups.iter().enumerate() {
             // Made at the email's first sign-in that still has to run, ended with its turn.
             let mut group_session: Option<Option<Arc<signin::Session>>> = None;
             for step in &group.steps {
                 let target = &step.target;
+                let at = position;
+                position += 1;
                 publish_bulk(&h, |b| {
                     b.done = done;
                     b.current = Some(target.clone());
                     b.kind = by_email.then_some(step.kind);
                     b.email = if by_email { index + 1 } else { 0 };
+                    b.still_waiting = false;
                 });
                 done += 1;
                 // Done (or removed) since the queue started: nothing to do.
@@ -997,25 +1128,36 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Re
                     }
                 };
                 if !still {
+                    mark(at, StepState::Skipped, None);
                     continue;
                 }
                 // Locked or left since the queue started: stop rather than open a page nobody sees.
                 if let Err(problem) = desktop_shown() {
+                    done -= 1;
+                    mark(at, StepState::Failed, Some(problem.clone()));
                     error = Some(problem);
                     break 'groups;
                 }
-                let session = group_session.get_or_insert_with(|| {
-                    let session = signin_session(&h);
-                    if let (Some(s), Some(email)) = (session.as_deref(), group.email.as_deref()) {
-                        s.label(email);
-                    }
-                    session
-                }).clone();
-                let run = async {
-                    // Another sign-in is open (one the user or automatic monitoring started): wait for it.
+                mark(at, StepState::Running, None);
+                // Another sign-in is open (one the user or automatic monitoring started): wait for it.
+                let free = async {
                     while h.state::<AppState>().account_operations.busy(monitoring::SIGN_IN) {
                         tokio::time::sleep(Duration::from_secs(2)).await;
                     }
+                };
+                let stopped = tokio::select! {
+                    _ = free => false,
+                    _ = stop.notified() => true,
+                };
+                let session = group_session.get_or_insert_with(|| {
+                    let session = signin_session(&h);
+                    if let (Some(s), Some(email)) = (session.as_deref(), group.email.as_deref()) {
+                        s.label(email, &lang);
+                    }
+                    session
+                }).clone();
+                let since = std::time::SystemTime::now();
+                let run = async {
                     match step.kind {
                         bulk::Kind::Add => add_expected(&h, step, session.as_deref()).await,
                         bulk::Kind::Connect => {
@@ -1036,29 +1178,38 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Re
                 }
                 // Whoever sits at this desktop (often brought here by an agent on another
                 // computer) is told which account and which page comes next.
-                if by_email {
+                let account = target.account.clone().unwrap_or_default();
+                if by_email && !stopped {
                     let (g, e, i, n) = ((index + 1).to_string(), groups.len().to_string(), done.to_string(), total.to_string());
-                    let account = target.account.clone().unwrap_or_default();
                     let key = if step.kind == bulk::Kind::Add { "signInAllAdding" } else { "signInAllConnecting" };
                     sign_in_notice(&h, key, &[("g", &g), ("e", &e), ("i", &i), ("n", &n), ("account", &account)]);
                 }
                 let mut run = Box::pin(run);
-                let outcome = tokio::select! {
-                    outcome = &mut run => outcome,
-                    _ = stop.notified() => Err("signin_stopped".into()),
-                    // Closing the window once the provider's page says "done" is fine: the
-                    // sign-in may still be saving (Codex's CLI can take a while), so it gets up to
-                    // two minutes to finish before the queue stops.
-                    _ = browser_closed(session.as_deref()) => tokio::time::timeout(SIGN_IN_GRACE, &mut run).await
-                        .unwrap_or_else(|_| Err("signin_window_closed".into())),
+                let outcome = if stopped {
+                    Err("signin_stopped".into())
+                } else {
+                    tokio::select! {
+                        outcome = &mut run => outcome,
+                        _ = stop.notified() => Err("signin_stopped".into()),
+                        // Closing the window once the provider's page says "done" is fine: the
+                        // sign-in may still be saving (Codex's CLI can take a while), so it gets up to
+                        // two minutes to finish before the queue stops.
+                        _ = browser_closed(session.as_deref()) => tokio::time::timeout(SIGN_IN_GRACE, &mut run).await
+                            .unwrap_or_else(|_| Err("signin_window_closed".into())),
+                        e = watch_step(&h, session.as_deref(), since, &account) => Err(e),
+                    }
                 };
-                if let Err(e) = outcome {
-                    done -= 1;
-                    error = Some(e);
-                    drop(run);
-                    drop(group_session);
-                    drop(session);
-                    break 'groups;
+                match outcome {
+                    Ok(()) => mark(at, StepState::Done, None),
+                    Err(e) => {
+                        done -= 1;
+                        mark(at, StepState::Failed, Some(e.clone()));
+                        error = Some(e);
+                        drop(run);
+                        drop(group_session);
+                        drop(session);
+                        break 'groups;
+                    }
                 }
             }
             // The last handle: closes the browser and deletes the profile (see `signin::Session`).
@@ -1067,10 +1218,9 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Re
         if by_email && total > 0 {
             match &error {
                 Some(e) => {
-                    let lang = crate::i18n::resolve(&h.state::<AppState>().settings.lock().unwrap().language);
                     let known = e.starts_with("signin_") || e.starts_with("monitor_") || e.starts_with("desktop_");
                     let reason = if known { crate::i18n::t(&lang, e, &[]) } else { e.clone() };
-                    sign_in_notice(&h, "bulkConnectStopped", &[("done", &done.to_string()), ("n", &total.to_string()), ("error", &reason)]);
+                    sign_in_choice(&h, "bulkConnectStopped", &[("done", &done.to_string()), ("n", &total.to_string()), ("error", &reason)], false);
                 }
                 None => sign_in_notice(&h, "signInAllDone", &[("n", &total.to_string())]),
             }
@@ -1081,6 +1231,7 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Re
             b.kind = None;
             b.finished = true;
             b.error = error;
+            b.still_waiting = false;
         });
     });
     Ok(())
@@ -1089,16 +1240,43 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Re
 /// How long a sign-in may go on finishing after its browser window was closed.
 const SIGN_IN_GRACE: Duration = Duration::from_secs(120);
 
-/// A notification for the person at this desktop during "Sign in all accounts", in the words
-/// Settings > Accounts uses; clicking it opens that page.
-fn sign_in_notice(app: &AppHandle, key: &str, vars: &[(&str, &str)]) {
+/// The notification text for the person at this desktop during "Sign in all accounts", in the
+/// words Settings > Accounts uses: (title, body, language).
+fn sign_in_text(app: &AppHandle, key: &str, vars: &[(&str, &str)]) -> (String, String, String) {
     let settings = app.state::<AppState>().settings.lock().unwrap().clone();
     let lang = crate::i18n::resolve(&settings.language);
     let place = if settings.signin_window == signin::Window::System { "signInWhereTerminal" } else { "signInWhereBrowser" };
     let place = crate::i18n::t(&lang, place, &[]);
     let mut vars = vars.to_vec();
     vars.push(("where", &place));
-    let _ = notify::notify(app.clone(), crate::i18n::t(&lang, "signInAll", &[]), crate::i18n::t(&lang, key, &vars), Some("accounts".into()), None);
+    (crate::i18n::t(&lang, "signInAll", &[]), crate::i18n::t(&lang, key, &vars), lang)
+}
+
+/// A notification for the person at this desktop; clicking it opens Settings > Accounts.
+fn sign_in_notice(app: &AppHandle, key: &str, vars: &[(&str, &str)]) {
+    let (title, body, _) = sign_in_text(app, key, vars);
+    let _ = notify::notify(app.clone(), title, body, Some("accounts".into()), None);
+}
+
+/// The same with a Retry button (see `retry_run`) and, while the run goes on, a Stop one.
+fn sign_in_choice(app: &AppHandle, key: &str, vars: &[(&str, &str)], running: bool) {
+    let (title, body, lang) = sign_in_text(app, key, vars);
+    let mut buttons = vec![(crate::i18n::t(&lang, "signInRetry", &[]), "retry")];
+    if running {
+        buttons.push((crate::i18n::t(&lang, "signInAllStop", &[]), "stop"));
+    }
+    let h = app.clone();
+    let _ = notify::notify_choice(app.clone(), title, body, buttons, move |action| match action {
+        Some("retry") => {
+            let h = h.clone();
+            tauri::async_runtime::spawn(async move {
+                // A failure shows in Settings and readiness like any run that did not start.
+                let _ = retry_run(&h).await;
+            });
+        }
+        Some("stop") => stop_running_sign_ins(&h.state::<AppState>()),
+        _ => show_settings_page(&h, Some("accounts".into())),
+    });
 }
 
 #[tauri::command]
@@ -1138,9 +1316,19 @@ async fn forget_signin_profiles() -> Result<usize, String> {
 /// closed with its browser, and nothing after it starts.
 #[tauri::command]
 fn stop_sign_ins(state: tauri::State<AppState>) {
+    stop_running_sign_ins(&state);
+}
+
+fn stop_running_sign_ins(state: &AppState) {
     if let Some(stop) = state.bulk_stop.lock().unwrap().as_ref() {
         stop.notify_one();
     }
+}
+
+/// Settings' Retry: see `retry_run`.
+#[tauri::command]
+async fn retry_sign_ins(app: AppHandle) -> Result<(), String> {
+    retry_run(&app).await
 }
 
 /// Removes every account whose plan has ended, as each row's remove does; accounts in use stay.
@@ -2451,8 +2639,10 @@ async fn readiness(app: &AppHandle) -> serde_json::Value {
         "accounts": { "here": snapshot.accounts.len(), "unmonitored": bulk::unmonitored(&snapshot).len() },
         "roster": summary, "waiting": waiting,
         // Sign in all accounts as it runs: email g of emails, done of total, who is signing in
-        // now and for what (add or connect), and why it stopped.
+        // now and for what (add or connect), why it stopped, and each step's outcome.
         "sign_in": state.bulk_connect.lock().unwrap().clone(),
+        // Pass as `since` with `wait_seconds` to hear of the next change.
+        "sign_in_revision": state.bulk_revision.load(std::sync::atomic::Ordering::SeqCst),
         "ready_for_sign_in": ready, "problems": problems, "next": next,
     })
 }
@@ -2618,6 +2808,42 @@ fn exit_allowed(code: Option<i32>) -> bool {
 }
 
 #[cfg(test)]
+mod sign_in_tests {
+    use super::*;
+
+    #[test]
+    fn a_codex_sign_in_with_the_right_email_is_a_workspace_mismatch() {
+        let (a, b) = (Some("synthetic.one@example.invalid"), Some("Synthetic.One@example.invalid "));
+        assert_eq!(wrong_account(Provider::Codex, a, b), "monitor_wrong_workspace");
+        assert_eq!(wrong_account(Provider::Codex, a, Some("synthetic.two@example.invalid")), "monitor_wrong_account");
+        assert_eq!(wrong_account(Provider::Codex, None, b), "monitor_wrong_account");
+        assert_eq!(wrong_account(Provider::Claude, a, b), "monitor_wrong_account", "a Claude organization is not a workspace choice");
+    }
+
+    #[test]
+    fn a_run_reports_every_step() {
+        let step = StepRecord { target: bulk::Target { provider: Provider::Codex, id: "synthetic-id".into(), account: Some("synthetic@example.invalid".into()), ended: None },
+            kind: bulk::Kind::Connect, state: StepState::Failed, error: Some("signin_no_page".into()) };
+        let v = serde_json::to_value(&step).unwrap();
+        assert_eq!(v["provider"], "codex");
+        assert_eq!(v["id"], "synthetic-id");
+        assert_eq!(v["kind"], "connect");
+        assert_eq!(v["state"], "failed");
+        assert_eq!(v["error"], "signin_no_page");
+        let done = StepRecord { state: StepState::Done, error: None, ..step };
+        assert!(serde_json::to_value(&done).unwrap().get("error").is_none());
+    }
+
+    #[test]
+    fn readiness_waits_only_when_asked_and_old_apps_still_read_it() {
+        let plain = serde_json::to_value(crate::door::Request::GetReadiness { wait_seconds: None, since: None }).unwrap();
+        assert_eq!(plain, serde_json::json!({ "op": "get_readiness" }), "no new fields for an app that does not know them");
+        let waiting: crate::door::Request = serde_json::from_value(serde_json::json!({ "op": "get_readiness", "wait_seconds": 30, "since": 7 })).unwrap();
+        assert!(matches!(waiting, crate::door::Request::GetReadiness { wait_seconds: Some(30), since: Some(7) }));
+    }
+}
+
+#[cfg(test)]
 mod exit_tests {
     #[test]
     fn closing_the_last_window_never_quits_but_an_explicit_exit_does() {
@@ -2672,6 +2898,8 @@ pub fn run() {
         profile_states: Mutex::default(),
         bulk_connect: Mutex::default(),
         bulk_stop: Mutex::default(),
+        bulk_changed: tokio::sync::Notify::new(),
+        bulk_revision: Default::default(),
         hotkey_error: Mutex::default(),
         compact_hotkey_error: Mutex::default(),
         compact_item: Mutex::default(),
@@ -2749,6 +2977,7 @@ pub fn run() {
             sign_in_all_accounts,
             forget_signin_profiles,
             stop_sign_ins,
+            retry_sign_ins,
             remove_lapsed_accounts,
             bulk_status,
             list_project_pins,
