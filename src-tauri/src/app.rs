@@ -56,6 +56,8 @@ pub struct AppState {
     roster: std::sync::Arc<Mutex<roster::Syncer>>,
     /// What the roster's last sync found, for Settings, Health and sign-ins.
     roster_seen: Mutex<roster::Seen>,
+    /// "Sign in all accounts" as the roster carries it to the other computers (see `roster::Run`).
+    roster_run: Mutex<Option<roster::Run>>,
     /// Use seen where none of the user's computers is, for a week (see `unexpected`).
     unexpected_log: Mutex<unexpected::Log>,
     /// Plan notifications already shown (renewals, running out), so each is shown once.
@@ -576,12 +578,16 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             Ok(serde_json::json!({ "started": !queued.is_empty(), "queued": queued,
                 "next": "Each sign-in opens after the previous one finishes; the user signs in as the account named in Settings. get_usage shows monitor_connected as they complete." }))
         }
-        R::SignInAll { confirm, monitoring } => {
+        R::SignInAll { confirm, monitoring, retry } => {
             if !confirm {
                 return Ok(serde_json::json!({ "started": false, "plan": sign_in_plan(&app, monitoring),
                     "next": "Nothing was started. With confirm: true the sign-ins open one at a time, an email's back to back in one fresh browser profile that is closed and deleted when the email is done; the user signs in as each account named here and completes every page." }));
             }
             desktop_shown()?;
+            // Retry from another computer: a run still going (one left waiting) gives way first.
+            if retry {
+                stop_and_wait(&app).await?;
+            }
             let plan = sign_in_all(&app, monitoring).await?;
             Ok(serde_json::json!({ "started": !plan.is_empty(), "plan": plan,
                 "next": "Each sign-in opens after the previous one finishes. get_usage shows the accounts and monitor_connected as they complete." }))
@@ -922,13 +928,41 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
 fn publish_bulk(app: &AppHandle, change: impl FnOnce(&mut BulkConnect)) {
     let state = app.state::<AppState>();
     let mut running = state.bulk_connect.lock().unwrap();
+    let mut run = None;
     if let Some(bulk) = running.as_mut() {
         change(bulk);
         bulk.revision = state.bulk_revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let _ = app.emit("bulk-monitoring", bulk.clone());
+        run = bulk.by_email.then(|| roster_run(bulk, chrono::Utc::now()));
     }
     drop(running);
     state.bulk_changed.notify_waiters();
+    // The user's other computers follow "Sign in all accounts" through the roster.
+    if let Some(run) = run {
+        *state.roster_run.lock().unwrap() = Some(run);
+        let settings = state.settings.lock().unwrap().clone();
+        if settings.account_roster {
+            let h = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = h.state::<AppState>();
+                let accounts = state.snapshot.lock().unwrap().accounts.clone();
+                sync_roster(&state, &settings, accounts, false, false).await;
+            });
+        }
+    }
+}
+
+/// A run of "Sign in all accounts" as the roster carries it (see `roster::Run`).
+fn roster_run(b: &BulkConnect, at: chrono::DateTime<chrono::Utc>) -> roster::Run {
+    let word = |v: serde_json::Value| v.as_str().unwrap_or_default().to_string();
+    roster::Run {
+        revision: b.revision, at, total: b.total, done: b.done, emails: b.emails, email: b.email, finished: b.finished,
+        still_waiting: b.still_waiting, monitoring: b.monitoring, error: b.error.clone(),
+        steps: b.steps.iter().map(|s| roster::RunStep {
+            provider: s.target.provider, account: s.target.account.clone(),
+            kind: word(serde_json::json!(s.kind)), state: word(serde_json::json!(s.state)), error: s.error.clone(),
+        }).collect(),
+    }
 }
 
 /// Returns once the run has changed since `revision` (see `BulkConnect::revision`), or after
@@ -973,16 +1007,7 @@ async fn sign_in_all(app: &AppHandle, monitoring: bool) -> Result<Vec<bulk::Grou
 /// so what already worked is not asked for again.
 async fn retry_run(app: &AppHandle) -> Result<(), String> {
     let last = app.state::<AppState>().bulk_connect.lock().unwrap().clone();
-    if last.as_ref().is_some_and(|b| !b.finished) {
-        stop_running_sign_ins(&app.state::<AppState>());
-        let until = Instant::now() + Duration::from_secs(20);
-        while app.state::<AppState>().bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished) {
-            if Instant::now() > until {
-                return Err("monitor_busy".into());
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    }
+    stop_and_wait(app).await?;
     match last {
         Some(b) if !b.by_email => connect_all(app).await.map(|_| ()),
         Some(b) => sign_in_all(app, b.monitoring).await.map(|_| ()),
@@ -1027,6 +1052,22 @@ impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// Stops the run if one is going and waits for it to end.
+async fn stop_and_wait(app: &AppHandle) -> Result<(), String> {
+    let going = || app.state::<AppState>().bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished);
+    if going() {
+        stop_running_sign_ins(&app.state::<AppState>());
+        let until = Instant::now() + Duration::from_secs(20);
+        while going() {
+            if Instant::now() > until {
+                return Err("monitor_busy".into());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+    Ok(())
 }
 
 /// Resolves once `session`'s browser, having opened for any of the email's sign-ins, is closed:
@@ -2116,7 +2157,7 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
     };
     let surged = presence::infer(&mut state.presence_tracks.lock().unwrap(), &mut list, hold, surge, now);
     if settings.account_roster {
-        sync_roster(&state, &settings, list.clone(), false).await;
+        sync_roster(&state, &settings, list.clone(), false, false).await;
     }
     let watch = unexpected::Watch { covered, notify: settings.notifications.unexpected_use, web_use: &settings.web_use };
     let log = {
@@ -2393,16 +2434,21 @@ async fn set_phone_token(token: Option<String>) -> Result<(), String> {
 // ---------------------------------------------------------------------------------------------
 // Account roster (see `roster`)
 
-/// Writes this machine's roster when due and reads the others' (at once with `force`). Does
-/// nothing without a sharing location or a passphrase.
-async fn sync_roster(state: &AppState, settings: &settings::Settings, accounts: Vec<model::AccountUsage>, force: bool) {
+/// Writes this machine's roster (with its "Sign in all accounts" run) when due and reads the
+/// others' (at once with `force`, sooner with `soon`: see `roster::Syncer::sync`). Does nothing
+/// without a sharing location or a passphrase.
+async fn sync_roster(state: &AppState, settings: &settings::Settings, accounts: Vec<model::AccountUsage>, force: bool, soon: bool) {
     let (Some(store), Some(passphrase)) = (roster::store(settings), settings::app_dir().and_then(|d| roster::load_passphrase(&d))) else { return };
     let sync = state.roster.clone();
+    let run = state.roster_run.lock().unwrap().clone();
     let now = chrono::Utc::now();
     let seen = tauri::async_runtime::spawn_blocking(move || {
         let (id, name) = presence::identity()?;
         let mut sync = sync.lock().unwrap();
-        sync.sync(store.as_ref(), &passphrase, (id, name), &accounts, now, force);
+        if let Some(run) = run {
+            sync.offer_run(run);
+        }
+        sync.sync(store.as_ref(), &passphrase, (id, name), &accounts, now, force, soon);
         Some(sync.seen.clone())
     }).await.ok().flatten();
     if let Some(seen) = seen {
@@ -2443,6 +2489,8 @@ async fn readiness(app: &AppHandle) -> serde_json::Value {
     summary["waiting"] = waiting.as_array().map_or(0, Vec::len).into();
     serde_json::json!({
         "app": { "running": true, "version": app_version(app.clone()), "build": diagnostics::build_info(), "pid": std::process::id() },
+        // The id its roster carries: the computer asking notes which SSH host reaches it.
+        "machine": presence::identity().map(|(id, name)| serde_json::json!({ "id": id, "name": name })),
         "desktop": desktop, "idle_seconds": desktop::idle_seconds(), "browser": browser, "signin_window": signin_window,
         "accounts": { "here": snapshot.accounts.len(), "unmonitored": bulk::unmonitored(&snapshot).len() },
         "roster": summary, "waiting": waiting,
@@ -2462,7 +2510,7 @@ async fn roster_status(app: &AppHandle, sync: bool) -> serde_json::Value {
     let settings = state.settings.lock().unwrap().clone();
     let snapshot = state.snapshot.lock().unwrap().clone();
     if sync && settings.account_roster {
-        sync_roster(&state, &settings, snapshot.accounts.clone(), true).await;
+        sync_roster(&state, &settings, snapshot.accounts.clone(), true, false).await;
     }
     let seen = state.roster_seen.lock().unwrap().clone();
     let waiting = roster_waiting(&state, &snapshot);
@@ -2480,6 +2528,42 @@ async fn roster_status(app: &AppHandle, sync: bool) -> serde_json::Value {
 #[tauri::command]
 async fn get_roster(app: AppHandle, sync: Option<bool>) -> serde_json::Value {
     roster_status(&app, sync.unwrap_or(false)).await
+}
+
+/// Settings > Accounts' "Signing in on <machine>" cards: the other computers' runs of "Sign in all
+/// accounts" as their rosters carry them (read sooner while Settings is `watching`; see
+/// `roster::peer_runs`), and whether Retry can reach each one over SSH.
+#[tauri::command]
+async fn peer_sign_ins(app: AppHandle, watching: Option<bool>) -> Vec<serde_json::Value> {
+    let state = app.state::<AppState>();
+    let settings = state.settings.lock().unwrap().clone();
+    if !settings.account_roster {
+        return vec![];
+    }
+    let accounts = state.snapshot.lock().unwrap().accounts.clone();
+    sync_roster(&state, &settings, accounts, false, watching.unwrap_or(false)).await;
+    let dir = settings::app_dir();
+    let runs = roster::peer_runs(&state.roster_seen.lock().unwrap(), chrono::Utc::now());
+    runs.into_iter().map(|r| {
+        let reachable = dir.as_deref().and_then(|d| pairing::host_for(d, &r.machine_id)).is_some();
+        let mut card = serde_json::to_value(&r).unwrap_or_default();
+        card["reachable"] = reachable.into();
+        card
+    }).collect()
+}
+
+/// Retry on a "Signing in on <machine>" card: runs Sign in all accounts on that computer again
+/// through its SSH door (see `pairing::remote_call`), first stopping a run left waiting there. The
+/// computer must have been paired or checked from here (`pairing::host_for`).
+#[tauri::command]
+async fn retry_peer_sign_in(app: AppHandle, machine_id: String) -> Result<(), String> {
+    let host = settings::app_dir().and_then(|d| pairing::host_for(&d, &machine_id)).ok_or("peer_not_paired")?;
+    let monitoring = app.state::<AppState>().roster_seen.lock().unwrap().peers.iter()
+        .find(|p| p.machine_id == machine_id).and_then(|p| p.run.as_ref()).is_none_or(|r| r.monitoring);
+    let arguments = serde_json::json!({ "confirm": true, "monitoring": monitoring, "retry": true });
+    tauri::async_runtime::spawn_blocking(move || pairing::remote_call(&pairing::Ssh, &host, "sign_in_all", &arguments))
+        .await.map_err(|_| "ssh_failed".to_string())??;
+    Ok(())
 }
 
 #[tauri::command]
@@ -2638,8 +2722,23 @@ mod sign_in_tests {
         assert_eq!(v["kind"], "connect");
         assert_eq!(v["state"], "failed");
         assert_eq!(v["error"], "signin_no_page");
-        let done = StepRecord { state: StepState::Done, error: None, ..step };
+        let done = StepRecord { state: StepState::Done, error: None, ..step.clone() };
         assert!(serde_json::to_value(&done).unwrap().get("error").is_none());
+        // The same run as the roster carries it to the other computers.
+        let bulk = BulkConnect { total: 2, done: 1, current: None, kind: None, emails: 1, email: 1, finished: true, error: Some("signin_no_page".into()),
+            steps: vec![done, step], by_email: true, monitoring: true, still_waiting: false, revision: 9 };
+        let run = roster_run(&bulk, "2026-10-23T12:00:00Z".parse().unwrap());
+        assert_eq!((run.revision, run.finished, run.error.as_deref()), (9, true, Some("signin_no_page")));
+        assert_eq!(run.steps.iter().map(|s| (s.kind.as_str(), s.state.as_str())).collect::<Vec<_>>(), [("connect", "done"), ("connect", "failed")]);
+        assert_eq!(run.steps[1].account.as_deref(), Some("synthetic@example.invalid"));
+    }
+
+    #[test]
+    fn retry_from_another_computer_is_opt_in() {
+        let plain: crate::door::Request = serde_json::from_value(serde_json::json!({ "op": "sign_in_all", "confirm": true })).unwrap();
+        assert!(matches!(plain, crate::door::Request::SignInAll { confirm: true, monitoring: true, retry: false }));
+        let retry: crate::door::Request = serde_json::from_value(serde_json::json!({ "op": "sign_in_all", "confirm": true, "retry": true })).unwrap();
+        assert!(matches!(retry, crate::door::Request::SignInAll { retry: true, .. }));
     }
 
     #[test]
@@ -2695,6 +2794,7 @@ pub fn run() {
         presence_tracks: Mutex::default(),
         roster: Default::default(),
         roster_seen: Mutex::default(),
+        roster_run: Mutex::default(),
         unexpected_log: Mutex::new(unexpected::load()),
         plan_alerts: Mutex::new(plan_alerts::load()),
         burn_log: Mutex::new(burn::load()),
@@ -2743,6 +2843,8 @@ pub fn run() {
             restore_backup,
             phone_token_saved,
             get_roster,
+            peer_sign_ins,
+            retry_peer_sign_in,
             roster_passphrase_saved,
             save_roster_passphrase,
             set_phone_token,

@@ -351,7 +351,7 @@ mod tests {
         let store = Rclone::with("cloud", Fake::default());
         let passphrase = crate::backup::Passphrase("synthetic roster passphrase".into());
         let mut sync = Syncer::default();
-        sync.sync(&store, &passphrase, ("11111111-1111-4111-8111-111111111111", "BACHELOR"), &[account("synthetic-a:org")], Utc::now(), false);
+        sync.sync(&store, &passphrase, ("11111111-1111-4111-8111-111111111111", "BACHELOR"), &[account("synthetic-a:org")], Utc::now(), false, false);
         assert_eq!((sync.seen.wrote, sync.seen.own_accounts), (Some(true), Some(1)), "written and read back");
         let files = store.runner.files.lock().unwrap().clone();
         assert_eq!(files.keys().collect::<Vec<_>>(), ["cloud:SlopBar/roster/11111111-1111-4111-8111-111111111111.roster"]);

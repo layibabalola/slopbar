@@ -1412,6 +1412,98 @@ listen("bulk-monitoring", ({ payload }) => { bulk.connecting = payload; renderBu
 listen("usage-updated", loadBulk);
 
 // ---------------------------------------------------------------------------------------------
+// "Signing in on <machine>" (Accounts): another computer's Sign in all accounts, as its roster
+// carries it, followed while it goes on, with Retry over SSH (see `peer_sign_ins`).
+
+let peerRuns = [];
+/** What the last Retry on each machine's card said, by machine id. */
+const peerNotes = {};
+
+/** A card's lines: where the run is, and what the person here should know about it. */
+function peerRunLines(p) {
+  const r = p.run;
+  const machine = p.machine;
+  const current = r.steps.find((s) => s.state === "running");
+  if (r.finished && r.error) {
+    return [t("bulkConnectStopped", { done: r.done, n: r.total, error: errorText("", r.error) }), t("peerSignInStoppedHint", { machine })];
+  }
+  if (r.finished) return [t(r.total ? "signInAllDone" : "signInAllNone", { n: r.total }), ""];
+  const step = !current ? t("peerSignInStarting")
+    : r.still_waiting ? t("peerSignInWaiting", { machine, account: who(current) })
+    : t(current.kind === "add" ? "signInAllAdding" : "signInAllConnecting",
+      { g: r.email, e: r.emails, i: r.done + 1, n: r.total, account: who(current), where: t("signInWhereMachine", { machine }) });
+  const quiet = Math.max(1, Math.round((Date.now() - new Date(p.written_at)) / 60000));
+  return [step, p.quiet ? t("peerSignInQuiet", { machine, t: duration(quiet) }) : t("peerSignInCoach", { machine })];
+}
+
+function renderPeerRuns() {
+  const box = $("peer-sign-ins");
+  box.replaceChildren(...peerRuns.map((p) => {
+    // Names and accounts come from other machines: text only, never markup.
+    const card = document.createElement("div");
+    card.className = "hint notice peer-run";
+    card.setAttribute("role", "status");
+    const title = document.createElement("h3");
+    title.textContent = t("peerSigningIn", { machine: p.machine });
+    card.append(title);
+    for (const [text, dim] of peerRunLines(p).map((line, i) => [line, i > 0])) {
+      if (!text) continue;
+      const line = document.createElement("p");
+      line.textContent = text;
+      if (dim) line.className = "dim";
+      card.append(line);
+    }
+    const r = p.run;
+    if ((r.finished && r.error) || r.still_waiting || p.quiet) {
+      if (p.reachable) {
+        const retry = document.createElement("button");
+        retry.className = "btn";
+        retry.textContent = t("signInRetry");
+        retry.addEventListener("click", () => retryPeer(p, retry));
+        card.append(retry);
+      } else {
+        peerNotes[p.machine_id] ??= t("peerSignInNotPaired", { machine: p.machine });
+      }
+    }
+    if (peerNotes[p.machine_id]) {
+      const note = document.createElement("p");
+      note.className = "dim";
+      note.textContent = peerNotes[p.machine_id];
+      card.append(note);
+    }
+    return card;
+  }));
+}
+
+async function retryPeer(p, button) {
+  button.disabled = true;
+  peerNotes[p.machine_id] = t("peerSignInRetrying", { machine: p.machine });
+  renderPeerRuns();
+  try {
+    await invoke("retry_peer_sign_in", { machineId: p.machine_id });
+    peerNotes[p.machine_id] = t("peerSignInRetrySent", { machine: p.machine });
+  } catch (err) {
+    const code = String(err);
+    peerNotes[p.machine_id] = code === "peer_not_paired" ? t("peerSignInNotPaired", { machine: p.machine })
+      : t("peerSignInRetryFailed", { machine: p.machine, error: errorText("", code) });
+  }
+  loadPeerRuns();
+}
+
+let peerTimer = null;
+async function loadPeerRuns() {
+  clearTimeout(peerTimer);
+  // Followed closely while Accounts is in view (and one goes on): the rosters are read sooner.
+  const watching = !document.hidden && $("page-accounts").classList.contains("active");
+  peerRuns = await invoke("peer_sign_ins", { watching }).catch(() => peerRuns);
+  renderPeerRuns();
+  peerTimer = setTimeout(loadPeerRuns, watching && peerRuns.some((p) => !p.run.finished) ? 15000 : 60000);
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) loadPeerRuns(); });
+document.querySelectorAll(".nav").forEach((b) => b.addEventListener("click", () => { if (b.dataset.page === "accounts") loadPeerRuns(); }));
+loadPeerRuns();
+
+// ---------------------------------------------------------------------------------------------
 // An account per project (Accounts): pinned folders, and the lines that use them.
 
 let pinListing = { pins: [], launcher: null };
