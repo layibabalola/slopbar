@@ -16,6 +16,11 @@
 //! Accounts another machine's roster names that are not signed in here are pending (see
 //! `bulk::sign_in_plan`): one stops being pending once it is signed in here, and an account
 //! removed everywhere else drops out with the last roster naming it.
+//!
+//! While "Sign in all accounts" runs on a machine, its roster also carries the run's progress
+//! (`Run`), rewritten at every step, so the user's other computers can follow it and offer Retry
+//! (Settings > Accounts, "Signing in on <machine>"). It names accounts too, so it goes inside the
+//! same encrypted file, never beside it in the clear.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -45,6 +50,15 @@ const IGNORE_AFTER_DAYS: i64 = 60;
 const REWRITE_AFTER_HOURS: i64 = 24;
 /// Other machines' rosters change only when their accounts do: read them at most this often.
 const READ_EVERY_MINUTES: i64 = 10;
+/// While a run goes on, this machine's roster is rewritten at least this often, so the others can
+/// tell a run waiting on the person from a machine that went quiet.
+const RUN_HEARTBEAT_MINUTES: i64 = 3;
+/// While another machine's run goes on, rosters are read this often; with Settings watching
+/// (`soon`), at least this often.
+const READ_LIVE_SECONDS: i64 = 15;
+const READ_SOON_SECONDS: i64 = 30;
+/// A run's steps beyond this many are not kept (they come from other machines).
+const MAX_STEPS: usize = 200;
 const PASSPHRASE_FILE: &str = "roster-passphrase.bin";
 const MAX_PASSPHRASE: usize = 1024;
 
@@ -64,6 +78,42 @@ pub struct Roster {
     pub machine: String,
     pub written_at: DateTime<Utc>,
     pub accounts: Vec<Entry>,
+    /// "Sign in all accounts" as it runs there, or last ran since SlopBar started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<Run>,
+}
+
+/// "Sign in all accounts" on the machine that wrote the roster, as Settings > Accounts shows it
+/// there (see `app::BulkConnect`), for the user's other computers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Run {
+    /// Bumped at every change there; a lower one is older news.
+    pub revision: u64,
+    /// When it last changed, by that machine's clock.
+    pub at: DateTime<Utc>,
+    pub total: usize,
+    pub done: usize,
+    /// How many emails, and which one (1-based) is signing in now.
+    pub emails: usize,
+    pub email: usize,
+    pub finished: bool,
+    /// The open sign-in has waited long enough that the person there was asked whether to retry.
+    pub still_waiting: bool,
+    pub monitoring: bool,
+    pub error: Option<String>,
+    pub steps: Vec<RunStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunStep {
+    pub provider: Provider,
+    /// Alias, else email: whom to sign in as.
+    pub account: Option<String>,
+    /// add or connect.
+    pub kind: String,
+    /// pending, running, done, skipped or failed.
+    pub state: String,
+    pub error: Option<String>,
 }
 
 /// This machine's roster: every account signed in here, field by field so nothing else from an
@@ -74,7 +124,7 @@ pub fn own(machine_id: &str, machine: &str, accounts: &[AccountUsage], now: Date
         .collect();
     list.sort_by(|a, b| (a.provider.key(), &a.id).cmp(&(b.provider.key(), &b.id)));
     list.dedup_by(|a, b| a.provider == b.provider && a.id == b.id);
-    Roster { v: VERSION, machine_id: machine_id.into(), machine: machine.into(), written_at: now, accounts: list }
+    Roster { v: VERSION, machine_id: machine_id.into(), machine: machine.into(), written_at: now, accounts: list, run: None }
 }
 
 /// The file name for a machine id: its hex digits and dashes only.
@@ -109,6 +159,16 @@ pub fn open(bytes: &[u8], passphrase: &Passphrase, keys: &mut HashMap<String, [u
     roster.accounts.retain(|e| fits(&e.id) && !e.id.is_empty() && e.email.as_ref().is_none_or(fits) && e.plan.as_ref().is_none_or(fits));
     roster.accounts.truncate(MAX_ACCOUNTS);
     roster.machine = roster.machine.chars().filter(|c| !c.is_control()).take(63).collect();
+    if let Some(run) = roster.run.as_mut() {
+        let one_of = |s: &String, words: &[&str]| words.contains(&s.as_str());
+        let code = |s: &String| s.len() <= 200 && !s.chars().any(char::is_control);
+        run.steps.retain(|s| one_of(&s.kind, &["add", "connect"]) && one_of(&s.state, &["pending", "running", "done", "skipped", "failed"])
+            && s.account.as_ref().is_none_or(fits) && s.error.as_ref().is_none_or(code));
+        run.steps.truncate(MAX_STEPS);
+        if run.error.as_ref().is_some_and(|e| !code(e)) {
+            run.error = Some("unknown".into());
+        }
+    }
     Ok(roster)
 }
 
@@ -230,9 +290,18 @@ pub fn store_passphrase(dir: &Path, passphrase: Option<&Passphrase>) -> Result<(
 /// Another machine's roster.
 #[derive(Debug, Clone, Serialize)]
 pub struct Peer {
+    pub machine_id: String,
     pub machine: String,
     pub written_at: DateTime<Utc>,
     pub accounts: Vec<Entry>,
+    pub run: Option<Run>,
+}
+
+impl Peer {
+    /// Its run is still going, by its last word.
+    pub fn running(&self) -> bool {
+        self.run.as_ref().is_some_and(|r| !r.finished)
+    }
 }
 
 /// What the last write and read found, for Settings, Health and the door.
@@ -260,6 +329,9 @@ pub struct Syncer {
     keys: HashMap<String, [u8; 32]>,
     seal: Option<SealKey>,
     written: Option<(Vec<Entry>, DateTime<Utc>)>,
+    /// This machine's run, newest revision (see `offer_run`), and the one last written.
+    run: Option<Run>,
+    written_run: Option<Run>,
     pub seen: Seen,
 }
 
@@ -270,14 +342,27 @@ impl Syncer {
         *self = Syncer::default();
     }
 
-    /// One refresh's turn: writes this machine's roster when its accounts changed (or a day
-    /// passed), then reads every roster when due, or at once with `force`.
-    pub fn sync(&mut self, store: &dyn RosterStore, passphrase: &Passphrase, me: (&str, &str), accounts: &[AccountUsage], now: DateTime<Utc>, force: bool) {
-        let mine = own(me.0, me.1, accounts, now);
+    /// Takes this machine's run as it is now, unless a newer revision is already in hand (syncs
+    /// started one after another can finish in any order).
+    pub fn offer_run(&mut self, run: Run) {
+        if self.run.as_ref().is_none_or(|r| r.revision < run.revision) {
+            self.run = Some(run);
+        }
+    }
+
+    /// One refresh's turn: writes this machine's roster when its accounts or its run changed (or a
+    /// day passed, or a few minutes while its run goes on), then reads every roster when due, or
+    /// at once with `force`. With `soon`, Settings is watching, so rosters are read more often.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync(&mut self, store: &dyn RosterStore, passphrase: &Passphrase, me: (&str, &str), accounts: &[AccountUsage], now: DateTime<Utc>, force: bool, soon: bool) {
+        let mut mine = own(me.0, me.1, accounts, now);
+        mine.run = self.run.clone();
         let Some(name) = file_name(me.0) else { return };
-        let due = force || self.written.as_ref().is_none_or(|(list, at)| *list != mine.accounts || now - *at >= Duration::hours(REWRITE_AFTER_HOURS));
+        let accounts_due = force || self.written.as_ref().is_none_or(|(list, at)| *list != mine.accounts || now - *at >= Duration::hours(REWRITE_AFTER_HOURS));
+        let run_due = mine.run != self.written_run
+            || mine.run.as_ref().is_some_and(|r| !r.finished) && self.seen.written_at.is_none_or(|at| now - at >= Duration::minutes(RUN_HEARTBEAT_MINUTES));
         let mut wrote = false;
-        if due {
+        if accounts_due || run_due {
             if self.seal.is_none() {
                 self.seal = SealKey::new(passphrase).ok();
             }
@@ -285,11 +370,20 @@ impl Syncer {
             self.seen.wrote = Some(ok);
             if ok {
                 self.written = Some((mine.accounts.clone(), now));
+                self.written_run = mine.run.clone();
                 self.seen.written_at = Some(now);
-                wrote = true;
+                // A change of accounts is worth reading back; a step of a run is not.
+                wrote = accounts_due;
             }
         }
-        let read_due = self.seen.read_at.is_none_or(|t| now - t >= Duration::minutes(READ_EVERY_MINUTES));
+        let every = if self.seen.peers.iter().any(Peer::running) {
+            Duration::seconds(READ_LIVE_SECONDS)
+        } else if soon {
+            Duration::seconds(READ_SOON_SECONDS)
+        } else {
+            Duration::minutes(READ_EVERY_MINUTES)
+        };
+        let read_due = self.seen.read_at.is_none_or(|t| now - t >= every);
         if !(force || wrote || read_due) {
             return;
         }
@@ -321,7 +415,7 @@ impl Syncer {
             if now - written_at > Duration::days(IGNORE_AFTER_DAYS) {
                 continue;
             }
-            let peer = Peer { machine: roster.machine, written_at, accounts: roster.accounts };
+            let peer = Peer { machine_id: roster.machine_id.clone(), machine: roster.machine, written_at, accounts: roster.accounts, run: roster.run };
             match peers.get(&roster.machine_id) {
                 Some(p) if p.written_at >= peer.written_at => {}
                 _ => { peers.insert(roster.machine_id, peer); }
@@ -331,6 +425,38 @@ impl Syncer {
         peers.sort_by(|a, b| b.written_at.cmp(&a.written_at).then_with(|| a.machine.cmp(&b.machine)));
         self.seen = Seen { own_accounts, peers, unreadable, unsupported, ..self.seen.clone() };
     }
+}
+
+/// A run going on whose machine has not rewritten its roster for this long has gone quiet (its
+/// SlopBar stopped, or lost the sharing location); one rewrites every few refreshes at most.
+const QUIET_MINUTES: i64 = 20;
+/// A finished run is shown for this long after its last change.
+const SHOW_FINISHED_MINUTES: i64 = 60;
+
+/// Another machine's run as Settings > Accounts shows it: "Signing in on <machine>".
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerRun {
+    pub machine_id: String,
+    pub machine: String,
+    pub written_at: DateTime<Utc>,
+    pub run: Run,
+    /// Going on, but nothing heard from its machine for a while.
+    pub quiet: bool,
+}
+
+/// The other machines' runs worth showing: going on, or finished within the hour.
+pub fn peer_runs(seen: &Seen, now: DateTime<Utc>) -> Vec<PeerRun> {
+    seen.peers.iter()
+        .filter_map(|p| {
+            let run = p.run.clone()?;
+            // A clock running ahead counts as now.
+            let at = run.at.min(now);
+            (!run.finished || now - at < Duration::minutes(SHOW_FINISHED_MINUTES)).then(|| PeerRun {
+                machine_id: p.machine_id.clone(), machine: p.machine.clone(), written_at: p.written_at,
+                quiet: !run.finished && now - p.written_at > Duration::minutes(QUIET_MINUTES), run,
+            })
+        })
+        .collect()
 }
 
 /// The accounts other machines' rosters name that are not signed in here: once each, newest
@@ -401,13 +527,13 @@ mod tests {
         let p = pass("synthetic roster passphrase");
         // The old machine has three accounts; the new one has signed in one of them.
         let mut old = Syncer::default();
-        old.sync(&store, &p, (MACHINE_A, "OLD-PC"), &[account("claude", "cl-one"), account("codex", "cx-one"), account("claude", "cl-two")], now(), false);
+        old.sync(&store, &p, (MACHINE_A, "OLD-PC"), &[account("claude", "cl-one"), account("codex", "cx-one"), account("claude", "cl-two")], now(), false, false);
         assert_eq!(old.seen.wrote, Some(true));
         assert_eq!(old.seen.own_accounts, Some(3), "its own roster reads back");
         assert!(shared.0.join("SlopBar").join("roster").join(format!("{MACHINE_A}.roster")).is_file());
         let here = [account("claude", "cl-two")];
         let mut new = Syncer::default();
-        new.sync(&store, &p, (MACHINE_B, "NEW-PC"), &here, now(), false);
+        new.sync(&store, &p, (MACHINE_B, "NEW-PC"), &here, now(), false, false);
         assert_eq!(new.seen.peers.iter().map(|p| p.machine.as_str()).collect::<Vec<_>>(), ["OLD-PC"]);
         let pending = waiting(&new.seen, &here);
         assert_eq!(pending.iter().map(|p| (p.provider.key(), p.id.as_str(), p.email.as_deref())).collect::<Vec<_>>(),
@@ -427,13 +553,13 @@ mod tests {
         let shared = TempDir::new();
         let store = Folder(shared.0.clone());
         let mut a = Syncer::default();
-        a.sync(&store, &pass("synthetic passphrase one"), (MACHINE_A, "A"), &[account("claude", "cl-one")], now(), false);
+        a.sync(&store, &pass("synthetic passphrase one"), (MACHINE_A, "A"), &[account("claude", "cl-one")], now(), false, false);
         let mut b = Syncer::default();
-        b.sync(&store, &pass("synthetic passphrase two"), (MACHINE_B, "B"), &[], now(), false);
+        b.sync(&store, &pass("synthetic passphrase two"), (MACHINE_B, "B"), &[], now(), false, false);
         assert!(b.seen.peers.is_empty());
         assert_eq!(b.seen.unreadable, 1, "a roster sealed with another passphrase is counted, not read");
         let mut late = Syncer::default();
-        late.sync(&store, &pass("synthetic passphrase one"), (MACHINE_B, "B"), &[], now() + Duration::days(IGNORE_AFTER_DAYS + 1), false);
+        late.sync(&store, &pass("synthetic passphrase one"), (MACHINE_B, "B"), &[], now() + Duration::days(IGNORE_AFTER_DAYS + 1), false, false);
         assert!(late.seen.peers.is_empty(), "a roster unwritten for two months is from a machine no longer used");
     }
 
@@ -457,13 +583,13 @@ mod tests {
         let p = pass("synthetic roster passphrase");
         let mut sync = Syncer::default();
         let one = [account("claude", "cl-one")];
-        sync.sync(&store, &p, (MACHINE_A, "A"), &one, now(), false);
-        sync.sync(&store, &p, (MACHINE_A, "A"), &one, now() + Duration::minutes(5), false);
+        sync.sync(&store, &p, (MACHINE_A, "A"), &one, now(), false, false);
+        sync.sync(&store, &p, (MACHINE_A, "A"), &one, now() + Duration::minutes(5), false, false);
         assert_eq!(writes(), 1, "unchanged: not written again");
-        sync.sync(&store, &p, (MACHINE_A, "A"), &[account("claude", "cl-one"), account("codex", "cx-one")], now() + Duration::minutes(10), false);
+        sync.sync(&store, &p, (MACHINE_A, "A"), &[account("claude", "cl-one"), account("codex", "cx-one")], now() + Duration::minutes(10), false, false);
         assert_eq!(writes(), 2);
         assert_eq!(sync.seen.own_accounts, Some(2), "read again after a write");
-        sync.sync(&store, &p, (MACHINE_A, "A"), &[account("claude", "cl-one"), account("codex", "cx-one")], now() + Duration::hours(25), false);
+        sync.sync(&store, &p, (MACHINE_A, "A"), &[account("claude", "cl-one"), account("codex", "cx-one")], now() + Duration::hours(25), false, false);
         assert_eq!(writes(), 3, "rewritten daily, so it never looks abandoned");
         store.remove(&file_name(MACHINE_A).unwrap()).unwrap();
         store.remove(&file_name(MACHINE_A).unwrap()).unwrap();
@@ -482,6 +608,88 @@ mod tests {
         store_passphrase(&dir.0, None).unwrap();
         store_passphrase(&dir.0, None).unwrap();
         assert!(load_passphrase(&dir.0).is_none());
+    }
+
+    fn run(revision: u64, finished: bool, state: &str) -> Run {
+        Run { revision, at: now(), total: 2, done: 0, emails: 1, email: 1, finished, still_waiting: false, monitoring: true,
+            error: finished.then(|| "signin_stopped".into()),
+            steps: vec![
+                RunStep { provider: Provider::Claude, account: Some("cl-one@example.invalid".into()), kind: "add".into(), state: state.into(), error: None },
+                RunStep { provider: Provider::Codex, account: Some("cl-one@example.invalid".into()), kind: "connect".into(), state: "pending".into(), error: None },
+            ] }
+    }
+
+    #[test]
+    fn a_run_reaches_the_other_machines_encrypted_newest_first() {
+        let shared = TempDir::new();
+        let store = Counting(Folder(shared.0.clone()), Default::default());
+        let writes = || store.1.load(std::sync::atomic::Ordering::SeqCst);
+        let p = pass("synthetic roster passphrase");
+        let one = [account("claude", "cl-two")];
+        let mut target = Syncer::default();
+        target.sync(&store, &p, (MACHINE_A, "TARGET"), &one, now(), false, false);
+        assert_eq!(writes(), 1);
+        // A step changes: written at once, though the accounts did not change.
+        target.offer_run(run(3, false, "running"));
+        target.offer_run(run(2, false, "pending"));
+        target.sync(&store, &p, (MACHINE_A, "TARGET"), &one, now() + Duration::seconds(5), false, false);
+        assert_eq!(writes(), 2, "an older revision offered later is ignored, the newer one written");
+        let bytes = std::fs::read(shared.0.join("SlopBar").join("roster").join(format!("{MACHINE_A}.roster"))).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("example.invalid"), "the run is inside the encrypted roster");
+        target.sync(&store, &p, (MACHINE_A, "TARGET"), &one, now() + Duration::seconds(10), false, false);
+        assert_eq!(writes(), 2, "unchanged: not written again");
+        target.sync(&store, &p, (MACHINE_A, "TARGET"), &one, now() + Duration::minutes(RUN_HEARTBEAT_MINUTES) + Duration::seconds(6), false, false);
+        assert_eq!(writes(), 3, "rewritten every few minutes while it runs, so it never looks quiet");
+        // The pilot sees it, and reads again soon while it runs.
+        let mut pilot = Syncer::default();
+        pilot.sync(&store, &p, (MACHINE_B, "PILOT"), &one, now() + Duration::minutes(4), false, false);
+        let peer = &pilot.seen.peers[0];
+        assert_eq!((peer.machine_id.as_str(), peer.machine.as_str()), (MACHINE_A, "TARGET"));
+        let seen = peer.run.clone().unwrap();
+        assert_eq!((seen.revision, seen.steps[0].state.as_str(), seen.steps[0].account.as_deref()), (3, "running", Some("cl-one@example.invalid")));
+        target.offer_run(run(4, true, "failed"));
+        target.sync(&store, &p, (MACHINE_A, "TARGET"), &one, now() + Duration::minutes(4), false, false);
+        pilot.sync(&store, &p, (MACHINE_B, "PILOT"), &one, now() + Duration::minutes(4) + Duration::seconds(READ_LIVE_SECONDS), false, false);
+        let seen = pilot.seen.peers[0].run.clone().unwrap();
+        assert_eq!((seen.finished, seen.error.as_deref()), (true, Some("signin_stopped")), "read again within seconds while a run went on");
+        // Finished: back to the slow pace, unless Settings is watching.
+        let read_at = pilot.seen.read_at;
+        pilot.sync(&store, &p, (MACHINE_B, "PILOT"), &one, now() + Duration::minutes(5), false, false);
+        assert_eq!(pilot.seen.read_at, read_at);
+        pilot.sync(&store, &p, (MACHINE_B, "PILOT"), &one, now() + Duration::minutes(5), false, true);
+        assert_ne!(pilot.seen.read_at, read_at);
+        // Shown for an hour after it finished, then no more.
+        assert_eq!(peer_runs(&pilot.seen, now() + Duration::minutes(5)).len(), 1);
+        assert!(peer_runs(&pilot.seen, now() + Duration::minutes(SHOW_FINISHED_MINUTES)).is_empty());
+    }
+
+    #[test]
+    fn a_run_whose_machine_went_quiet_says_so() {
+        let peer = |written: i64, finished: bool| Peer { machine_id: MACHINE_A.into(), machine: "TARGET".into(),
+            written_at: now() - Duration::minutes(written), accounts: vec![], run: Some(run(1, finished, "running")) };
+        let seen = |p: Peer| Seen { peers: vec![p], ..Seen::default() };
+        assert!(!peer_runs(&seen(peer(1, false)), now())[0].quiet);
+        assert!(peer_runs(&seen(peer(QUIET_MINUTES + 1, false)), now())[0].quiet, "no word for a while");
+        assert!(peer_runs(&seen(Peer { run: None, ..peer(1, false) }), now()).is_empty(), "no run, no card");
+    }
+
+    #[test]
+    fn a_run_from_another_machine_is_trimmed_to_known_words() {
+        let mut roster = own(MACHINE_A, "A", &[], now());
+        let mut r = run(1, false, "running");
+        r.steps.push(RunStep { provider: Provider::Claude, account: None, kind: "delete".into(), state: "running".into(), error: None });
+        r.steps.push(RunStep { provider: Provider::Claude, account: None, kind: "add".into(), state: "hacked".into(), error: None });
+        r.error = Some("bad\nerror".into());
+        roster.run = Some(r);
+        let key = SealKey::new(&pass("synthetic roster passphrase")).unwrap();
+        let back = open(&seal(&roster, &key).unwrap(), &pass("synthetic roster passphrase"), &mut HashMap::new()).unwrap().run.unwrap();
+        assert_eq!(back.steps.len(), 2);
+        assert_eq!(back.error.as_deref(), Some("unknown"));
+        // A roster from a SlopBar without runs still opens.
+        let mut plain: serde_json::Value = serde_json::to_value(own(MACHINE_A, "A", &[], now())).unwrap();
+        plain.as_object_mut().unwrap().remove("run");
+        let bytes = crate::backup::seal_bytes(FORMAT, &serde_json::to_vec(&plain).unwrap(), &key).unwrap();
+        assert!(open(&bytes, &pass("synthetic roster passphrase"), &mut HashMap::new()).unwrap().run.is_none());
     }
 
     #[test]

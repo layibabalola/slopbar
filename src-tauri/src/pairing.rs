@@ -129,6 +129,47 @@ pub fn ascii_json(value: &Value) -> String {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The SSH host each paired computer answered on, by its machine id (the one its roster carries),
+// so this computer's app can reach it too: Retry on Settings > Accounts' "Signing in on <machine>".
+
+const HOSTS_FILE: &str = "paired-machines.json";
+const MAX_HOSTS: usize = 64;
+
+fn hosts(dir: &std::path::Path) -> serde_json::Map<String, Value> {
+    std::fs::read(dir.join(HOSTS_FILE)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v.as_object().cloned()).unwrap_or_default()
+}
+
+/// Notes that the computer `machine_id` answered on `host` (from its readiness, which carries the id).
+pub fn remember_host(dir: &std::path::Path, machine_id: &str, host: &str) {
+    if !valid_host(host) || crate::roster::file_name(machine_id).as_deref() != Some(&format!("{machine_id}.roster")) {
+        return;
+    }
+    let mut map = hosts(dir);
+    if map.get(machine_id).and_then(Value::as_str) == Some(host) {
+        return;
+    }
+    map.remove(machine_id);
+    while map.len() >= MAX_HOSTS {
+        let Some(first) = map.keys().next().cloned() else { break };
+        map.remove(&first);
+    }
+    map.insert(machine_id.into(), host.into());
+    let _ = crate::private_store::write(&dir.join(HOSTS_FILE), &serde_json::to_vec_pretty(&map).unwrap_or_default());
+}
+
+/// The SSH host `machine_id` last answered on here, if it was ever checked or paired from here.
+pub fn host_for(dir: &std::path::Path, machine_id: &str) -> Option<String> {
+    hosts(dir).get(machine_id).and_then(Value::as_str).filter(|h| valid_host(h)).map(str::to_owned)
+}
+
+fn remember_answer(host: &str, readiness: &Value) {
+    if let (Some(dir), Some(id)) = (crate::settings::app_dir(), readiness.pointer("/machine/id").and_then(Value::as_str)) {
+        remember_host(&dir, id, host);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // What pairing talks to, so tests can stand in for the app and the other computer.
 
 pub trait Door {
@@ -297,6 +338,7 @@ pub fn pair(door: &dyn Door, remote: &dyn Remote, host: &str, saved: Option<Pass
     let here = door.call(&Request::SyncRoster)?;
     Ok(json!({
         "paired": true,
+        "machine": target.get("machine").cloned().unwrap_or(Value::Null),
         "key": if key.1 { "generated" } else { "reused" },
         "here": roster_summary(&here),
         "target": received,
@@ -465,7 +507,9 @@ pub fn local_tool(name: &str, args: &Value, pipe: &str, remote_ok: bool) -> Resu
             // Waiting for a change is passed on: the other computer's app does the waiting.
             let wait: serde_json::Map<String, Value> = args.as_object().into_iter().flatten()
                 .filter(|(k, _)| matches!(k.as_str(), "wait_seconds" | "since")).map(|(k, v)| (k.clone(), v.clone())).collect();
-            remote_call(&Ssh, host, "get_machine_readiness", &Value::Object(wait))
+            let answer = remote_call(&Ssh, host, "get_machine_readiness", &Value::Object(wait))?;
+            remember_answer(host, &answer);
+            Ok(answer)
         }
         ("get_machine_readiness", None) => match crate::door::call(pipe, &Request::GetReadiness {
             wait_seconds: args.get("wait_seconds").and_then(Value::as_u64).map(|s| s.min(45) as u32),
@@ -479,13 +523,19 @@ pub fn local_tool(name: &str, args: &Value, pipe: &str, remote_ok: bool) -> Resu
             let saved = crate::settings::app_dir().and_then(|d| crate::roster::load_passphrase(&d));
             let machine = crate::presence::identity().map(|(_, name)| name.to_string()).unwrap_or_default();
             let replace = args.get("replace_key").and_then(Value::as_bool).unwrap_or(false);
-            pair(&LocalDoor(pipe.into()), &Ssh, host, saved, &machine, replace)
+            let paired = pair(&LocalDoor(pipe.into()), &Ssh, host, saved, &machine, replace)?;
+            remember_answer(host, &paired);
+            Ok(paired)
         }
         ("run_on_machine", Some(host)) => {
             let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
             let arguments = args.get("arguments").cloned().unwrap_or(json!({}));
             check_remote(tool, &arguments)?;
-            remote_call(&Ssh, host, tool, &arguments)
+            let answer = remote_call(&Ssh, host, tool, &arguments)?;
+            if tool == "get_machine_readiness" {
+                remember_answer(host, &answer);
+            }
+            Ok(answer)
         }
         _ => Err("Invalid arguments: ssh_host is required".into()),
     }
@@ -743,5 +793,22 @@ mod tests {
         for t in REMOTE_TOOLS {
             assert!(!t.contains("passphrase") && !t.contains("backup") && !t.contains("remove"), "{t}");
         }
+    }
+
+    #[test]
+    fn paired_hosts_are_remembered_by_machine_id_and_never_options() {
+        let dir = crate::test_support::TempDir::new();
+        const ID: &str = "22222222-2222-4222-8222-222222222222";
+        assert_eq!(host_for(&dir.0, ID), None);
+        remember_host(&dir.0, ID, "virtual-ten");
+        assert_eq!(host_for(&dir.0, ID).as_deref(), Some("virtual-ten"));
+        remember_host(&dir.0, ID, "user@virtual-ten.tailnet");
+        assert_eq!(host_for(&dir.0, ID).as_deref(), Some("user@virtual-ten.tailnet"), "the last host it answered on");
+        remember_host(&dir.0, ID, "-oProxyCommand=x");
+        remember_host(&dir.0, "../../evil", "virtual-ten");
+        assert_eq!(host_for(&dir.0, ID).as_deref(), Some("user@virtual-ten.tailnet"));
+        assert_eq!(host_for(&dir.0, "../../evil"), None);
+        std::fs::write(dir.0.join(HOSTS_FILE), format!("{{\"{ID}\": \"-oProxyCommand=x\"}}")).unwrap();
+        assert_eq!(host_for(&dir.0, ID), None, "a changed file never hands ssh an option");
     }
 }
