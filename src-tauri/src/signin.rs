@@ -862,6 +862,8 @@ mod tests {
         };
 
         let first = Session::create().expect("session");
+        // As Sign in all accounts does: the window starts on a tab naming the account.
+        first.label("visual.one@example.invalid", "en");
         let homes = [TempDir::new(), TempDir::new(), TempDir::new()];
         let claude_one = claude(&first, "visual.one@example.invalid", &homes[0].0);
         let pid = browser(first.dir());
