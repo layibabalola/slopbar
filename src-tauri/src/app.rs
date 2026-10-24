@@ -1004,7 +1004,13 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool) -> Re
                     error = Some(problem);
                     break 'groups;
                 }
-                let session = group_session.get_or_insert_with(|| signin_session(&h)).clone();
+                let session = group_session.get_or_insert_with(|| {
+                    let session = signin_session(&h);
+                    if let (Some(s), Some(email)) = (session.as_deref(), group.email.as_deref()) {
+                        s.label(email);
+                    }
+                    session
+                }).clone();
                 let run = async {
                     // Another sign-in is open (one the user or automatic monitoring started): wait for it.
                     while h.state::<AppState>().account_operations.busy(monitoring::SIGN_IN) {
